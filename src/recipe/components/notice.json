@@ -1,0 +1,30 @@
+{
+  "kind": "component",
+  "id": "notice",
+  "title": "Notice",
+  "description": "A boxed, shaded paragraph that stands out from the text: an interim status, a revision, a caution.",
+  "params": {
+    "title": { "default": null },
+    "text": { "required": true },
+    "fill": { "default": "f6f1df" },
+    "rule": { "default": "a8904a" }
+  },
+  "blocks": [
+    {
+      "type": "paragraph",
+      "keepLinesTogether": true,
+      "shading": "{{ params.fill }}",
+      "spacing": { "before": 6, "after": 12 },
+      "borders": {
+        "top": { "style": "single", "width": 1, "color": "{{ params.rule }}" },
+        "bottom": { "style": "single", "width": 1, "color": "{{ params.rule }}" },
+        "left": { "style": "single", "width": 1, "color": "{{ params.rule }}" },
+        "right": { "style": "single", "width": 1, "color": "{{ params.rule }}" }
+      },
+      "content": [
+        { "if": "params.title", "then": [{ "type": "text", "text": "{{ params.title }}", "bold": true }, " "] },
+        "{{ params.text }}"
+      ]
+    }
+  ]
+}

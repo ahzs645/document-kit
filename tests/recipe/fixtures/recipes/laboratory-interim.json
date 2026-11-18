@@ -1,0 +1,19 @@
+{
+  "kind": "recipe",
+  "id": "laboratory-interim",
+  "name": "Laboratory report, interim",
+  "description": "The laboratory report issued before every result is in: its status in the title, a notice after it, and the brief notes.",
+  "extends": "laboratory",
+  "changes": [
+    { "set": "title", "with": { "status": "Interim" } },
+    {
+      "add": {
+        "use": "notice",
+        "id": "interim-notice",
+        "with": { "title": "Interim report.", "text": "{{ pending.count }} results are still to follow and will be issued in a final report." }
+      },
+      "after": "title"
+    },
+    { "set": "notes", "variant": "brief" }
+  ]
+}

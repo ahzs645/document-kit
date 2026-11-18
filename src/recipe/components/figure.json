@@ -1,0 +1,25 @@
+{
+  "kind": "component",
+  "id": "figure",
+  "title": "Figure",
+  "description": "A picture from the data, fitted into a box, with a caption and a note. A picture the data lacks prints a placeholder box and is listed.",
+  "params": {
+    "image": { "required": true },
+    "caption": { "default": null },
+    "note": { "default": null },
+    "placeholder": { "default": "Picture to come" },
+    "width": { "default": null },
+    "height": { "default": 300 }
+  },
+  "blocks": [
+    {
+      "type": "figure",
+      "image": "{{ params.image }}",
+      "align": "center",
+      "caption": "{{ params.caption }}",
+      "note": "{{ params.note }}",
+      "placeholder": "{{ params.placeholder }}",
+      "fit": { "width": "{{ params.width }}", "height": "{{ params.height }}" }
+    }
+  ]
+}

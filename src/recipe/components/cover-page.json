@@ -1,0 +1,30 @@
+{
+  "kind": "component",
+  "id": "cover-page",
+  "title": "Cover page",
+  "description": "A title, a subtitle, label and value lines and a closing note. Put it in a section of its own whose page is centred (\"page\": { \"verticalAlign\": \"center\" }) with an empty header and footer.",
+  "params": {
+    "title": { "required": true },
+    "subtitle": { "default": null },
+    "lines": { "default": [], "description": "A list of { label, value }; a value the data lacks prints a blank rule and is listed." },
+    "note": { "default": null }
+  },
+  "blocks": [
+    { "type": "paragraph", "style": "title", "align": "center", "content": "{{ params.title }}" },
+    { "if": "params.subtitle", "then": [{ "type": "paragraph", "style": "subtitle", "align": "center", "content": "{{ params.subtitle }}" }] },
+    {
+      "if": "params.lines",
+      "then": [
+        { "type": "spacer", "height": 36 },
+        { "type": "fields", "layout": "table", "rows": [{ "for": "line in params.lines", "do": [{ "label": "{{ line.label }}", "value": "{{ line.value }}" }] }] }
+      ]
+    },
+    {
+      "if": "params.note",
+      "then": [
+        { "type": "spacer", "height": 48 },
+        { "type": "paragraph", "style": "note", "align": "center", "content": "{{ params.note }}" }
+      ]
+    }
+  ]
+}

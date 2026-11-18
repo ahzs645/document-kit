@@ -14,6 +14,7 @@ export default defineConfig({
         docx: 'src/docx/index.ts',
         layout: 'src/layout/index.ts',
         template: 'src/template/index.ts',
+        recipe: 'src/recipe/index.ts',
         ream: 'src/ream/index.ts',
       },
     },

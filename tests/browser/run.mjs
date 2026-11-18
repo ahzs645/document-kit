@@ -5,7 +5,7 @@
 //
 // Each case in tests/browser/cases/*.mjs is bundled on its own with Vite from
 // the built `dist/` (the specifiers `document-kit`, `document-kit/docx`,
-// `document-kit/layout`, `document-kit/template` and `document-kit/ream` resolve
+// `document-kit/layout`, `document-kit/template`, `document-kit/recipe` and `document-kit/ream` resolve
 // to dist/), served with `fonts/` from 127.0.0.1 on a free port, and run in a
 // fresh page. Every request that is not to that server is aborted, recorded,
 // and fails the run.
@@ -90,7 +90,7 @@ function findChromium() {
 
 // --- Bundling ----------------------------------------------------------------
 
-const ENTRIES = { '': 'index', '/docx': 'docx', '/layout': 'layout', '/template': 'template', '/ream': 'ream' };
+const ENTRIES = { '': 'index', '/docx': 'docx', '/layout': 'layout', '/template': 'template', '/recipe': 'recipe', '/ream': 'ream' };
 
 async function bundleCase(build, file) {
   const name = basename(file, '.mjs');

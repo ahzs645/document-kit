@@ -25,6 +25,7 @@ and nothing that belongs to one of them.
 | `src/docx` | Writes the block model as a Word file (the `docx` library) | `document-kit/docx` |
 | `src/layout` | Word file to PDF, page pictures (SVG) and HTML, with fonts passed in | `document-kit/layout` |
 | `src/template` | Fills a Word template's tags from data | `document-kit/template` |
+| `src/recipe` | Reports from JSON components and recipes: compile, render, layering, own recipes, code components | `document-kit/recipe` |
 | `src/ream` | The layout engine itself, brought in from reamkit | `document-kit/ream` |
 | `fonts` | Open fonts that stand in for the common Office faces | `document-kit/fonts/*` |
 

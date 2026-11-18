@@ -1,0 +1,15 @@
+{
+  "kind": "component",
+  "id": "text-section",
+  "title": "Text section",
+  "description": "A heading and paragraphs. Each paragraph is text, or rich text (runs, sentences); a sentence whose slot the data lacks is not printed and is listed.",
+  "params": {
+    "heading": { "default": null },
+    "level": { "default": 2 },
+    "paragraphs": { "default": [] }
+  },
+  "blocks": [
+    { "if": "params.heading", "then": [{ "type": "heading", "level": "{{ params.level }}", "content": "{{ params.heading }}" }] },
+    { "for": "paragraph in params.paragraphs", "do": [{ "type": "paragraph", "content": "{{ paragraph }}" }] }
+  ]
+}

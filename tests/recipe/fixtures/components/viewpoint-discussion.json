@@ -1,0 +1,58 @@
+{
+  "kind": "component",
+  "id": "viewpoint-discussion",
+  "title": "Viewpoint discussion",
+  "description": "A heading and two sentences per viewpoint. A sentence whose judgement the reviewer has not given is not printed and is listed to complete.",
+  "params": {
+    "viewpoints": {
+      "required": true
+    }
+  },
+  "blocks": [
+    {
+      "type": "heading",
+      "level": 2,
+      "content": "Viewpoints"
+    },
+    {
+      "for": "vp in params.viewpoints",
+      "do": [
+        {
+          "type": "heading",
+          "level": 3,
+          "content": "{{ vp.name }}"
+        },
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "type": "sentence",
+              "label": "Visibility",
+              "template": "From {viewpoint}, the proposed opening is {visibility}.",
+              "values": {
+                "viewpoint": "{{ vp.name }}",
+                "visibility": "{{ vp.visibility | lower }}"
+              }
+            },
+            " ",
+            {
+              "type": "sentence",
+              "label": "Share seen",
+              "template": "About {share} of its area is seen, {distance} away.",
+              "values": {
+                "share": "{{ vp.share | format \"0%\" }}",
+                "distance": "{{ vp.distanceKm | format \"0.0\" }} km"
+              }
+            }
+          ]
+        }
+      ],
+      "empty": [
+        {
+          "type": "paragraph",
+          "content": "No viewpoint was assessed."
+        }
+      ]
+    }
+  ]
+}

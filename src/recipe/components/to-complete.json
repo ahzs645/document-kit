@@ -1,0 +1,15 @@
+{
+  "kind": "component",
+  "id": "to-complete",
+  "title": "To complete",
+  "description": "The list of everything the document leaves to complete (blank values, left-out sentences, missing pictures, pending items), made by the render from the rest of the document.",
+  "params": {
+    "title": { "default": "To complete before signing" },
+    "level": { "default": 1 },
+    "none": { "default": "Nothing is left to complete." }
+  },
+  "blocks": [
+    { "type": "heading", "level": "{{ params.level }}", "content": "{{ params.title }}" },
+    { "type": "custom", "kind": "recipe.toComplete", "data": { "none": "{{ params.none }}" } }
+  ]
+}

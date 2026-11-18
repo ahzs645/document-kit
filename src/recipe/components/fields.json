@@ -1,0 +1,22 @@
+{
+  "kind": "component",
+  "id": "fields",
+  "title": "Label and value fields",
+  "description": "Label and value rows, as lines or a two-column table, under an optional heading. A value the data lacks prints a blank rule and is listed to complete.",
+  "params": {
+    "heading": { "default": null },
+    "level": { "default": 2 },
+    "rows": { "required": true, "description": "A list of { label, value, what? }." },
+    "layout": { "default": "lines", "description": "lines or table." },
+    "labelWidth": { "default": null }
+  },
+  "blocks": [
+    { "if": "params.heading", "then": [{ "type": "heading", "level": "{{ params.level }}", "content": "{{ params.heading }}" }] },
+    {
+      "type": "fields",
+      "layout": "{{ params.layout }}",
+      "labelWidth": "{{ params.labelWidth }}",
+      "rows": [{ "for": "row in params.rows", "do": [{ "label": "{{ row.label }}", "value": "{{ row.value }}", "what": "{{ row.what }}" }] }]
+    }
+  ]
+}

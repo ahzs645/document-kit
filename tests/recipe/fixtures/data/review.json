@@ -1,0 +1,23 @@
+{
+  "project": {
+    "name": "Example Creek Block 7",
+    "client": "Example Forest Partnership",
+    "preparer": { "$value": "C. Reviewer", "$source": "office" },
+    "date": "2026-04-02",
+    "location": "Made-up Valley, 12 km north of Example Town",
+    "areaHa": 24.37,
+    "objective": "Partial retention",
+    "inventoryDate": null
+  },
+  "viewpoints": [
+    { "name": "Viewpoint 1, lake shore", "visibility": { "$value": "Easy to see", "$source": "reviewer" }, "share": 0.18, "distanceKm": 3.2 },
+    { "name": "Viewpoint 2, highway pull-out", "share": 0.07, "distanceKm": 5.75 }
+  ],
+  "rating": { "mark": { "row": 1, "column": 2 } },
+  "inventory": [
+    ["VSU 101", "High", "Low", "Natural", "Retention", 412.5, "Viewpoint 1, lake shore", "18%", "2024-06-01"],
+    ["VSU 102", "Moderate", "Moderate", "Slightly altered", "Partial retention", 980.0, "Viewpoint 1 and 2", "7%", "2024-06-01"],
+    ["VSU 103", "Low", "High", "Moderately altered", "Modification", 1544.2, "None", "0%", null]
+  ],
+  "sheet": { "viewpoint": "Viewpoint 1, lake shore", "eyeHeightM": 1.6 }
+}

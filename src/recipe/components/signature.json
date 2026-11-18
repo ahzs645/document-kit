@@ -1,0 +1,25 @@
+{
+  "kind": "component",
+  "id": "signature",
+  "title": "Signature",
+  "description": "A signature block: a label, the signature picture or room to sign, the signing rule with the name under it, and a title and date line. A name or line the data lacks is a blank to complete.",
+  "params": {
+    "label": { "default": "Signed" },
+    "image": { "default": null },
+    "name": { "required": true },
+    "title": { "default": null },
+    "date": { "default": null }
+  },
+  "blocks": [
+    {
+      "type": "signature",
+      "label": "{{ params.label }}",
+      "image": "{{ params.image }}",
+      "name": "{{ params.name }}",
+      "lines": [
+        { "label": "Title", "value": "{{ params.title }}" },
+        { "label": "Date", "value": "{{ params.date }}" }
+      ]
+    }
+  ]
+}

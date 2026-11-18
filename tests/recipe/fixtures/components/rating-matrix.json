@@ -1,0 +1,24 @@
+{
+  "kind": "component",
+  "id": "rating-matrix",
+  "title": "Rating matrix",
+  "description": "A rating matrix drawn by the application's custom block kind \"matrix\": the data says which cell the assessment reads.",
+  "params": {
+    "rating": { "required": true }
+  },
+  "blocks": [
+    { "type": "heading", "level": 2, "content": "Rating" },
+    {
+      "type": "custom",
+      "kind": "matrix",
+      "data": {
+        "title": "Made-up rating matrix",
+        "rowHeader": "Size",
+        "rows": ["Small", "Medium", "Large"],
+        "columns": ["Low", "Moderate", "High"],
+        "cells": [["A", "A", "B"], ["A", "B", "C"], ["B", "C", "C"]],
+        "mark": "{{ params.rating.mark }}"
+      }
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "kind": "component",
+  "id": "contents",
+  "title": "Table of contents",
+  "description": "A table of contents over the headings, to the level given.",
+  "params": {
+    "title": { "default": "Contents" },
+    "levels": { "default": 2 }
+  },
+  "blocks": [{ "type": "toc", "title": "{{ params.title }}", "levels": "{{ params.levels }}" }]
+}

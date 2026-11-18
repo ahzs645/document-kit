@@ -1,0 +1,25 @@
+{
+  "kind": "component",
+  "id": "page-footer",
+  "title": "Page X of Y footer",
+  "description": "A footer line: optional text at the left and \"Page X of Y\" at the right edge.",
+  "params": {
+    "text": { "default": null },
+    "page": { "default": "Page" },
+    "of": { "default": "of" }
+  },
+  "blocks": [
+    {
+      "type": "paragraph",
+      "tabs": [{ "at": "end", "align": "right" }],
+      "content": [
+        { "if": "params.text", "then": ["{{ params.text }}"] },
+        { "type": "tab" },
+        "{{ params.page }} ",
+        { "type": "field", "field": "page" },
+        " {{ params.of }} ",
+        { "type": "field", "field": "pages" }
+      ]
+    }
+  ]
+}

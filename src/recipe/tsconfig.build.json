@@ -1,0 +1,14 @@
+{
+  // Declarations for document-kit/recipe, built with this folder's own options. The program reaches src/model and
+  // src/template, whose declarations it writes again unchanged beside those the root and template builds wrote.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "emitDeclarationOnly": true,
+    "declaration": true,
+    "outDir": "../../dist/types",
+    "rootDir": ".."
+  },
+  "include": ["./**/*.ts", "./**/*.json"],
+  "exclude": ["./tsconfig*.json"]
+}

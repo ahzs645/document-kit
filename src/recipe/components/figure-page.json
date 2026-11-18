@@ -1,0 +1,74 @@
+{
+  "kind": "component",
+  "id": "figure-page",
+  "title": "Figure page",
+  "description": "A page given to one picture: a heading, optional facts as a table, and the picture in a box of the height given (points), under which its caption prints. Put it in a section whose page suits the picture (landscape, tabloid) and give a height that leaves room for the heading and facts.",
+  "params": {
+    "title": {
+      "required": true
+    },
+    "level": {
+      "default": 1
+    },
+    "image": {
+      "required": true
+    },
+    "caption": {
+      "default": null
+    },
+    "facts": {
+      "default": [],
+      "description": "A list of { label, value }."
+    },
+    "placeholder": {
+      "default": "Picture to come"
+    },
+    "height": {
+      "default": 360,
+      "description": "The picture's box height in points; its width is the text width."
+    }
+  },
+  "blocks": [
+    {
+      "type": "heading",
+      "level": "{{ params.level }}",
+      "content": "{{ params.title }}"
+    },
+    {
+      "if": "params.facts",
+      "then": [
+        {
+          "type": "fields",
+          "layout": "table",
+          "labelWidth": 25,
+          "rows": [
+            {
+              "for": "fact in params.facts",
+              "do": [
+                {
+                  "label": "{{ fact.label }}",
+                  "value": "{{ fact.value }}"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "type": "spacer",
+          "height": 8
+        }
+      ]
+    },
+    {
+      "type": "figure",
+      "image": "{{ params.image }}",
+      "fit": {
+        "height": "{{ params.height }}",
+        "upscale": true
+      },
+      "align": "center",
+      "caption": "{{ params.caption }}",
+      "placeholder": "{{ params.placeholder }}"
+    }
+  ]
+}

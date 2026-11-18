@@ -1,0 +1,12 @@
+{
+  // The recipe system reads tags with the template engine's own reader (src/template/templateTags.ts,
+  // templateFormat.ts), so this program reaches those files and is checked with that engine's one relaxed option
+  // (see src/template/tsconfig.json); every other option of the kit's tsconfig applies. The root program leaves
+  // this folder out, as it does src/template. See docs/recipe.md, "Type checking".
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "noUncheckedIndexedAccess": false
+  },
+  "include": ["./**/*.ts", "./**/*.json"],
+  "exclude": ["./tsconfig*.json"]
+}

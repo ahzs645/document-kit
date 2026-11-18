@@ -1,0 +1,60 @@
+{
+  "kind": "component",
+  "id": "sample-notes",
+  "title": "Sample and analysis notes",
+  "description": "How the samples arrived and were analysed, in two wordings. Each sentence prints only when the data fills every slot; one it cannot fill is listed to complete.",
+  "params": {
+    "heading": { "default": "Sample and Analysis Notes" }
+  },
+  "variants": {
+    "brief": {
+      "title": "Brief",
+      "blocks": [
+        { "type": "heading", "level": 2, "content": "{{ params.heading }}" },
+        {
+          "type": "paragraph",
+          "content": [
+            {
+              "type": "sentence",
+              "label": "Receipt",
+              "template": "{count} samples were received on {received}.",
+              "values": { "count": "{{ samples.length }}", "received": "{{ received | format \"d MMMM yyyy\" }}" }
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "blocks": [
+    { "type": "heading", "level": 2, "content": "{{ params.heading }}" },
+    {
+      "type": "paragraph",
+      "content": [
+        {
+          "type": "sentence",
+          "label": "Receipt",
+          "template": "{count} samples were received on {received} in good condition.",
+          "values": { "count": "{{ samples.length }}", "received": "{{ received | format \"d MMMM yyyy\" }}" }
+        },
+        " ",
+        {
+          "type": "sentence",
+          "label": "Analysis dates",
+          "template": "They were analysed between {start} and {end}.",
+          "values": { "start": "{{ analysed.start | format \"d MMMM\" }}", "end": "{{ analysed.end | format \"d MMMM yyyy\" }}" }
+        },
+        " ",
+        {
+          "type": "sentence",
+          "label": "Method",
+          "template": "Results are reported on {basis}.",
+          "values": { "basis": "{{ basis }}" }
+        }
+      ]
+    },
+    {
+      "if": "remarks",
+      "then": [{ "type": "list", "items": [{ "for": "remark in remarks", "do": ["{{ remark }}"] }] }]
+    }
+  ]
+}

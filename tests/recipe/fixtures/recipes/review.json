@@ -1,0 +1,267 @@
+{
+  "kind": "recipe",
+  "id": "review",
+  "name": "Visual review",
+  "description": "A made-up review-style report: a cover, contents, project fields with blanks, a computed summary, the viewpoint discussion, a rating matrix, a landscape inventory table, a figure page and the to-complete list.",
+  "document": {
+    "metadata": {
+      "title": "Visual review: {{ project.name }}",
+      "created": "2026-04-02T10:00:00Z"
+    }
+  },
+  "sections": [
+    {
+      "id": "cover",
+      "page": {
+        "paper": "letter",
+        "verticalAlign": "center"
+      },
+      "header": [],
+      "footer": [],
+      "parts": [
+        {
+          "use": "cover-page",
+          "id": "cover",
+          "with": {
+            "title": "Visual Review",
+            "subtitle": "{{ project.name }}",
+            "lines": [
+              {
+                "label": "Prepared for",
+                "value": "{{ project.client }}"
+              },
+              {
+                "label": "Prepared by",
+                "value": "{{ project.preparer }}"
+              },
+              {
+                "label": "Date",
+                "value": "{{ project.date | format \"d MMMM yyyy\" }}"
+              }
+            ],
+            "note": "Made-up content for a test of document-kit."
+          }
+        }
+      ]
+    },
+    {
+      "id": "body",
+      "header": [
+        {
+          "use": "running-header",
+          "with": {
+            "left": "Made-up Visual Review",
+            "right": "{{ project.name }}"
+          }
+        }
+      ],
+      "footer": [
+        {
+          "use": "page-footer"
+        }
+      ],
+      "pageNumbers": {
+        "start": 1
+      },
+      "parts": [
+        {
+          "use": "contents",
+          "id": "contents",
+          "with": {
+            "levels": 2
+          }
+        },
+        {
+          "use": "fields",
+          "id": "project",
+          "pageBreakBefore": true,
+          "with": {
+            "heading": "Project",
+            "level": 1,
+            "layout": "table",
+            "rows": [
+              {
+                "label": "Project",
+                "value": "{{ project.name }}"
+              },
+              {
+                "label": "Location",
+                "value": "{{ project.location }}"
+              },
+              {
+                "label": "Area (ha)",
+                "value": "{{ project.areaHa | format \"0.0\" }}"
+              },
+              {
+                "label": "Objective",
+                "value": "{{ project.objective }}"
+              },
+              {
+                "label": "Inventory date",
+                "value": "{{ project.inventoryDate }}"
+              }
+            ]
+          }
+        },
+        {
+          "use": "review-summary",
+          "id": "summary",
+          "with": {
+            "assessor": "{{ project.preparer }}"
+          }
+        },
+        {
+          "use": "viewpoint-discussion",
+          "id": "discussion",
+          "with": {
+            "viewpoints": "{{ viewpoints }}"
+          }
+        },
+        {
+          "use": "rating-matrix",
+          "id": "rating",
+          "if": "rating",
+          "with": {
+            "rating": "{{ rating }}"
+          }
+        }
+      ]
+    },
+    {
+      "id": "inventory",
+      "page": {
+        "orientation": "landscape"
+      },
+      "header": [
+        {
+          "use": "running-header",
+          "with": {
+            "left": "Made-up Visual Review",
+            "right": "{{ project.name }}"
+          }
+        }
+      ],
+      "footer": [
+        {
+          "use": "page-footer"
+        }
+      ],
+      "parts": [
+        {
+          "use": "text-section",
+          "id": "inventory-heading",
+          "with": {
+            "heading": "Inventory",
+            "level": 1
+          }
+        },
+        {
+          "use": "data-table",
+          "id": "inventory-table",
+          "with": {
+            "caption": "Made-up inventory units",
+            "columns": [
+              "Unit",
+              "Class",
+              "Absorption",
+              "Condition",
+              "Objective",
+              "Area (ha)",
+              "Seen from",
+              "Share seen",
+              "Updated"
+            ],
+            "rows": "{{ inventory }}",
+            "widths": [
+              1.2,
+              1,
+              1,
+              1,
+              1,
+              1,
+              2,
+              1,
+              1.4
+            ],
+            "size": 9
+          }
+        }
+      ]
+    },
+    {
+      "id": "sheet",
+      "page": {
+        "paper": "tabloid",
+        "orientation": "landscape",
+        "margins": {
+          "top": 36,
+          "bottom": 36,
+          "left": 36,
+          "right": 36
+        }
+      },
+      "header": [
+        {
+          "use": "running-header",
+          "with": {
+            "left": "Made-up Visual Review",
+            "right": "{{ project.name }}"
+          }
+        }
+      ],
+      "footer": [
+        {
+          "use": "page-footer"
+        }
+      ],
+      "parts": [
+        {
+          "use": "figure-page",
+          "id": "sheet",
+          "with": {
+            "title": "Analysis sheet",
+            "image": "{{ sheet.image }}",
+            "caption": "Made-up analysis sheet",
+            "facts": [
+              {
+                "label": "Viewpoint",
+                "value": "{{ sheet.viewpoint }}"
+              },
+              {
+                "label": "Camera height",
+                "value": "{{ sheet.eyeHeightM }} m"
+              }
+            ],
+            "height": 540
+          }
+        }
+      ]
+    },
+    {
+      "id": "closing",
+      "page": {
+        "paper": "letter"
+      },
+      "header": [
+        {
+          "use": "running-header",
+          "with": {
+            "left": "Made-up Visual Review",
+            "right": "{{ project.name }}"
+          }
+        }
+      ],
+      "footer": [
+        {
+          "use": "page-footer"
+        }
+      ],
+      "parts": [
+        {
+          "use": "to-complete",
+          "id": "to-complete"
+        }
+      ]
+    }
+  ]
+}

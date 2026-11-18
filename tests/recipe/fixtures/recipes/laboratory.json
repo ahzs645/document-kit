@@ -1,0 +1,41 @@
+{
+  "kind": "recipe",
+  "id": "laboratory",
+  "name": "Laboratory report",
+  "description": "A made-up laboratory report: letterhead line, title and addressee, notes, a table per set of results, a signature.",
+  "document": {
+    "metadata": { "title": "{{ report.title }}", "author": "Made-up Testing Laboratory", "created": "2026-03-12T09:00:00Z" }
+  },
+  "options": { "notes": "standard" },
+  "sections": [
+    {
+      "id": "report",
+      "page": { "paper": "letter" },
+      "header": [{ "use": "running-header", "with": { "left": "Made-up Testing Laboratory", "right": "{{ report.code }}" } }],
+      "footer": [{ "use": "page-footer", "with": { "text": "Report {{ report.number }}" } }],
+      "parts": [
+        { "use": "report-title", "id": "title", "with": { "title": "{{ report.title }}" } },
+        {
+          "use": "fields",
+          "id": "addressee",
+          "with": {
+            "rows": [
+              { "label": "Attention", "value": "{{ client.contact }}" },
+              { "label": "Organisation", "value": "{{ client.name }}" },
+              { "label": "Re", "value": "{{ report.subject }}" },
+              { "label": "Date", "value": "{{ report.date | format \"d MMMM yyyy\" }}" },
+              { "label": "Reference", "value": "{{ client.reference }}", "what": "Client reference" }
+            ]
+          }
+        },
+        { "use": "sample-notes", "id": "notes" },
+        { "use": "results-table", "id": "results", "for": "table in tables", "with": { "table": "{{ table }}" } },
+        {
+          "use": "signature",
+          "id": "sign-off",
+          "with": { "label": "Reviewed and approved", "name": "{{ signer.name }}", "title": "{{ signer.title }}", "date": "{{ report.date | format \"d MMMM yyyy\" }}" }
+        }
+      ]
+    }
+  ]
+}

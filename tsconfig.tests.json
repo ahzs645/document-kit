@@ -5,5 +5,5 @@
   "extends": "./tsconfig.json",
   "compilerOptions": { "types": ["node"], "lib": ["ES2022", "WebWorker"] },
   "include": ["src/**/*.ts", "tests/model/**/*.ts", "tests/docx/**/*.ts", "tests/layout/**/*.ts"],
-  "exclude": ["node_modules", "dist", "src/template"]
+  "exclude": ["node_modules", "dist", "src/template", "src/recipe"]
 }

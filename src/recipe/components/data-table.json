@@ -1,0 +1,46 @@
+{
+  "kind": "component",
+  "id": "data-table",
+  "title": "Data table",
+  "description": "A table: a header row from a list of column labels, one row per item of the data (a list of cell values), group rows ({ group }) and note rows ({ note }) among them, a caption and a note. A cell the data leaves empty prints empty and is listed to complete.",
+  "params": {
+    "caption": { "default": null },
+    "columns": { "required": true, "description": "The column labels." },
+    "rows": { "default": [], "description": "Each a list of cell values, or { group: text }, or { note: text }." },
+    "note": { "default": null },
+    "widths": { "default": null, "description": "Column shares, as [3, 1, 1]." },
+    "align": { "default": null, "description": "Body alignment by column, as [\"left\", \"right\"]." },
+    "size": { "default": null },
+    "empty": { "default": "No results." }
+  },
+  "blocks": [
+    {
+      "type": "table",
+      "caption": "{{ params.caption }}",
+      "columnWidths": "{{ params.widths }}",
+      "columnAlign": "{{ params.align }}",
+      "size": "{{ params.size }}",
+      "note": "{{ params.note }}",
+      "rows": [
+        { "role": "header", "cells": [{ "for": "column in params.columns", "do": ["{{ column }}"] }] },
+        {
+          "for": "row in params.rows",
+          "do": [
+            {
+              "if": "row.group",
+              "then": [{ "role": "group", "cells": [{ "content": "{{ row.group }}", "colSpan": "{{ params.columns.length }}" }] }],
+              "else": [
+                {
+                  "if": "row.note",
+                  "then": [{ "role": "note", "cells": ["{{ row.note }}"] }],
+                  "else": [{ "cells": [{ "for": "cell in row", "do": ["{{ cell }}"] }] }]
+                }
+              ]
+            }
+          ],
+          "empty": [{ "cells": [{ "content": "{{ params.empty }}", "colSpan": "{{ params.columns.length }}" }] }]
+        }
+      ]
+    }
+  ]
+}

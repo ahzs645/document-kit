@@ -1,0 +1,44 @@
+{
+  "report": {
+    "title": "Analysis of Water Samples",
+    "code": "QF-07 rev 3",
+    "number": "MTL-2026-0412",
+    "subject": "Routine water analysis, spring sampling",
+    "date": "2026-03-12"
+  },
+  "client": {
+    "contact": "A. Sample",
+    "name": "Example Water Board",
+    "reference": null
+  },
+  "signer": { "name": "B. Analyst", "title": "Laboratory Supervisor" },
+  "received": "2026-03-02",
+  "analysed": { "start": "2026-03-03", "end": "2026-03-09" },
+  "samples": [{ "id": "W-1" }, { "id": "W-2" }, { "id": "W-3" }],
+  "remarks": ["Sample W-2 arrived above the holding temperature; its results are marked."],
+  "pending": { "count": 2 },
+  "tables": [
+    {
+      "title": "General chemistry",
+      "columns": ["Parameter", "Units", "W-1", "W-2"],
+      "rows": [
+        { "group": "Physical" },
+        ["pH", "pH units", 7.4, 7.1],
+        ["Conductivity", "µS/cm", 212, 248],
+        { "group": "Nutrients" },
+        ["Nitrate-N", "mg/L", 0.42, null],
+        ["Total phosphorus", "mg/L", 0.018, 0.022]
+      ],
+      "note": "Made-up values for a test."
+    },
+    {
+      "title": "Metals",
+      "columns": ["Parameter", "Units", "W-1", "W-2"],
+      "rows": [
+        ["Calcium", "mg/L", 18.2, 21.5],
+        ["Iron", "mg/L", 0.08, 0.11],
+        ["Manganese", "mg/L", 0.004, 0.006]
+      ]
+    }
+  ]
+}

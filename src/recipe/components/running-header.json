@@ -1,0 +1,22 @@
+{
+  "kind": "component",
+  "id": "running-header",
+  "title": "Running header",
+  "description": "A header line with text at the left and at the right edge, ruled underneath.",
+  "params": {
+    "left": { "default": null },
+    "right": { "default": null }
+  },
+  "blocks": [
+    {
+      "type": "paragraph",
+      "tabs": [{ "at": "end", "align": "right" }],
+      "borders": { "bottom": { "style": "single", "width": 0.5, "color": "999999" } },
+      "content": [
+        { "if": "params.left", "then": ["{{ params.left }}"] },
+        { "type": "tab" },
+        { "if": "params.right", "then": ["{{ params.right }}"] }
+      ]
+    }
+  ]
+}

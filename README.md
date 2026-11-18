@@ -10,6 +10,7 @@ no server, no Node at run time, no network.
 | `document-kit/docx` | `writeDocx(document)` writes the model as a Word file | `docs/model.md` |
 | `document-kit/layout` | `docxToPdf`, `docxToPages` (one SVG a page), `docxToHtml`, with fonts passed in as bytes | `docs/layout.md` |
 | `document-kit/template` | `fillTemplate`, `templateTags`, `checkTemplate` for Word templates with `{{ tags }}` | `docs/template.md` |
+| `document-kit/recipe` | Reports from JSON: components and recipes compiled into one JSON object (`compileRecipe`), rendered against data into the block model (`renderRecipe`), with the to-complete list, provenance and hand edits; the same `{{ tag }}` language as Word templates | `docs/recipe.md` |
 | `document-kit/ream` | The layout engine itself | `docs/ream-upstream.md` |
 | `document-kit/fonts/*` | Open fonts that stand in for Times New Roman, Arial, Calibri, Cambria and Courier New | `fonts/README.md` |
 
@@ -18,7 +19,7 @@ no server, no Node at run time, no network.
 ```ts
 import { document, section, heading, paragraph } from 'document-kit'
 import { writeDocx } from 'document-kit/docx'
-import { createFontProvider, docxToPdf, docxToPages } from 'document-kit/layout'
+import { createFontProvider, docxToPdf, docxToPages, layoutDocx } from 'document-kit/layout'
 
 const docx = await writeDocx(document([section([heading(1, 'Report'), paragraph('Made in the browser.')])]))
 
@@ -26,6 +27,9 @@ const docx = await writeDocx(document([section([heading(1, 'Report'), paragraph(
 const fonts = createFontProvider(async ({ file }) => new Uint8Array(await (await fetch(`/fonts/${file}`)).arrayBuffer()))
 const pdf = await docxToPdf(docx, { fonts })      // { bytes, pageCount, losses }
 const pages = await docxToPages(docx, { fonts })  // { pages: string[], pageSizes, pageText, losses }
+
+// Both from one layout (a preview, then the export):
+const laid = await layoutDocx(docx, { fonts })     // { pageCount, pageSizes, pageText, losses, toPdf(), toPages() }
 ```
 
 A Word file from anywhere goes through the same layout: one the `docx` library wrote, one a person made in

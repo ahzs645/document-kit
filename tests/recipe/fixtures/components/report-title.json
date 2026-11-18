@@ -1,0 +1,14 @@
+{
+  "kind": "component",
+  "id": "report-title",
+  "title": "Report title",
+  "description": "The report's title, with its status under it when it has one.",
+  "params": {
+    "title": { "required": true },
+    "status": { "default": null }
+  },
+  "blocks": [
+    { "type": "paragraph", "style": "title", "content": "{{ params.title }}" },
+    { "if": "params.status", "then": [{ "type": "paragraph", "style": "subtitle", "content": "Status: {{ params.status }}" }] }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "kind": "component",
+  "id": "results-table",
+  "title": "Results table",
+  "description": "One table of results from the data: its title, columns, rows (with group rows) and note.",
+  "params": {
+    "table": { "required": true, "description": "{ title, columns, rows, note? }" }
+  },
+  "blocks": [
+    {
+      "use": "data-table",
+      "with": {
+        "caption": "{{ params.table.title }}",
+        "columns": "{{ params.table.columns }}",
+        "rows": "{{ params.table.rows }}",
+        "note": "{{ params.table.note }}",
+        "widths": [3, 1, 1, 1],
+        "align": ["left", "center", "right", "right"]
+      }
+    }
+  ]
+}
