@@ -35,6 +35,7 @@
  * @module template/templateEngine
  */
 
+import { sentenceFilter } from './sentenceFilters.js';
 import { zipSync, Zippable } from 'fflate';
 import { DecompressionLimits, OfficeErrorType, IssueHandler, TemplateData, TemplateDataDetails, TemplateFormatter, TemplateLoopPlace, TemplateNumbersAsTextDetails, TemplateSyntaxDetails, TemplateTagInfo, TemplateTextReason, TemplateValue } from './types.js';
 import { shownTo80 } from './errors.js';
@@ -573,7 +574,8 @@ interface TagSpan { start: number; end: number; inner: string; tag: TemplateTag 
 
 /** Whether a name is a filter: a built-in one, or one of the caller's `formatters`. */
 function isFilter(name: string, ctx: PartContext): boolean {
-    return (BUILT_IN_FILTERS as readonly string[]).includes(name) || Object.prototype.hasOwnProperty.call(ctx.opts.formatters, name);
+    // document-kit: the sentence filters (sentenceFilters.ts) are filters too.
+    return (BUILT_IN_FILTERS as readonly string[]).includes(name) || sentenceFilter(name) !== undefined || Object.prototype.hasOwnProperty.call(ctx.opts.formatters, name);
 }
 
 /**
@@ -598,9 +600,13 @@ function compileFilters(filters: { name: string; args: (string | number)[] }[], 
             case 'lower':
                 if (filter.args.length) return unreadable(`writes something after ${filter.name}, which takes nothing`);
                 return { kind: filter.name };
-            default:
+            default: {
+                // document-kit: a sentence filter, when the caller gives none of that name.
+                const helper = sentenceFilter(filter.name);
+                if (helper) return { kind: 'custom', name: filter.name, run: helper as TemplateFormatter, args: filter.args };
                 // Not reached: a tag naming no filter is prose (see findTagSpans).
                 return unreadable(`uses ${filter.name}, which is not a filter`);
+            }
         }
     });
 }

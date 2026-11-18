@@ -12,6 +12,7 @@ import {
   type ISectionOptions,
 } from 'docx'
 import {
+  applyTextRules,
   expandDocument,
   numberCaptions,
   pageBox,
@@ -63,7 +64,8 @@ export async function writeDocx(document: Document, options: WriteDocxOptions = 
 /** The document as the docx library's object, before it is packed. */
 function buildDocx(source: Document, options: WriteDocxOptions): DocxDocument {
   if (!source.sections.length) throw new Error('document-kit: a document needs at least one section')
-  const document = expandDocument(source, options.registry)
+  // Custom blocks first, so the text they become takes the rules too.
+  const document = applyTextRules(expandDocument(source, options.registry)).document
   const theme = resolveTheme(document.theme)
   const captions = numberCaptions(document)
   const lists = createListRegistry()

@@ -4,6 +4,7 @@
  * picture code, and the application's), and text. Pure: no DOM, no network.
  */
 import { dateOf, formatDate, formatNumber, numberOf, type NumberTextSeparators, type PictureSettings } from '../template/templateFormat'
+import { sentenceFilter, SentenceFilterError } from '../template/sentenceFilters'
 import { RecipeError } from './errors'
 import { hasOwn, isRecord } from './json'
 import type { CompiledFilter } from './tags'
@@ -116,11 +117,32 @@ export function applyFilters(
   what: string,
   where: string,
   onUnknown?: (name: string) => void,
+  rules?: (value: unknown, ids: readonly string[]) => unknown,
 ): unknown {
   let current = value
   for (const filter of filters) {
+    if (filter.kind === 'missing') continue
+    if (filter.kind === 'rules') {
+      if (current === null || current === undefined || current === '') continue
+      if (!rules) throw new RecipeError('bad-value', `${what} names text rules, and the recipe has none`, where)
+      current = rules(current, filter.ids)
+      continue
+    }
     if (filter.kind === 'custom') {
-      const run = hasOwn(custom, filter.name) ? custom[filter.name] : undefined
+      const own = hasOwn(custom, filter.name) ? custom[filter.name] : undefined
+      // The application's filter of a sentence filter's name is used instead of the kit's.
+      const helper = !own && filter.helper ? sentenceFilter(filter.name) : undefined
+      if (helper) {
+        if (current === null || current === undefined) continue
+        try {
+          current = helper(current, ...filter.args)
+        } catch (error) {
+          if (error instanceof SentenceFilterError) throw new RecipeError('bad-value', `${what}: ${error.message}`, where)
+          throw error
+        }
+        continue
+      }
+      const run = own
       if (!run) {
         if (onUnknown) {
           onUnknown(filter.name)

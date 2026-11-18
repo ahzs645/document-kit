@@ -6,9 +6,12 @@
   "params": {
     "heading": { "default": null },
     "level": { "default": 2 },
-    "rows": { "required": true, "description": "A list of { label, value, what? }." },
+    "rows": { "required": true, "description": "A list of { label, value, what?, sameLine? }; sameLine puts a row on the line of the row before it when it fits." },
     "layout": { "default": "lines", "description": "lines or table." },
-    "labelWidth": { "default": null }
+    "labelWidth": { "default": null },
+    "size": { "default": null, "description": "Text size of the rows, points." },
+    "rowSpacing": { "default": null, "description": "Points after each row (lines layout)." },
+    "sameLineGap": { "default": null, "description": "Points before a row on the line of the row before it (24)." }
   },
   "blocks": [
     { "if": "params.heading", "then": [{ "type": "heading", "level": "{{ params.level }}", "content": "{{ params.heading }}" }] },
@@ -16,7 +19,10 @@
       "type": "fields",
       "layout": "{{ params.layout }}",
       "labelWidth": "{{ params.labelWidth }}",
-      "rows": [{ "for": "row in params.rows", "do": [{ "label": "{{ row.label }}", "value": "{{ row.value }}", "what": "{{ row.what }}" }] }]
+      "size": "{{ params.size }}",
+      "rowSpacing": "{{ params.rowSpacing }}",
+      "sameLineGap": "{{ params.sameLineGap }}",
+      "rows": [{ "for": "row in params.rows", "do": [{ "label": "{{ row.label }}", "value": "{{ row.value }}", "what": "{{ row.what }}", "sameLine": "{{ row.sameLine }}" }] }]
     }
   ]
 }

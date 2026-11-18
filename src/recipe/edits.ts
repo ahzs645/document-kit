@@ -11,7 +11,7 @@ import type { Block, CellInput, FieldRow, ListItem, RichText, TableBlock } from 
 /** Edits by key. An empty string blanks the value (printed blank and listed to complete). */
 export type RecipeEdits = Readonly<Record<string, string>>
 
-export type EditKind = 'field' | 'name' | 'cell' | 'paragraph' | 'item'
+export type EditKind = 'field' | 'name' | 'cell' | 'paragraph' | 'item' | 'choice' | 'answer'
 
 /** One printed value a person can change by hand. */
 export interface EditTarget {
@@ -26,6 +26,8 @@ export interface EditTarget {
   original: string | null
   /** The edit applied, when there is one. */
   edited?: string
+  /** A tick-box question's options: its edit is one of them, or empty for none ticked. */
+  options?: readonly string[]
 }
 
 const SEP = ' › '
@@ -49,16 +51,29 @@ export function applyEdits(
 ): { blocks: Block[]; targets: EditTarget[] } {
   const targets: EditTarget[] = []
   const seen = new Map<string, number>()
-  const leaf = (scope: string, kind: EditKind, label: string, original: string | null) => {
+  const leaf = (scope: string, kind: EditKind, label: string, original: string | null, options?: readonly string[]) => {
     const base = `${part.id}|${scope}|${kind}|${label}`
     const n = (seen.get(base) ?? 0) + 1
     seen.set(base, n)
     const key = n > 1 ? `${base}#${n}` : base
-    const has = Object.prototype.hasOwnProperty.call(edits, key) && typeof edits[key] === 'string'
-    targets.push({ key, part: part.id, partTitle: part.title, kind, label: [scope, label].filter(Boolean).join(SEP), original, ...(has ? { edited: edits[key] } : {}) })
+    // A tick that is not one of the question's options is not applied (it is kept, and reported as an orphan).
+    const has =
+      Object.prototype.hasOwnProperty.call(edits, key) &&
+      typeof edits[key] === 'string' &&
+      (!options || edits[key] === '' || options.includes(edits[key] as string))
+    targets.push({
+      key,
+      part: part.id,
+      partTitle: part.title,
+      kind,
+      label: [scope, label].filter(Boolean).join(SEP),
+      original,
+      ...(has ? { edited: edits[key] } : {}),
+      ...(options ? { options } : {}),
+    })
     if (!has) return null
     const text = edits[key] as string
-    return { value: text === '' ? null : ({ type: 'text', text, source } as const) }
+    return { text, value: text === '' ? null : ({ type: 'text', text, source } as const) }
   }
   const editRow = (row: FieldRow, scope: string, prefix: string, kind: EditKind = 'field'): FieldRow => {
     const label = [prefix, plainText(row.label).replace(/:\s*$/, '')].filter(Boolean).join(SEP)
@@ -107,6 +122,24 @@ export function applyEdits(
         }
         case 'table':
           return editTable(block, own)
+        case 'choices': {
+          const question = printed(block.label)?.replace(/:\s*$/, '') ?? ''
+          const chosen = Array.isArray(block.chosen) ? block.chosen.join(', ') || null : (block.chosen ?? null)
+          // A question that takes several ticks is edited as one tick; its options are its own.
+          const tick = Array.isArray(block.chosen) ? null : leaf(own, 'choice', question, chosen as string | null, block.options)
+          const answer = block.answer === undefined ? null : leaf(own, 'answer', question, printed(block.answer))
+          if (!tick && !answer) return block
+          return {
+            ...block,
+            ...(tick ? { chosen: tick.text === '' ? null : tick.text } : {}),
+            ...(answer ? { answer: answer.value === null ? null : [answer.value] } : {}),
+            source,
+          }
+        }
+        case 'pinned': {
+          const inner = walk(block.blocks, scope)
+          return inner.every((b, i) => b === block.blocks[i]) ? block : { ...block, blocks: inner }
+        }
         default:
           return block
       }

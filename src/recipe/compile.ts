@@ -9,7 +9,9 @@ import { jsonPath, RecipeError } from './errors'
 import { canonical, cloneJson, contentHash, hasOwn, isRecord } from './json'
 import { readLibrary, readRecipe } from './read'
 import { BLOCK_KEYS, CONTROL_KEYS, controlKind, ITEM_OF, isListPos, keysOf, type Pos } from './schema'
-import { BUILT_IN_FILTERS, customFilterNames, readCondition, readLoop, readString, TagSyntaxError, walkSegs, type CompiledFilter, type Loop } from './tags'
+import { BUILT_IN_FILTERS, customFilterNames, readCondition, readLoop, readString, ruleIdsOf, TagSyntaxError, walkSegs, type CompiledFilter, type Loop } from './tags'
+import { compileTextRules, TextRuleError } from '../model/textRules'
+import type { TextRule } from '../model/types'
 import type { TemplateExpression } from '../template/templateTags'
 import {
   RECIPE_FORMAT_VERSION,
@@ -86,6 +88,8 @@ interface Ctx {
   embedding: boolean
   /** Walking blocks a code component returned (at render): pictures as bytes pass, `use` reads `embedded`. */
   fromCode: boolean
+  /** The text rule ids the recipe's document defines, for the `rules` filter; null when not checked. */
+  ruleIds: ReadonlySet<string> | null
 }
 
 const fail = (code: ConstructorParameters<typeof RecipeError>[0], message: string, loc: Loc): never => {
@@ -148,11 +152,11 @@ export function applyChanges(sectionsIn: readonly RecipeSection[], changes: read
       const found = need(change.set)
       const part = sections[found.s]?.parts[found.p]
       if (!part) return
-      for (const key of ['variant', 'if', 'for', 'title', 'pageBreakBefore'] as const) {
+      for (const key of ['variant', 'if', 'for', 'title', 'pageBreakBefore', 'missing', 'pin', 'meta'] as const) {
         const value = change[key]
         if (value === undefined) continue
         if (value === null) delete part[key]
-        else (part as unknown as Record<string, unknown>)[key] = value
+        else (part as unknown as Record<string, unknown>)[key] = cloneJson(value as Json)
       }
       if (change.with) {
         const next: JsonObject = { ...(part.with ?? {}) }
@@ -199,7 +203,7 @@ export function resolveRecipe(
   recipe: Recipe,
   recipes: ReadonlyMap<string, Recipe>,
   limits: Pick<CompileLimits, 'extendsDepth'> = COMPILE_LIMITS,
-): { sections: RecipeSection[]; document: RecipeDocument; options: JsonObject; chain: Recipe[] } {
+): { sections: RecipeSection[]; document: RecipeDocument; options: JsonObject; chain: Recipe[]; missing?: Recipe['missing'] } {
   const chain: Recipe[] = [recipe]
   const seen = new Set([recipe.id])
   for (let current = recipe; current.extends !== undefined; ) {
@@ -220,7 +224,9 @@ export function resolveRecipe(
     options = { ...options, ...cloneJson((r.options ?? {}) as Json) as JsonObject }
     if (r.changes?.length) sections = applyChanges(sections, r.changes, `recipe/${r.id}`)
   }
-  return { sections, document: document as RecipeDocument, options, chain }
+  // The nearest recipe that states a missing-value rule gives it.
+  const missing = chain.find((r) => r.missing !== undefined)?.missing
+  return { sections, document: document as RecipeDocument, options, chain, ...(missing ? { missing } : {}) }
 }
 
 /* ------------------------------------------------------------------ needs */
@@ -277,6 +283,9 @@ function addNeed(ctx: Ctx, path: string | null, use: NeedUse, sym: Sym, out: Out
 }
 
 function noteFilters(ctx: Ctx, filters: readonly CompiledFilter[], loc: Loc) {
+  for (const id of ruleIdsOf(filters))
+    if (ctx.ruleIds && !ctx.ruleIds.has(id))
+      fail('bad-tag', `the rules filter names "${id}", which is not a text rule of the recipe's document (${[...ctx.ruleIds].join(', ') || 'it has none with an id'})`, loc)
   for (const name of customFilterNames(filters)) {
     if (ctx.filtersKnown && !ctx.filtersKnown.has(name))
       fail('unknown-filter', `the filter "${name}" is not format, upper, lower or one of the application's (${[...ctx.filtersKnown].join(', ') || 'none given'})`, loc)
@@ -458,7 +467,7 @@ function walkValue(value: unknown, pos: Pos, ctx: Ctx, sym: Sym, loc: Loc, out: 
     case 'cell':
     case 'listItem': {
       if (typeof value.type === 'string') {
-        const keys = keysOf('inline', value) ?? fail('bad-node', `an inline run's type is one of text, field, break, tab, blank, image, sentence`, at(loc, 'type'))
+        const keys = keysOf('inline', value) ?? fail('bad-node', `an inline run's type is one of text, field, break, tab, blank, image, sentence, checkbox`, at(loc, 'type'))
         return { type: value.type, ...walkKeys(value, keys, `a ${value.type} run`, ctx, sym, loc, out, ['type']) } as JsonObject
       }
       if (pos === 'cell') return walkKeys(value, keysOf('cell', value) ?? {}, 'a table cell', ctx, sym, loc, out)
@@ -621,6 +630,7 @@ function newCtx(components: ReadonlyMap<string, Component>, options: CompileOpti
     embedded: new Map(),
     embedding: false,
     fromCode: false,
+    ruleIds: null,
   }
 }
 
@@ -640,6 +650,21 @@ export function compileRecipe(recipe: string | Recipe, libraryIn: Library, optio
   const ctx = newCtx(components, options)
   const resolved = resolveRecipe(given, recipes, ctx.limits)
   const root: Loc = { root: `recipe/${given.id}`, steps: [] }
+  // The text rules are checked here, every problem named by its place, and carried as written.
+  const textRules = resolved.document.textRules
+  if (textRules !== undefined) {
+    try {
+      compileTextRules(textRules as unknown as TextRule[])
+    } catch (error) {
+      if (!(error instanceof TextRuleError)) throw error
+      const problems = error.problems.map((p) => ({
+        path: `${where(at(root, 'document', 'textRules', p.rule))}${p.key ? `.${p.key}` : ''}`,
+        message: `text rule ${p.rule} ${p.message}`,
+      }))
+      throw new RecipeError('invalid', error.message.replace(/^document-kit: /, ''), problems[0]?.path ?? where(root), problems)
+    }
+    ctx.ruleIds = new Set(textRules.flatMap((rule) => (isRecord(rule) && typeof rule.id === 'string' ? [rule.id] : [])))
+  } else ctx.ruleIds = new Set()
 
   const ids = new Set<string>()
   const sections: CompiledSection[] = resolved.sections.map((section, s) => {
@@ -667,10 +692,19 @@ export function compileRecipe(recipe: string | Recipe, libraryIn: Library, optio
       if (part.for !== undefined) sym = loop(part.for, ctx, sym, at(ploc, 'for'), [...pout, 'for']).sym
       if (part.if !== undefined) condition(part.if, ctx, sym, at(ploc, 'if'), [...pout, 'if'])
       const use = resolveUse(part.use, part.variant, part.with, 'block', ctx, sym, ploc, pout)
+      const componentMeta = use.kind === 'json' ? ctx.components.get(use.id)?.meta : undefined
       const result: CompiledPart = {
-        part: { id, component: use.id, title: part.title ?? use.title },
+        part: {
+          id,
+          component: use.id,
+          title: part.title ?? use.title,
+          ...(part.meta ? { meta: cloneJson(part.meta) as JsonObject } : {}),
+          ...(componentMeta ? { componentMeta: cloneJson(componentMeta) as JsonObject } : {}),
+        },
         params: use.params,
       }
+      if (part.missing !== undefined) result.missing = part.missing
+      if (part.pin !== undefined) result.pin = cloneJson(part.pin as Json) as CompiledPart['pin'] & Json
       if (part.if !== undefined) result.if = part.if
       if (part.for !== undefined) result.for = part.for
       if (part.pageBreakBefore !== undefined) result.pageBreakBefore = part.pageBreakBefore
@@ -686,6 +720,7 @@ export function compileRecipe(recipe: string | Recipe, libraryIn: Library, optio
   const top: Sym = { params: new Map(), vars: new Map(), inLoop: false, part: null, stack: [] }
   if (resolved.document.metadata) document.metadata = walkValue(resolved.document.metadata, 'any', ctx, top, at(root, 'document', 'metadata'), ['document', 'metadata']) as JsonObject
   if (resolved.document.theme) document.theme = walkValue(resolved.document.theme, 'any', ctx, top, at(root, 'document', 'theme'), ['document', 'theme']) as JsonObject
+  if (textRules !== undefined) document.textRules = cloneJson(textRules as Json) as Json[]
 
   const recipesFrom = resolved.chain.map((r) => ({ id: r.id, hash: contentHash(r) }))
   const componentsFrom = [...ctx.componentsUsed.values()].sort((a, b) => a.id.localeCompare(b.id)).map((c) => ({ id: c.id, hash: contentHash(c) }))
@@ -693,7 +728,13 @@ export function compileRecipe(recipe: string | Recipe, libraryIn: Library, optio
   const compiled: CompiledRecipe = {
     kind: 'compiled-recipe',
     version: RECIPE_FORMAT_VERSION,
-    recipe: { id: given.id, name: given.name, ...(given.description ? { description: given.description } : {}) },
+    recipe: {
+      id: given.id,
+      name: given.name,
+      ...(given.description ? { description: given.description } : {}),
+      ...(given.meta ? { meta: cloneJson(given.meta) as JsonObject } : {}),
+    },
+    ...(resolved.missing && resolved.missing !== 'blank' ? { missing: resolved.missing } : {}),
     from: { recipes: recipesFrom, components: componentsFrom, code: codeFrom, hash: contentHash({ recipes: recipesFrom, components: componentsFrom, code: codeFrom }) },
     document,
     options: resolved.options,

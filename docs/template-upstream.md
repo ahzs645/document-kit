@@ -112,6 +112,17 @@ ported ODT tests pass.
 - `DecompressionLimits` keeps all six limits so an officeParser configuration carries over unreported;
   `maxTableCells` and `maxRawContentLength` are documented as unused by templates.
 
+### Sentence filters
+
+- **Four filters of document-kit's own** (`sentenceFilters.ts`, new; `templateEngine.ts` `isFilter` and the
+  `default` branch of `compileFilters`, marked `document-kit:`): `capitalize`, `plural`, `prose` and
+  `ranges`, shared with JSON recipes (`docs/template.md`, "Sentence filters"). A caller's `formatters` entry of
+  the same name is used instead, so a template that already had one of these names as its own filter fills as
+  before; only `format`, `upper` and `lower` stay reserved names (`BUILT_IN_FILTER_NAMES`, unchanged). A tag
+  using one of the four is now a filter where it was text that looks like a tag (`TEMPLATE_NOT_A_TAG`) when no
+  formatter of that name was given. Pinned by `tests/template/sentence-filters.test.ts`; officeParser's own
+  tests are unchanged and pass.
+
 ### Type fixes
 
 - `TemplateSyntaxDetails.detail` is `string | undefined` where it was `string`, because the engine sets it

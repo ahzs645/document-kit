@@ -133,9 +133,32 @@ Write a value through `format` and a picture, as Word's own mail merge does:
   Send dates without times with no offset, or as full times.
 - Month and day names are English unless the program gives others (`dateNames`).
 - `upper` and `lower` change case; filters chain left to right: `{{ code | lower | upper }}`. The program
-  can add filters of its own (`formatters`), used the same way: `{{ name | initials }}`.
+  can add filters of its own (`formatters`), used the same way: `{{ name | initials }}`. The sentence
+  filters (below) are there too.
 - A number picture on text that is not a number, or a date picture on something that is not a date,
   stops the fill with `TEMPLATE_DATA_INVALID`.
+
+### Sentence filters
+
+Four filters help a sentence read right around what fills it. They work the same in a Word template and in
+a JSON recipe, and chain with the others:
+
+```text
+{{ count | plural "sample was" "samples were" | capitalize }} received.     Samples were received.
+{{ n }} {{ n | plural "bottle" }}                                         1 bottle / 3 bottles
+{{ names | prose }}                                                       A, B and C
+{{ names | prose "or" }}                                                  A, B or C
+{{ ids | ranges | prose }}                                                S-1–S-3 and S-7
+```
+
+| Filter | What it does |
+|---|---|
+| `capitalize` | A plain lower-case first word gets a capital ("three" → "Three"), for a fill that opens a sentence. A word cased on purpose ("pH", "mL") and a value that is one letter alone (a footnote marker) are left as they are. |
+| `plural "one" "many"` | The first word for a count of exactly one, the second otherwise (the first with an `s` when the second is left out). The count is a number, a number written as text, or a list (its length). Anything else stops the fill with an error naming the filter. |
+| `prose "and" ", "` | A list joined as a sentence says it: "a", "a and b", "a, b and c". The first argument is the last joining word (`and` by default), the second what goes between the others (`, ` by default). Empty items are left out. A value that is not a list is printed as it is. |
+| `ranges "–" 3` | A list with each run of consecutive values collapsed to its first and last: numbers (`1, 2, 3, 5` → `1–3`, `5`) or texts that differ only in a number at their end (`S-1`, `S-2`, `S-3`). The first argument is the dash (`–` by default), the second the shortest run collapsed (3 by default; shorter runs are listed). It gives a list, in the order given, for `prose` to join. |
+
+A program's own filter of the same name (`formatters`) is used instead of the kit's.
 
 ### Headers, footers and the rest
 
@@ -216,7 +239,7 @@ The names are officeParser's.
 | `numericTextComparison` | text, with a warning | `'number'` compares two texts that are numbers as numbers; `'text'` as text, without the warning |
 | `dateNames` | English | `months`, `monthsShort`, `days`, `daysShort` (Sunday first), `am`, `pm` |
 | `utcOffsetMinutes` | `0` | Minutes added to UTC before a date is printed (−480 for Pacific Standard Time) |
-| `formatters` | none | Filters of your own: `{ initials: (value) => ... }` |
+| `formatters` | none | Filters of your own: `{ initials: (value) => ... }`. One named `capitalize`, `plural`, `prose` or `ranges` is used in place of the kit's; `format`, `upper` and `lower` cannot be replaced |
 | `fileType` | | `'docx'`, `'odt'` or `'ott'`: only changes the wording of the unsupported-format error; the format is read from the bytes |
 | `decompressionLimits` | 512 MB, 10,000 entries, 2,000,000 XML elements, 16 MiB repeated | Bounds for an untrusted template: `maxUncompressedBytes`, `maxZipEntries`, `maxXmlElements`, `maxRepeatedContent` (what loops and repeated values may add; past it the fill stops with `OUTPUT_TOO_LARGE`) |
 | `onWarning` | | Called with each warning (`TEMPLATE_NOT_A_TAG`, `TEMPLATE_NUMBERS_COMPARED_AS_TEXT`, `UNRECOGNIZED_CONFIG_OPTION`, `INVALID_CONFIG_VALUE`, `TEMPLATE_CHECK_LIMITED`) and each error before it is thrown. Without it, warnings are not reported anywhere |

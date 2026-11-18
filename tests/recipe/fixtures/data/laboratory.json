@@ -9,8 +9,12 @@
   "client": {
     "contact": "A. Sample",
     "name": "Example Water Board",
-    "reference": null
+    "reference": null,
+    "email": "office@example.org",
+    "phone": "555-0100"
   },
+  "lab": { "contact": "Phone 555-0199 | lab@example.org | www.example.org/lab" },
+  "footnotes": ["a Made-up guideline limit.", "b Below the reporting limit."],
   "signer": { "name": "B. Analyst", "title": "Laboratory Supervisor" },
   "received": "2026-03-02",
   "analysed": { "start": "2026-03-03", "end": "2026-03-09" },
@@ -26,8 +30,9 @@
         ["pH", "pH units", 7.4, 7.1],
         ["Conductivity", "µS/cm", 212, 248],
         { "group": "Nutrients" },
-        ["Nitrate-N", "mg/L", 0.42, null],
-        ["Total phosphorus", "mg/L", 0.018, 0.022]
+        ["Nitrate as NO3 a", "mg/L", 0.42, null],
+        ["Total phosphorus", "mg/L", 0.018, 0.022],
+        ["M. exemplum b", "count", 0, 1]
       ],
       "note": "Made-up values for a test."
     },
@@ -35,7 +40,7 @@
       "title": "Metals",
       "columns": ["Parameter", "Units", "W-1", "W-2"],
       "rows": [
-        ["Calcium", "mg/L", 18.2, 21.5],
+        ["Hardness as CaCO3", "mg/L", 64, 71],
         ["Iron", "mg/L", 0.08, 0.11],
         ["Manganese", "mg/L", 0.004, 0.006]
       ]

@@ -47,6 +47,23 @@ class Checker {
     this.problem(path, `${what} is not an id (letters, digits, - _ . and at most 100 of them): ${JSON.stringify(value)}`)
     return false
   }
+  /** `meta`: any JSON object, read as JSON and nothing more. */
+  meta(value: unknown, path: Path) {
+    if (value === undefined) return
+    if (this.object(value, path, 'meta')) this.json(value, path, 'meta')
+  }
+  /** A missing-value rule. */
+  missing(value: unknown, path: Path) {
+    if (value !== undefined && value !== 'blank' && value !== 'placeholder') this.problem(path, 'missing is "blank" or "placeholder"')
+  }
+  /** A part's pin: "bottom", or { at: "bottom", spaceBelow }. */
+  pin(value: unknown, path: Path) {
+    if (value === undefined || value === 'bottom') return
+    if (!this.object(value, path, 'pin')) return
+    this.keys(value, ['at', 'spaceBelow'], path, 'pin')
+    if (value.at !== undefined && value.at !== 'bottom') this.problem([...path, 'at'], 'pin.at is "bottom"')
+    if (value.spaceBelow !== undefined && (typeof value.spaceBelow !== 'number' || !(value.spaceBelow >= 0))) this.problem([...path, 'spaceBelow'], 'pin.spaceBelow is a number of points from 0')
+  }
   bool(value: unknown, path: Path, what: string) {
     if (value !== undefined && typeof value !== 'boolean') this.problem(path, `${what} is not true or false`)
   }
@@ -97,7 +114,7 @@ class Checker {
   }
 }
 
-const COMPONENT_KEYS = ['kind', 'version', 'id', 'title', 'description', 'params', 'variants', 'blocks']
+const COMPONENT_KEYS = ['kind', 'version', 'id', 'title', 'description', 'params', 'variants', 'blocks', 'meta']
 const PARAM_KEYS = ['default', 'required', 'description']
 const VARIANT_KEYS = ['title', 'description', 'blocks', 'with']
 
@@ -136,9 +153,10 @@ function checkComponent(c: Checker, value: unknown, path: Path) {
     }
   }
   c.blocks(value.blocks, [...path, 'blocks'], 'The component\'s blocks')
+  c.meta(value.meta, [...path, 'meta'])
 }
 
-const PART_KEYS = ['use', 'id', 'title', 'variant', 'with', 'if', 'for', 'pageBreakBefore']
+const PART_KEYS = ['use', 'id', 'title', 'variant', 'with', 'if', 'for', 'pageBreakBefore', 'missing', 'pin', 'meta']
 
 function checkPart(c: Checker, value: unknown, path: Path) {
   if (!c.object(value, path, 'A part')) return
@@ -151,6 +169,9 @@ function checkPart(c: Checker, value: unknown, path: Path) {
   c.string(value.if, [...path, 'if'], 'The part\'s condition', true)
   c.string(value.for, [...path, 'for'], 'The part\'s loop', true)
   c.bool(value.pageBreakBefore, [...path, 'pageBreakBefore'], 'pageBreakBefore')
+  c.missing(value.missing, [...path, 'missing'])
+  c.pin(value.pin, [...path, 'pin'])
+  c.meta(value.meta, [...path, 'meta'])
 }
 
 const SECTION_KEYS = ['id', 'page', 'header', 'footer', 'firstPage', 'pageNumbers', 'parts']
@@ -201,8 +222,11 @@ function checkChange(c: Checker, value: unknown, path: Path) {
     c.id(value.move, [...path, 'move'], 'The part moved')
     checkAnchor(c, value, path)
   } else if ('set' in value) {
-    c.keys(value, ['set', 'variant', 'with', 'if', 'for', 'title', 'pageBreakBefore'], path, 'A set change')
+    c.keys(value, ['set', 'variant', 'with', 'if', 'for', 'title', 'pageBreakBefore', 'missing', 'pin', 'meta'], path, 'A set change')
     c.id(value.set, [...path, 'set'], 'The part set')
+    if (value.missing !== null) c.missing(value.missing, [...path, 'missing'])
+    if (value.pin !== null) c.pin(value.pin, [...path, 'pin'])
+    if (value.meta !== null) c.meta(value.meta, [...path, 'meta'])
     if (value.with !== undefined && c.object(value.with, [...path, 'with'], 'with')) c.json(value.with, [...path, 'with'], 'with')
     for (const key of ['variant', 'if', 'for', 'title'])
       if (value[key] !== undefined && value[key] !== null && typeof value[key] !== 'string')
@@ -217,7 +241,7 @@ function checkChange(c: Checker, value: unknown, path: Path) {
   } else c.problem(path, 'A change is none of add, remove, replace, move, set, setSection, addSection')
 }
 
-const RECIPE_KEYS = ['kind', 'version', 'id', 'name', 'description', 'extends', 'document', 'options', 'sections', 'changes', 'own']
+const RECIPE_KEYS = ['kind', 'version', 'id', 'name', 'description', 'extends', 'document', 'options', 'sections', 'changes', 'own', 'missing', 'meta']
 
 function checkRecipe(c: Checker, value: unknown, path: Path) {
   if (!c.object(value, path, 'A recipe')) return
@@ -230,13 +254,19 @@ function checkRecipe(c: Checker, value: unknown, path: Path) {
     c.problem([...path, 'description'], 'The description is not a string')
   c.id(value.extends, [...path, 'extends'], 'The recipe it extends', true)
   if (c.object(value.document, [...path, 'document'], 'The document', true)) {
-    c.keys(value.document, ['metadata', 'theme'], [...path, 'document'], 'The document')
+    c.keys(value.document, ['metadata', 'theme', 'textRules'], [...path, 'document'], 'The document')
+    if (value.document.textRules !== undefined) {
+      if (!Array.isArray(value.document.textRules)) c.problem([...path, 'document', 'textRules'], 'The text rules are not a list')
+      else c.json(value.document.textRules, [...path, 'document', 'textRules'], 'The text rules')
+    }
     if (c.object(value.document.metadata, [...path, 'document', 'metadata'], 'The metadata', true))
       c.json(value.document.metadata, [...path, 'document', 'metadata'], 'The metadata')
     if (c.object(value.document.theme, [...path, 'document', 'theme'], 'The theme', true))
       c.json(value.document.theme, [...path, 'document', 'theme'], 'The theme')
   }
   if (c.object(value.options, [...path, 'options'], 'The options', true)) c.json(value.options, [...path, 'options'], 'The options')
+  c.missing(value.missing, [...path, 'missing'])
+  c.meta(value.meta, [...path, 'meta'])
   if (value.sections !== undefined) {
     if (!Array.isArray(value.sections) || !value.sections.length) c.problem([...path, 'sections'], 'The sections are not a list of at least one')
     else value.sections.forEach((section, i) => checkSection(c, section, [...path, 'sections', i]))
@@ -323,8 +353,8 @@ export function readOverrides(value: unknown): LibraryOverrides {
   return c.done(value as LibraryOverrides, 'The overrides')
 }
 
-const COMPILED_KEYS = ['kind', 'version', 'recipe', 'from', 'document', 'options', 'sections', 'needs', 'customKinds', 'filters', 'code', 'embedded']
-const COMPILED_PART_KEYS = ['part', 'if', 'for', 'pageBreakBefore', 'variant', 'params', 'blocks', 'code']
+const COMPILED_KEYS = ['kind', 'version', 'recipe', 'from', 'missing', 'document', 'options', 'sections', 'needs', 'customKinds', 'filters', 'code', 'embedded']
+const COMPILED_PART_KEYS = ['part', 'if', 'for', 'pageBreakBefore', 'variant', 'missing', 'pin', 'params', 'blocks', 'code']
 
 /**
  * A compiled recipe read back (from storage or a file): its shape checked, a newer version refused. The block
@@ -342,6 +372,7 @@ export function readCompiledRecipe(value: unknown): CompiledRecipe {
       c.string(value.recipe.name, ['recipe', 'name'], 'The recipe\'s name')
     }
     if (c.object(value.from, ['from'], 'from')) c.string(value.from.hash, ['from', 'hash'], 'The hash')
+    c.missing(value.missing, ['missing'])
     c.object(value.document, ['document'], 'The document')
     c.object(value.options, ['options'], 'The options')
     for (const key of ['needs', 'customKinds', 'filters', 'code'])
@@ -356,7 +387,10 @@ export function readCompiledRecipe(value: unknown): CompiledRecipe {
           const at = ['sections', s, 'parts', p]
           if (!c.object(part, at, 'A part')) return
           c.keys(part, COMPILED_PART_KEYS, at, 'A compiled part')
+          c.missing(part.missing, [...at, 'missing'])
+          c.pin(part.pin, [...at, 'pin'])
           if (c.object(part.part, [...at, 'part'], 'The part\'s mark')) {
+            c.keys(part.part, ['id', 'component', 'title', 'meta', 'componentMeta'], [...at, 'part'], 'A part\'s mark')
             c.id(part.part.id, [...at, 'part', 'id'], 'The part\'s id')
             c.id(part.part.component, [...at, 'part', 'component'], 'The part\'s component')
             c.string(part.part.title, [...at, 'part', 'title'], 'The part\'s title')

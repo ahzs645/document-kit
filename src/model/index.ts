@@ -2,10 +2,13 @@ export type * from './types'
 export { DEFAULT_MARGINS, DEFAULT_THEME, PAPER, resolveTheme } from './theme'
 export { pageBox, type PageBox } from './page'
 export {
+  CHECKED_BOX,
+  EMPTY_BOX,
   fillSlots,
   inlines,
   isEmptyText,
   isRichText,
+  placeholderSentence,
   plainText,
   resolveSentences,
   sentenceText,
@@ -35,4 +38,17 @@ export {
   type CaptionKind,
 } from './captions'
 export { toComplete, type ToCompleteItem, type ToCompleteKind, type ToCompleteOptions } from './complete'
+export {
+  applyTextRules,
+  compileTextRules,
+  linkHref,
+  ruleText,
+  TEXT_RULE_LIMITS,
+  TextRuleError,
+  type AppliedTextRules,
+  type CompiledTextRules,
+  type SkippedText,
+  type TextRuleLimits,
+  type TextRuleProblem,
+} from './textRules'
 export * from './builders'

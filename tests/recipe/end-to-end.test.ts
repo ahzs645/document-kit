@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { writeDocx } from '../../src/docx'
 import { createFontProvider, layoutDocx } from '../../src/layout'
 import { compileRecipe, renderRecipe, type CompiledRecipe } from '../../src/recipe'
-import { makePng } from '../docx/helpers'
+import { makePng, readPackage } from '../docx/helpers'
 import { diskLoader } from '../layout/sample'
 import { code, fixtureData, fixtureLibrary, registry } from './fixtures/library'
 
@@ -37,7 +37,7 @@ async function run(recipe: string, data: Record<string, unknown>, options: Param
 
 describe('a laboratory-style report', () => {
   it('prints its letterhead, fields, notes, one table per set of results and a signature', async () => {
-    const { compiled, rendered, laid, text, flat } = await run('laboratory', fixtureData('laboratory'), {
+    const { compiled, rendered, docx, laid, text, flat } = await run('laboratory', fixtureData('laboratory'), {
       sources: { 'tables[].rows': 'instrument', client: 'office' },
     })
     keep('laboratory.compiled.json', `${JSON.stringify(compiled, null, 2)}\n`)
@@ -48,8 +48,22 @@ describe('a laboratory-style report', () => {
     expect(text).toContain('Attention: A. Sample')
     expect(flat).toContain('3 samples were received on 2 March 2026 in good condition.')
     expect(flat).toContain('They were analysed between 3 March and 9 March 2026.')
-    // The sentence whose slot the data lacks is not printed.
-    expect(text).not.toContain('reported on')
+    // The notes take the placeholder rule: the sentence whose slot the data lacks prints its slot's name, marked.
+    expect(flat).toContain('Results are reported on [basis].')
+    expect(text).toContain('E-mail: office@example.org')
+    // The phone shares the e-mail's line; its spaces and hyphen do not break.
+    expect(text).toMatch(/E-mail: office@example\.org\s+Phone:\s555‑0100/)
+    // The contact block is pinned to the foot of the last page, under everything else on it.
+    const last = laid.pageText[laid.pageText.length - 1]!.split('\n')
+    expect(last.slice(-4, -1).join(' ')).toContain('Phone 555-0199 | lab@example.org | www.example.org/lab')
+    // The text rules reach the Word file as ordinary runs: links, a raised marker, a low digit, a term in italics.
+    const xml = readPackage(docx).document
+    expect(xml).toMatch(/<w:hyperlink [^>]*>[\s\S]*?<w:t[^>]*>lab@example\.org<\/w:t>/)
+    expect(xml).toMatch(/<w:vertAlign w:val="superscript"\/>[\s\S]{0,200}<w:t[^>]*>a<\/w:t>/)
+    expect(xml).toMatch(/<w:vertAlign w:val="subscript"\/>[\s\S]{0,200}<w:t[^>]*>3<\/w:t>/)
+    expect(xml).toMatch(/<w:i\/>[\s\S]{0,200}<w:t[^>]*>M\. exemplum<\/w:t>/)
+    // The signature takes its options: centred, the title on the name's line.
+    expect(text).toContain('B. Analyst, Laboratory Supervisor')
     expect(text).toContain('General chemistry')
     expect(text).toContain('Metals')
     expect(text).toContain('Nutrients')
@@ -60,7 +74,7 @@ describe('a laboratory-style report', () => {
     expect(rendered.toComplete.map((item) => [item.partId, item.kind, item.what])).toEqual([
       ['addressee', 'field', 'Client reference'],
       ['notes', 'sentence', 'Method'],
-      ['results', 'cell', 'General chemistry, Nitrate-N, W-2'],
+      ['results', 'cell', 'General chemistry, Nitrate as NO3 a, W-2'],
     ])
     expect(fetchSpy).not.toHaveBeenCalled()
   }, 60_000)
@@ -107,7 +121,9 @@ describe('a review-style report', () => {
     const last = (laid.pageText[laid.pageText.length - 1] ?? '').replace(/\s+/g, ' ')
     expect(last).toContain('Inventory date')
     expect(last).toContain('Viewpoint 2, highway pull-out: Visibility (needs visibility)')
-    expect(rendered.toComplete.map((item) => item.partId)).toEqual(['project', 'summary', 'discussion', 'inventory-table'])
+    expect(rendered.toComplete.map((item) => item.partId)).toEqual(['project', 'summary', 'discussion', 'objective-met', 'inventory-table'])
+    // The tick-box question: boxes drawn, the chosen one crossed, in a ruled box.
+    expect(flat).toMatch(/Is the made-up objective met\?.*☐\s?Yes ☒\s?Partly ☐\s?No/)
     expect(fetchSpy).not.toHaveBeenCalled()
   }, 60_000)
 })

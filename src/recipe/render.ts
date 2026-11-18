@@ -8,8 +8,12 @@
  * printed and is listed. A missing value tested by a condition is false, and a missing list repeats nothing.
  */
 import {
+  compileTextRules,
   plainText,
+  ruleText,
   toComplete as modelToComplete,
+  type CompiledTextRules,
+  type TextRule,
   type Block,
   type CustomRegistry,
   type Document,
@@ -25,7 +29,7 @@ import { jsonPath, RecipeError } from './errors'
 import { hasOwn, isRecord } from './json'
 import { readCompiledRecipe } from './read'
 import { CONTROL_KEYS, controlKind, ITEM_OF, isListPos, keysOf, type Pos } from './schema'
-import { readCondition, readLoop, readString, type Condition, type FieldSeg, type Loop, type ParsedString, type Seg } from './tags'
+import { missingOf, readCondition, readLoop, readString, type Condition, type FieldSeg, type Loop, type ParsedString, type Seg } from './tags'
 import {
   applyFilters,
   formatting,
@@ -41,7 +45,7 @@ import {
   type RecipeFilter,
   type SourceMap,
 } from './values'
-import type { CompiledPart, CompiledRecipe, Json, JsonObject } from './types'
+import type { CompiledPart, CompiledRecipe, Json, JsonObject, MissingRule } from './types'
 
 /** Bounds on a render. */
 export const RENDER_LIMITS = {
@@ -93,6 +97,9 @@ export interface RenderedPart {
   toComplete: number
   /** Times it was printed (its `for` passes that met its `if`). */
   repeats: number
+  /** The part's own `meta` and its component's, as the recipe and component give them. */
+  meta?: JsonObject
+  componentMeta?: JsonObject
 }
 
 export interface RenderResult {
@@ -172,6 +179,12 @@ interface State {
   strings: Map<string, ParsedString>
   conditions: Map<string, Condition>
   loops: Map<string, Loop>
+  /** The missing-value rule of the part being rendered (the recipe's in headers and footers). */
+  missing: MissingRule
+  /** The recipe's text rules, read once, for the `rules` filter. */
+  rules: CompiledTextRules | null
+  /** Placeholders named after their tag, which a field row names after its label instead. */
+  autoNamed: WeakSet<object>
 }
 
 const where = (out: Out) => jsonPath(out)
@@ -276,8 +289,20 @@ function parsed(state: State, text: string, out: Out): ParsedString {
 function filtered(state: State, field: FieldSeg, scope: Scope, out: Out): Bound | typeof MISSING {
   const found = lookup(state, field.path, scope, 'value', out)
   if (found === MISSING || !field.filters.length) return found
-  const value = applyFilters(found.value, field.filters, state.format, state.filters, field.text, where(out), state.check ? (name) => problem(state, { code: 'missing-filter', at: where(out), message: `no filter "${name}"` }) : undefined)
+  const value = applyFilters(found.value, field.filters, state.format, state.filters, field.text, where(out), state.check ? (name) => problem(state, { code: 'missing-filter', at: where(out), message: `no filter "${name}"` }) : undefined, rulesFilter(state, field.text, out))
   return { ...found, value }
+}
+
+/** The `rules` filter: a value's text with the named text rules applied, as runs. */
+function rulesFilter(state: State, what: string, out: Out) {
+  return (value: unknown, ids: readonly string[]): unknown => {
+    if (!state.rules) throw new RecipeError('bad-value', `${what} names text rules, and the recipe's document has none`, where(out))
+    const unknown = ids.find((id) => !state.rules?.rules.some((rule) => rule.id === id))
+    if (unknown !== undefined) throw new RecipeError('bad-value', `${what} names the text rule "${unknown}", which the recipe's document does not have`, where(out))
+    const plain = unwrapDeep(value)
+    const rich = asRich(plain) ?? valueText(plain, what, where(out)) ?? ''
+    return ruleText(rich, state.rules, { use: ids })
+  }
 }
 
 function test(state: State, text: string, scope: Scope, out: Out): boolean {
@@ -386,18 +411,24 @@ function lone(state: State, field: FieldSeg, scope: Scope, out: Out): Lone {
   return { value: found.value, empty: isEmptyValue(found.value), absent: found.value === undefined, path, ...(found.source ? { source: found.source } : {}) }
 }
 
-/** A piece of text: printed text (with its source), or a value with none. */
-type Piece = { text: string; source?: string } | { missing: string; path: string; absent: boolean; source?: string }
+/** A piece of text: printed text (with its source), runs a value gave, or a value with none (and its missing rule). */
+type Piece =
+  | { text: string; source?: string }
+  | { runs: Inline[]; source?: string }
+  | { missing: string; path: string; absent: boolean; source?: string; rule?: { mode: MissingRule; name?: string } }
 
 function pieces(state: State, segs: readonly Seg[], scope: Scope, out: Out, into: Piece[] = []): Piece[] {
   for (const seg of segs) {
     if (seg.t === 'text') into.push({ text: seg.text })
     else if (seg.t === 'field') {
       const value = lone(state, seg, scope, out)
-      if (value.empty) into.push({ missing: seg.text, path: value.path, absent: value.absent, ...(value.source ? { source: value.source } : {}) })
+      const rule = missingOf(seg.filters)
+      if (value.empty) into.push({ missing: seg.text, path: value.path, absent: value.absent, ...(value.source ? { source: value.source } : {}), ...(rule ? { rule } : {}) })
       else {
-        const text = valueText(unwrapDeep(value.value), seg.text, where(out)) ?? ''
-        into.push({ text, ...(value.source ? { source: value.source } : {}) })
+        const plain = unwrapDeep(value.value)
+        const rich = asRich(plain)
+        if (rich) into.push({ runs: rich, ...(value.source ? { source: value.source } : {}) })
+        else into.push({ text: valueText(plain, seg.text, where(out)) ?? '', ...(value.source ? { source: value.source } : {}) })
       }
     } else if (seg.t === 'if') {
       const branch = seg.branches.find((b) => testCondition(state, b.condition, scope, out))
@@ -429,7 +460,9 @@ function richFromString(state: State, text: string, scope: Scope, out: Out, styl
   if (read.kind === 'raw') {
     const value = lone(state, read.field, scope, out)
     if (value.empty) {
-      if (empty === 'null') {
+      const rule = missingOf(read.field.filters)
+      const placeholder = (rule?.mode ?? state.missing) === 'placeholder'
+      if (empty === 'null' && !placeholder) {
         state.lastNullSource = value.source
         return null
       }
@@ -437,7 +470,7 @@ function richFromString(state: State, text: string, scope: Scope, out: Out, styl
         if (value.absent) gap(state, read.field.text, value.path, value.source)
         return null
       }
-      return [{ ...style, type: 'blank', what: read.field.text, ...(value.source ? { source: value.source } : {}) } as Inline]
+      return [missingRun(state, style, read.field.text, value.source, placeholder, rule?.name)]
     }
     const plain = unwrapDeep(value.value)
     const rich = asRich(plain)
@@ -447,14 +480,29 @@ function richFromString(state: State, text: string, scope: Scope, out: Out, styl
   }
   const runs: Inline[] = []
   for (const piece of pieces(state, read.segs, scope, out)) {
-    if ('missing' in piece) runs.push({ ...style, type: 'blank', what: piece.missing, ...(piece.source ? { source: piece.source } : {}) } as Inline)
+    if ('missing' in piece)
+      runs.push(missingRun(state, style, piece.missing, piece.source, (piece.rule?.mode ?? state.missing) === 'placeholder', piece.rule?.name))
+    else if ('runs' in piece) runs.push(...piece.runs.map((run) => withSource(Object.keys(style).length && typeof run === 'string' ? ({ ...style, type: 'text', text: run } as Inline) : run, piece.source)))
     else if (piece.source || Object.keys(style).length) runs.push({ ...style, type: 'text', text: piece.text, ...(piece.source ? { source: piece.source } : {}) } as Inline)
     else runs.push(piece.text)
   }
   return merge(runs)
 }
 
-const INLINE_TYPES = new Set(['text', 'field', 'break', 'tab', 'blank', 'image', 'sentence'])
+/** A value with none, printed: a blank rule, or under the placeholder rule its bracketed name, marked. */
+function missingRun(state: State, style: Style, tag: string, source: string | undefined, placeholder: boolean, name?: string): Inline {
+  const run = {
+    ...style,
+    type: 'blank',
+    what: name ?? tag,
+    ...(source ? { source } : {}),
+    ...(placeholder ? { show: 'placeholder' } : {}),
+  } as Inline
+  if (placeholder && name === undefined) state.autoNamed.add(run as object)
+  return run
+}
+
+const INLINE_TYPES = new Set(['text', 'field', 'break', 'tab', 'blank', 'image', 'sentence', 'checkbox'])
 const isInlineObject = (value: unknown) => isRecord(value) && typeof value.type === 'string' && INLINE_TYPES.has(value.type)
 
 /** A data value that is already rich text (a run, or runs), or null. */
@@ -467,7 +515,7 @@ function asRich(value: unknown): Inline[] | null {
 const withSource = (inline: Inline, source: string | undefined): Inline => {
   if (!source) return inline
   if (typeof inline === 'string') return { type: 'text', text: inline, source }
-  if ((inline.type === 'text' || inline.type === 'blank' || inline.type === 'sentence') && inline.source === undefined) return { ...inline, source }
+  if ((inline.type === 'text' || inline.type === 'blank' || inline.type === 'sentence' || inline.type === 'checkbox') && inline.source === undefined) return { ...inline, source }
   return inline
 }
 
@@ -494,7 +542,7 @@ function plainFromString(state: State, text: string, scope: Scope, out: Out): st
     if ('missing' in piece) {
       if (piece.absent) gap(state, piece.missing, piece.path, piece.source)
     } else {
-      printed += piece.text
+      printed += 'runs' in piece ? plainText(piece.runs) : piece.text
       any = true
     }
   }
@@ -534,6 +582,12 @@ function evalValue(state: State, value: unknown, pos: Pos, scope: Scope, out: Ou
         return runs === null ? OMIT : richValue(runs)
       }
       case 'caption': {
+        // A caption the data gives whole ({ text, numbered }) is taken as it is.
+        const read = parsed(state, value, out)
+        if (read.kind === 'raw') {
+          const whole = unwrapDeep(lone(state, read.field, scope, out).value)
+          if (isRecord(whole) && !('type' in whole) && 'text' in whole) return whole
+        }
         const runs = richFromString(state, value, scope, out, {}, 'omit')
         return runs === null ? OMIT : { text: richValue(runs) }
       }
@@ -611,6 +665,11 @@ function evalValue(state: State, value: unknown, pos: Pos, scope: Scope, out: Ou
       return record
     case 'block':
       return evalBlock(state, record, scope, out)
+    case 'caption': {
+      // A caption whose text has no value is left out whole.
+      const caption = evalObject(state, record, keysOf('caption', record) ?? {}, scope, out)
+      return caption.text === undefined ? OMIT : caption
+    }
     case 'inline':
     case 'rich':
     case 'richNull':
@@ -660,6 +719,14 @@ function evalObject(state: State, record: Record<string, unknown>, keys: Record<
   }
   // A blank that the data says would come from somewhere carries that source onto its row or cell.
   if (nullSource && result.source === undefined && ('value' in keys || 'content' in keys)) result.source = nullSource
+  // A field's placeholder is named after the field, unless its tag named it.
+  if ('value' in keys && 'label' in keys && Array.isArray(result.value) && result.value.length === 1) {
+    const only = result.value[0] as Record<string, unknown> | undefined
+    if (only && state.autoNamed.has(only)) {
+      const label = plainText(result.label as never).replace(/:\s*$/, '').trim()
+      if (label) result.value = [{ ...only, what: typeof result.what === 'string' ? result.what : label }]
+    }
+  }
   return result
 }
 
@@ -688,6 +755,7 @@ function evalInline(state: State, record: Record<string, unknown>, scope: Scope,
   }
   if (type === 'sentence') {
     const run = evalObject(state, record, keys, scope, out) as Record<string, unknown>
+    if (run.missing === undefined && state.missing === 'placeholder') run.missing = 'placeholder'
     if (run.source === undefined) {
       const sources = new Set<string>()
       for (const member of Object.values(isRecord(record.values) ? record.values : {})) {
@@ -888,6 +956,9 @@ function newState(compiled: CompiledRecipe, data: unknown, options: RenderOption
     strings: new Map(),
     conditions: new Map(),
     loops: new Map(),
+    missing: compiled.missing ?? 'blank',
+    rules: compiled.document.textRules?.length ? compileTextRules(compiled.document.textRules as unknown as TextRule[]) : null,
+    autoNamed: new WeakSet(),
   }
 }
 
@@ -957,6 +1028,7 @@ export function renderRecipe(compiledIn: CompiledRecipe, data: unknown, options:
       const pout = [...out, 'parts', p]
       state.part = part.part.id
       state.where = 'body'
+      state.missing = part.missing ?? compiled.missing ?? 'blank'
       const runs = part.for !== undefined ? passes(state, loopOf(state, part.for, [...pout, 'for']), EMPTY_SCOPE, [...pout, 'for']) : [EMPTY_SCOPE]
       let produced: Block[] = []
       let repeats = 0
@@ -965,7 +1037,13 @@ export function renderRecipe(compiledIn: CompiledRecipe, data: unknown, options:
         repeats += 1
         produced.push(...renderPart(state, part, run, pout))
       }
+      // A pinned part's blocks go in one block pinned to the foot of the page.
+      if (part.pin !== undefined && produced.length) {
+        const spaceBelow = typeof part.pin === 'object' ? part.pin.spaceBelow : undefined
+        produced = [{ type: 'pinned', blocks: produced, ...(spaceBelow !== undefined ? { spaceBelow } : {}) }]
+      }
       if (part.pageBreakBefore && produced[0]) produced[0] = { ...produced[0], pageBreakBefore: true }
+      state.missing = compiled.missing ?? 'blank'
       const edited = applyEdits({ id: part.part.id, title: part.part.title }, produced, edits, editSource)
       produced = edited.blocks
       targets.push(...edited.targets)
@@ -987,6 +1065,8 @@ export function renderRecipe(compiledIn: CompiledRecipe, data: unknown, options:
         blocks: produced.length,
         toComplete: own.length + gaps.length,
         repeats,
+        ...(part.part.meta ? { meta: part.part.meta } : {}),
+        ...(part.part.componentMeta ? { componentMeta: part.part.componentMeta } : {}),
       })
     })
     const built: Record<string, unknown> = { body }
@@ -1008,8 +1088,10 @@ export function renderRecipe(compiledIn: CompiledRecipe, data: unknown, options:
   const document: Document = { sections }
   if (metadata && Object.keys(metadata).length) (document as { metadata?: unknown }).metadata = metadata
   if (theme && Object.keys(theme).length) (document as { theme?: unknown }).theme = theme
+  if (compiled.document.textRules?.length) (document as { textRules?: unknown }).textRules = compiled.document.textRules
 
-  const keys = new Set(targets.map((target) => target.key))
+  // An edit counts as applied only where its target took it (a tick must be one of the question's options).
+  const keys = new Set(targets.filter((target) => target.edited !== undefined).map((target) => target.key))
   const partIds = new Set(compiled.sections.flatMap((section) => section.parts.map((part) => part.part.id)))
   const orphans: string[] = []
   const otherParts: string[] = []

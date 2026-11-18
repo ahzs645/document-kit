@@ -7,6 +7,8 @@ import type {
   Block,
   BlankRun,
   Caption,
+  CheckboxRun,
+  ChoicesBlock,
   CellInput,
   CustomBlock,
   Document,
@@ -24,6 +26,7 @@ import type {
   ListItem,
   PageBreakBlock,
   ParagraphBlock,
+  PinnedBlock,
   RichText,
   RowRole,
   Section,
@@ -80,6 +83,19 @@ export const inlineImage = (image: ImageData, width: number, height: number, alt
   width,
   height,
   ...(alt === undefined ? {} : { alt }),
+})
+/** A tick box in a line of text, ticked or not. */
+export const checkbox = (checked: boolean, style: TextStyle & { source?: string } = {}): CheckboxRun => ({
+  ...style,
+  type: 'checkbox',
+  checked,
+})
+/** A placeholder for a value nobody gave: printed `[what]`, marked, and listed to complete. */
+export const placeholder = (what: string, options: Options<BlankRun, 'what' | 'show'> = {}): BlankRun => ({
+  ...options,
+  type: 'blank',
+  what,
+  show: 'placeholder',
 })
 export const sentence = (
   template: string,
@@ -197,6 +213,20 @@ export const figureGrid = (
 export const signature = (options: Options<SignatureBlock, never> = {}): SignatureBlock => ({
   ...options,
   type: 'signature',
+})
+
+/** A tick-box question: its options and the one chosen (null: unanswered). */
+export const choices = (
+  options: readonly string[],
+  chosen: ChoicesBlock['chosen'],
+  extra: Options<ChoicesBlock, 'options' | 'chosen'> = {},
+): ChoicesBlock => ({ ...extra, type: 'choices', options, ...(chosen === undefined ? {} : { chosen }) })
+
+/** Blocks pinned to the foot of the page they fall on. */
+export const pinned = (blocks: readonly Block[], options: Options<PinnedBlock, 'blocks'> = {}): PinnedBlock => ({
+  ...options,
+  type: 'pinned',
+  blocks,
 })
 
 export const pageBreak = (): PageBreakBlock => ({ type: 'pageBreak' })

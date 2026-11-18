@@ -19,12 +19,12 @@ describe('the fixture recipes', () => {
   it('share the kit\'s components between the two families', () => {
     const used = (id: string) => compileRecipe(id, fixtureLibrary(), { code }).from.components.map((c) => c.id)
     const shared = used('laboratory').filter((id) => used('review').includes(id))
-    expect(shared).toEqual(['data-table', 'fields', 'page-footer', 'running-header'])
+    expect(shared).toEqual(['data-table', 'fields', 'page-footer', 'running-header', 'text-section'])
   })
 
   it('the interim recipe compiles from its base plus its changes', () => {
     const interim = compileRecipe('laboratory-interim', fixtureLibrary(), { code })
-    expect(interim.sections[0]?.parts.map((p) => p.part.id)).toEqual(['title', 'interim-notice', 'addressee', 'notes', 'results', 'sign-off'])
+    expect(interim.sections[0]?.parts.map((p) => p.part.id)).toEqual(['title', 'interim-notice', 'addressee', 'notes', 'results', 'footnotes', 'sign-off', 'contact'])
     expect(interim.sections[0]?.parts[3]?.variant).toBe('brief')
   })
 
@@ -33,6 +33,46 @@ describe('the fixture recipes', () => {
     expect(checkRecipe(lab, fixtureData('laboratory')).map((p) => p.path)).toEqual(['basis', 'tables.1.note'])
     const review = compileRecipe('review', fixtureLibrary(), { code })
     expect(checkRecipe(review, fixtureData('review'), { code, registry }).map((p) => p.path)).toEqual(['project.checker', 'viewpoints.1.visibility', 'sheet.image'])
+  })
+})
+
+describe('what the laboratory fixture says beside its blocks', () => {
+  const lab = compileRecipe('laboratory', fixtureLibrary(), { code })
+
+  it('carries its meta to the compiled recipe and the rendered parts', () => {
+    expect(lab.recipe.meta).toEqual({ family: 'laboratory', reviewedBy: 'nobody: a made-up fixture' })
+    const { parts } = renderRecipe(lab, fixtureData('laboratory'))
+    expect(parts.find((p) => p.id === 'notes')?.meta).toEqual({ wording: 'standard notes' })
+    expect(parts.find((p) => p.id === 'footnotes')?.componentMeta).toEqual({ source: 'made-up fixture', rules: ['footnote-markers'] })
+  })
+
+  it('pins its contact block, and states its text rules on the document', () => {
+    const { document } = renderRecipe(lab, fixtureData('laboratory'))
+    const body = document.sections[0]!.body
+    expect(body[body.length - 1]).toMatchObject({ type: 'pinned', spaceBelow: 12 })
+    expect(document.textRules?.map((rule) => rule.id)).toEqual(['links', 'species', 'cell-markers', 'footnote-markers', 'formulas'])
+  })
+})
+
+describe('the review\'s tick-box question', () => {
+  const review = compileRecipe('review', fixtureLibrary(), { code })
+
+  it('ticks the data\'s answer, and takes a hand edit of the tick and of the answer', () => {
+    const plain = renderRecipe(review, fixtureData('review'), { code, registry })
+    const targets = plain.edits.targets.filter((t) => t.part === 'objective-met')
+    expect(targets.map((t) => [t.key, t.kind, t.original])).toEqual([
+      ['objective-met||choice|Is the made-up objective met?', 'choice', 'Partly'],
+      ['objective-met||answer|Is the made-up objective met?', 'answer', null],
+    ])
+    expect(plain.toComplete.filter((t) => t.partId === 'objective-met').map((t) => t.kind)).toEqual(['answer'])
+    const edited = renderRecipe(review, fixtureData('review'), {
+      code,
+      registry,
+      edits: { [targets[0]!.key]: 'Yes', [targets[1]!.key]: 'Seen only from the lake.' },
+    })
+    const part = edited.parts.find((p) => p.id === 'objective-met')!
+    expect(edited.document.sections[1]!.body[part.start]).toMatchObject({ type: 'choices', chosen: 'Yes', answer: [{ text: 'Seen only from the lake.', source: 'edited' }] })
+    expect(edited.toComplete.some((t) => t.partId === 'objective-met')).toBe(false)
   })
 })
 

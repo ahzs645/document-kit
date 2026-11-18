@@ -112,9 +112,24 @@ Each change is marked in the source with a `document-kit:` comment unless noted.
    run taller than a page breaks as before, and a table's last row keeps with nothing. A
    paragraph kept with a table (a caption) now counts the rows kept with the first, when they
    fit a page. Pinned by `tests/layout/keep-rows.test.ts`.
+10. **A line a float pushes past the text area** (`layout/styled-layout.ts`, the line loop in
+    the paragraph pass, marked `document-kit:`). A float that leaves no room beside a line
+    pushes it under itself; upstream checked the page's foot before that push, so a frame
+    standing at the foot of the page (a `w:framePr` anchored to the bottom margin, the model's
+    `pinned` block) pushed the next line into the bottom margin, drawn there. The pushed place
+    is now checked too, and a line that would end below the text area starts the next page, as
+    Word sets it. Pinned by `tests/layout/report-features.test.ts` ("pushes text that would run
+    into it on to the next page").
+11. **A frame at the foot of a full page** (`layout/styled-layout.ts`, the `shape` float branch
+    in the block pass, marked `document-kit:`). A text frame aligned to the bottom of the page or
+    margin (`w:yAlign="bottom"`, `w:vAnchor` page or margin, wrapping) whose top stands above
+    text already set on its page was drawn over that text. It now starts the next page and
+    stands at its foot, where its anchor then falls. Frames placed by offset, anchored to the
+    paragraph, aligned to the top or centre, or not wrapping are placed as before. Pinned by
+    `tests/layout/report-features.test.ts` ("goes to the foot of the next page …").
 
 Nothing else differs. `diff -r` against the upstream tree, after running the rewrite script
-over a fresh copy, shows only the nine changes above.
+over a fresh copy, shows only the eleven changes above.
 
 ## Bringing in a newer upstream
 
@@ -124,13 +139,15 @@ over a fresh copy, shows only the nine changes above.
    included; skip `corpus/`, `stand/`, `docs/`, `scripts/`). Delete files upstream deleted.
 3. Run `node scripts/rewrite-ream-aliases.mjs`, then `node scripts/rewrite-ream-aliases.mjs
    --check` (exits 1 if an alias import or root-relative fixture path is left).
-4. Re-apply changes 1, 2 and 4 to 9 above unless upstream has made them itself (check
+4. Re-apply changes 1, 2 and 4 to 11 above unless upstream has made them itself (check
    `FIXED_MTIME`, a `w:r` split for complex fields, every fallback to the global `fetch` in
    `core/fonts`, `core/converter` and `excel`, `familyNamesInFlow`, `w:vAlign`, PAGEREF and
-   body fields, §17.4.66 border conflicts and `w:keepNext` in table rows). Search for
+   body fields, §17.4.66 border conflicts, `w:keepNext` in table rows, and the two foot-frame
+   checks of changes 10 and 11). Search for
    `document-kit:` in the old tree to find each place. Search for new uses of
    `fetch`, `XMLHttpRequest` and `node:` in `src/ream` and treat any as change 4.
 5. Check `src/layout` still compiles against the internals it imports (`core/converter/project`,
+   `core/font/ttf-build` (`buildTrueType`, for `src/layout/tickBoxes.ts`),
    `core/fonts/families`, `core/fonts/remote-fonts`, `core/fonts/scripts` (`scriptsInFlow`,
    `companionsInFlow`, `forEachTextInFlow`, `scriptForCodepoint`), `core/font` (`ParsedTtf`),
    `layout/styled-layout`, `pdf/styled-page-emitter`, `pdf/writer`, `svg/svg-writer`,

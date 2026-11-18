@@ -1,0 +1,16 @@
+{
+  "kind": "component",
+  "id": "tick-question",
+  "title": "Tick-box question",
+  "description": "A question with its options as tick boxes, the one chosen ticked, and a free-text answer under it. A hand edit can change the tick and the answer.",
+  "params": {
+    "question": { "required": true },
+    "options": { "required": true },
+    "chosen": { "default": null },
+    "answer": { "default": null },
+    "boxed": { "default": false }
+  },
+  "blocks": [
+    { "type": "choices", "label": "{{ params.question }}", "options": "{{ params.options }}", "chosen": "{{ params.chosen }}", "answer": "{{ params.answer }}", "boxed": "{{ params.boxed }}" }
+  ]
+}

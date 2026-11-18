@@ -9,7 +9,7 @@ import { tableGrid, toCell } from './table'
 import { walkDocument, type BlockVisit } from './walk'
 import type { Block, Document, RichText } from './types'
 
-export type ToCompleteKind = 'blank' | 'field' | 'cell' | 'sentence' | 'figure' | 'signature' | 'pending'
+export type ToCompleteKind = 'blank' | 'field' | 'cell' | 'sentence' | 'figure' | 'signature' | 'choice' | 'answer' | 'pending'
 
 export interface ToCompleteItem {
   kind: ToCompleteKind
@@ -172,14 +172,29 @@ function scanBlock(block: Block, push: Push) {
       scanText(block.label, push)
       if (block.name === null) push({ kind: 'signature', what: plainText(block.label) || 'Name of the signatory' })
       else scanText(block.name, push)
+      if (block.title === null) push({ kind: 'signature', what: 'Title of the signatory' })
+      else scanText(block.title, push)
       for (const row of block.lines ?? []) {
         const label = plainText(row.label).replace(/:\s*$/, '')
         if (row.value === null) push({ kind: 'signature', what: row.what ?? label, ...withSource(row.source) })
         else scanText(row.value, push, label)
       }
       return
+    case 'choices': {
+      scanText(block.label, push)
+      const question = plainText(block.label).replace(/[:?]?\s*$/, '') || 'Tick-box question'
+      const chosen = block.chosen
+      if (chosen === null || chosen === undefined || (Array.isArray(chosen) && !chosen.length))
+        push({ kind: 'choice', what: question, ...withSource(block.source) })
+      if (block.answer === null) push({ kind: 'answer', what: question, ...withSource(block.source) })
+      else scanText(block.answer, push, question)
+      return
+    }
     case 'toc':
       scanText(block.title, push)
+      return
+    case 'pinned':
+      // Its blocks are walked as blocks of their own.
       return
     case 'pageBreak':
     case 'spacer':

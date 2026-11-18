@@ -60,6 +60,7 @@ export const DEFAULT_THEME: Theme = {
   },
   captions: { table: 'Table', figure: 'Figure', separator: ': ' },
   blankWidth: 144,
+  placeholderMark: { highlight: 'yellow' },
   page: { paper: 'letter', orientation: 'portrait', margins: { ...DEFAULT_MARGINS } },
 }
 

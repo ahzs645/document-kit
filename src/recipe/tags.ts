@@ -12,14 +12,24 @@ import {
   type TemplateTag,
 } from '../template/templateTags'
 import { readPicture, type Picture } from '../template/templateFormat'
+import { SENTENCE_FILTER_NAMES } from '../template/sentenceFilters'
 
 /** The filters the language has itself; any other is the application's (`filters` at render). */
 export const BUILT_IN_FILTERS: readonly string[] = ['format', 'upper', 'lower']
 
+/**
+ * Filters the kit gives besides: the sentence filters Word templates have too (`capitalize`, `plural`, `prose`,
+ * `ranges`; an application's filter of the same name is used instead), and two of recipes only: `missing` (the
+ * missing-value rule for one value) and `rules` (text rules applied to one value).
+ */
+export const KIT_FILTERS: readonly string[] = [...SENTENCE_FILTER_NAMES, 'missing', 'rules']
+
 export type CompiledFilter =
   | { kind: 'format'; picture: Picture; text: string }
   | { kind: 'upper' | 'lower' }
-  | { kind: 'custom'; name: string; args: (string | number)[] }
+  | { kind: 'custom'; name: string; args: (string | number)[]; helper?: true }
+  | { kind: 'missing'; mode: 'blank' | 'placeholder'; name?: string }
+  | { kind: 'rules'; ids: string[] }
 
 export interface FieldSeg {
   t: 'field'
@@ -75,8 +85,24 @@ function compileFilters(filters: readonly TemplateFilter[] | undefined, typed: s
       case 'lower':
         if (filter.args.length) return fail(`${typed} writes something after ${filter.name}, which takes nothing`)
         return { kind: filter.name }
+      case 'missing': {
+        const [mode, name, ...extra] = filter.args
+        if ((mode !== 'blank' && mode !== 'placeholder') || extra.length || (name !== undefined && (typeof name !== 'string' || !name.trim())))
+          return fail(`${typed} gives missing something other than "blank" or "placeholder" and, for a placeholder, its name`)
+        return { kind: 'missing', mode, ...(name !== undefined ? { name: name as string } : {}) }
+      }
+      case 'rules': {
+        if (!filter.args.length || filter.args.some((id) => typeof id !== 'string' || !id))
+          return fail(`${typed} names no text rules: write rules "rule-id" …`)
+        return { kind: 'rules', ids: filter.args.map(String) }
+      }
       default:
-        return { kind: 'custom', name: filter.name, args: [...filter.args] }
+        return {
+          kind: 'custom',
+          name: filter.name,
+          args: [...filter.args],
+          ...(SENTENCE_FILTER_NAMES.includes(filter.name) ? { helper: true as const } : {}),
+        }
     }
   })
 }
@@ -209,6 +235,16 @@ export function* walkSegs(
   }
 }
 
-/** The custom filter names a list of compiled filters uses. */
+/** The application's filter names a list of compiled filters uses (the kit's own left out). */
 export const customFilterNames = (filters: readonly CompiledFilter[]): string[] =>
-  filters.flatMap((filter) => (filter.kind === 'custom' ? [filter.name] : []))
+  filters.flatMap((filter) => (filter.kind === 'custom' && !filter.helper ? [filter.name] : []))
+
+/** The text rule ids a list of compiled filters names. */
+export const ruleIdsOf = (filters: readonly CompiledFilter[]): string[] =>
+  filters.flatMap((filter) => (filter.kind === 'rules' ? filter.ids : []))
+
+/** The missing-value rule a field's filters give it, if any. */
+export const missingOf = (filters: readonly CompiledFilter[]): { mode: 'blank' | 'placeholder'; name?: string } | undefined => {
+  for (const filter of filters) if (filter.kind === 'missing') return { mode: filter.mode, ...(filter.name !== undefined ? { name: filter.name } : {}) }
+  return undefined
+}

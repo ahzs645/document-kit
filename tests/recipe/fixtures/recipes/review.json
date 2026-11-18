@@ -2,7 +2,7 @@
   "kind": "recipe",
   "id": "review",
   "name": "Visual review",
-  "description": "A made-up review-style report: a cover, contents, project fields with blanks, a computed summary, the viewpoint discussion, a rating matrix, a landscape inventory table, a figure page and the to-complete list.",
+  "description": "A made-up review-style report: a cover, contents, project fields with blanks, a computed summary, the viewpoint discussion, a tick-box question a reviewer can change by hand, a rating matrix, a landscape inventory table, a figure page and the to-complete list.",
   "document": {
     "metadata": {
       "title": "Visual review: {{ project.name }}",
@@ -115,6 +115,17 @@
           "id": "discussion",
           "with": {
             "viewpoints": "{{ viewpoints }}"
+          }
+        },
+        {
+          "use": "tick-question",
+          "id": "objective-met",
+          "with": {
+            "question": "Is the made-up objective met?",
+            "options": ["Yes", "Partly", "No"],
+            "chosen": "{{ judgement.met }}",
+            "answer": "{{ judgement.why }}",
+            "boxed": true
           }
         },
         {

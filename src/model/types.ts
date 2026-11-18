@@ -75,12 +75,28 @@ export interface TabRun {
 /**
  * A space to be filled by hand: printed as a rule. `what` says what goes there, for the list of things still to
  * complete ({@link toComplete}).
+ *
+ * `show: 'placeholder'` prints the bracketed name instead of a rule (`[metals run date]`), in the theme's
+ * `placeholderMark` look (a yellow highlight by default), so an unfilled value inside a sentence cannot be missed. It
+ * is listed to complete either way.
  */
 export interface BlankRun extends TextStyle {
   type: 'blank'
   what?: string
-  /** Points; the theme's blank width when absent. */
+  /** Points; the theme's blank width when absent. Not used by a placeholder. */
   width?: number
+  source?: string
+  /** `rule` (default): a rule to write on; `placeholder`: `[what]`, marked. */
+  show?: 'rule' | 'placeholder'
+}
+
+/**
+ * A tick box in a line of text. Word shows a real check box (a content control the reader can tick); the layout draws
+ * a box, crossed when ticked, and `pageText` reads it as ☐ or ☒.
+ */
+export interface CheckboxRun extends TextStyle {
+  type: 'checkbox'
+  checked: boolean
   source?: string
 }
 
@@ -107,11 +123,26 @@ export interface SentenceRun extends TextStyle {
   /** What the sentence is, for the to-complete list ("Visibility statement"); the template when absent. */
   label?: string
   source?: string
+  /**
+   * What a missing slot does: `drop` (default) leaves the whole sentence out; `placeholder` prints the sentence with
+   * each missing slot as its bracketed name, marked (`[visibility]`, see {@link BlankRun}). Listed to complete either
+   * way.
+   */
+  missing?: 'drop' | 'placeholder'
 }
 
 export type SlotValues = Readonly<Record<string, string | number | null | undefined>>
 
-export type Inline = string | TextRun | FieldRun | LineBreak | TabRun | BlankRun | InlineImage | SentenceRun
+export type Inline =
+  | string
+  | TextRun
+  | FieldRun
+  | LineBreak
+  | TabRun
+  | BlankRun
+  | InlineImage
+  | SentenceRun
+  | CheckboxRun
 
 /** Text with its formatting: a plain string, one run, or a list of runs. */
 export type RichText = string | Exclude<Inline, string> | readonly Inline[]
@@ -161,6 +192,11 @@ export interface BlockBase {
   pending?: readonly Pending[]
   /** Start the block on a new page. */
   pageBreakBefore?: boolean
+  /**
+   * Which of the document's text rules ({@link TextRule}) touch this block's text: absent, the automatic ones; a list
+   * of rule ids, the automatic ones and these (rules with `auto: false` apply only where named); `false`, none.
+   */
+  textRules?: false | readonly string[]
 }
 
 export interface Spacing {
@@ -252,6 +288,12 @@ export interface FieldRow {
   source?: string
   /** What the blank is for the to-complete list; the label when absent. */
   what?: string
+  /**
+   * `lines` layout: print this row on the line of the row before it, after a gap ("E-mail: …   Phone: …"), when it
+   * fits; when it does not, it moves whole to a line of its own (its spaces and hyphens do not break). Ignored on the
+   * first row and in `table` layout.
+   */
+  sameLine?: boolean
 }
 
 /** Label and value rows: "Date: 12 March", either as lines of text or as a two-column table. */
@@ -267,6 +309,10 @@ export interface FieldsBlock extends BlockBase {
   separator?: string
   /** Text size for the rows (points). */
   size?: number
+  /** `lines` layout: space after each row, points (the body's paragraph spacing when absent). */
+  rowSpacing?: number
+  /** The gap before a `sameLine` row, points; 24 by default. */
+  sameLineGap?: number
 }
 
 /**
@@ -357,6 +403,8 @@ export interface TableBlock extends BlockBase {
   borders?: TableBorders
   /** Inner padding of every cell, points. */
   cellPadding?: { top?: number; bottom?: number; left?: number; right?: number }
+  /** Line height of the table's text as a multiple of single spacing; the theme's table line height when absent. */
+  line?: number
   /** Keep every row whole (no row breaks across a page). */
   cantSplit?: boolean
   /**
@@ -368,6 +416,11 @@ export interface TableBlock extends BlockBase {
   repeatHeader?: boolean
   /** Alignment of body cells by column, when a cell does not say. */
   columnAlign?: readonly (Align | undefined)[]
+  /**
+   * Let the columns fit their content (Word's AutoFit to contents, `w:tblLayout autofit`), the column shares only a
+   * starting point. Fixed by default: the columns keep their shares whatever they hold.
+   */
+  autoFit?: boolean
 }
 
 /** The box a picture is fitted into, keeping its proportions. */
@@ -440,23 +493,91 @@ export interface FigureGridBlock extends BlockBase {
   upscale?: boolean
 }
 
-/** A signature block: a label, the signature picture or room to sign, the rule, the name, and lines under it. */
+/**
+ * A signature block: a label, the signature picture (fitted to a box, sitting on the rule) or room to sign by hand,
+ * the signing rule, the name (and title) under it, and lines under that. It is kept on one page unless `keepTogether`
+ * is false.
+ */
 export interface SignatureBlock extends BlockBase {
   type: 'signature'
   label?: RichText
+  /** `above` (default): the label heads the block; `below`: it is printed under the name and lines. */
+  labelPosition?: 'above' | 'below'
+  /** The label's look; bold by default. */
+  labelStyle?: TextStyle
+  /** Space between the label and the picture or signing room, points; 4 by default. */
+  labelGap?: number
   /** The signature as a picture. Absent or null: room is left to sign by hand. */
   image?: ImageData | null
-  /** The box the signature picture is fitted into, points (190 × 74 by default). */
+  /** The box the signature picture is fitted into, keeping its shape, points (140 × 55 by default). */
   imageBox?: { width: number; height: number }
+  /** Enlarge a picture smaller than its box (true by default). */
+  imageUpscale?: boolean
   /** Printed under the rule. Null is a blank to complete. */
   name?: RichText | null
-  /** Rows under the name: "Title", "Date". A null value is a blank to complete. */
+  /** The signer's title, printed with the name: on its line (`titleLayout: 'sameLine'`) or on the next. */
+  title?: RichText | null
+  /** `sameLine` (default): "Name, Title"; `nextLine`: the title on its own line under the name. */
+  titleLayout?: 'sameLine' | 'nextLine'
+  /** Between the name and the title on one line; `", "` by default. */
+  titleSeparator?: string
+  /** The name's (and title's) look; bold by default. */
+  nameStyle?: TextStyle
+  /** Rows under the name: "Title", "Date". A null value is a blank to complete. A row with an empty label prints its value alone. */
   lines?: readonly FieldRow[]
-  align?: 'left' | 'center'
-  /** Length of the signing rule, points. */
+  align?: 'left' | 'center' | 'right'
+  /** Length of the signing rule, points; 216 by default. */
   ruleWidth?: number
-  /** Room to sign by hand when there is no picture, points. */
+  /** The rule's thickness, points; 0.75 by default. */
+  ruleThickness?: number
+  /** The rule's colour; the body text's by default. */
+  ruleColor?: string
+  /** Between the rule and the name under it, points; 2 by default. */
+  ruleGap?: number
+  /** Room to sign by hand when there is no picture, points; 36 by default. */
   signingSpace?: number
+  /** Space above the block, points; 12 by default. */
+  spaceAbove?: number
+  /** Space under the block, points; 2 by default. */
+  spaceBelow?: number
+  /** Keep the whole block on one page (true by default). */
+  keepTogether?: boolean
+}
+
+/**
+ * A tick-box question: its options, each with a box, the one chosen ticked. `chosen` null (or absent) is unanswered:
+ * every box empty, and listed to complete. `answer` adds a free-text answer line under it (null: a blank to complete;
+ * absent: no answer line). A hand edit can change which option is ticked and the answer (see the recipes' edits).
+ */
+export interface ChoicesBlock extends BlockBase {
+  type: 'choices'
+  /** The question. */
+  label?: RichText
+  /** The options, as printed. */
+  options: readonly string[]
+  /** The option ticked: one of `options`, or several for a question that takes more than one. */
+  chosen?: string | readonly string[] | null
+  answer?: RichText | null
+  /** `inline` (default): the boxes on one line after the question; `list`: one option a line under it. */
+  layout?: 'inline' | 'list'
+  /** Drawn as a ruled box: the question (and answer) at the left, the tick boxes at the right. */
+  boxed?: boolean
+}
+
+/**
+ * Blocks pinned to the foot of the page the block falls on, out of the text's flow: a disclaimer at the bottom of the
+ * first page, a contact block at the bottom of the last. Written as a Word text frame anchored to the bottom margin
+ * (consecutive paragraphs sharing one frame are one box). It holds headings, paragraphs, lists, `lines` fields, a
+ * signature, tick boxes, spacers and pictures; not tables. The text of the page flows above it; text that would run
+ * into it goes on to the next page.
+ */
+export interface PinnedBlock extends BlockBase {
+  type: 'pinned'
+  /** Where: the foot of the page (the bottom margin), the only place for now. */
+  at?: 'bottom'
+  blocks: readonly Block[]
+  /** Empty room kept under the blocks inside the frame, points, so the last line clears the margin; 0 by default. */
+  spaceBelow?: number
 }
 
 export interface PageBreakBlock extends BlockBase {
@@ -497,6 +618,8 @@ export type Block =
   | FigureBlock
   | FigureGridBlock
   | SignatureBlock
+  | ChoicesBlock
+  | PinnedBlock
   | PageBreakBlock
   | TocBlock
   | SpacerBlock
@@ -598,6 +721,12 @@ export interface TableLook {
   outerBorder: Border
   innerBorder: Border
   cellPadding: { top: number; bottom: number; left: number; right: number }
+  /** Least height of a body, group or note row, points (a row's own `height` wins); none when absent. */
+  rowHeight?: number
+  /** Least height of a header row, points (a row's own `height` wins); none when absent. */
+  headerRowHeight?: number
+  /** Line height of table text as a multiple of single spacing; 1 by default. */
+  line?: number
   /** Spacer row height, points. */
   spacerHeight: number
   /** Fill of a missing figure's placeholder box. */
@@ -625,6 +754,8 @@ export interface Theme {
   captions: { table: string; figure: string; separator: string }
   /** A blank rule's width, points. */
   blankWidth: number
+  /** How a placeholder (`[name]` for a value nobody gave, see {@link BlankRun}) is marked; a yellow highlight by default. */
+  placeholderMark: TextStyle
   /** Default page set-up for sections that do not give one. */
   page: { paper: PaperName | PaperSize; orientation: 'portrait' | 'landscape'; margins: Margins }
 }
@@ -641,5 +772,70 @@ export type ThemeInput = {
 export interface Document {
   metadata?: Metadata
   theme?: ThemeInput
+  /**
+   * Automatic text touches, stated as data and applied in order by the writer to the text's ordinary runs: links,
+   * terms in italics, raised footnote markers, formula digits set low. See {@link TextRule} and `docs/model.md`.
+   */
+  textRules?: readonly TextRule[]
   sections: readonly Section[]
+}
+
+/* ------------------------------------------------------------------ text rules */
+
+/** The kinds of text a rule may be limited to (`in`). Text in a header or footer is `header` or `footer`. */
+export type TextPlace =
+  | 'paragraph'
+  | 'heading'
+  | 'list'
+  | 'label'
+  | 'value'
+  | 'cell'
+  | 'caption'
+  | 'note'
+  | 'signature'
+  | 'choice'
+  | 'header'
+  | 'footer'
+
+/**
+ * One automatic text touch: what to find, and what to do with what is found. Exactly one of `pattern`, `terms` or
+ * `builtIn` says what to find:
+ *
+ * - `pattern`: a regular expression from a safe subset (see `docs/model.md`, "Text rules": no back-references or
+ *   look-arounds, no repeat inside a repeat, `*` and `+` repeat at most 100 times);
+ * - `terms`: words or phrases, matched whole (longest first);
+ * - `builtIn`: `links` (web and e-mail addresses become links), `trailingMarker` ("Total a" → the `a` raised),
+ *   `leadingMarker` ("a Dried at 105 °C" → the `a` raised), `formulaDigits` (the digits of the listed formulas set
+ *   low: CaCO3 → CaCO₃).
+ *
+ * What is done: `style` on the match (or on its `group`), and/or `link: true` (the match becomes a link, if it reads
+ * as an address of an allowed scheme). A built-in has its own default (links: a link; markers: superscript; formula
+ * digits: subscript), which `style` replaces.
+ */
+export interface TextRule {
+  /** The rule's name, for a block's or a filter's list of rules to use. */
+  id?: string
+  pattern?: string
+  /** Pattern flags: `i` (ignore case) is the only one. */
+  flags?: string
+  terms?: readonly string[]
+  /** Terms: match regardless of case. */
+  ignoreCase?: boolean
+  builtIn?: 'links' | 'trailingMarker' | 'leadingMarker' | 'formulaDigits'
+  /** `pattern`: the capture group, by number or name, the style or link goes on; the whole match when absent. */
+  group?: number | string
+  style?: TextStyle
+  link?: boolean
+  /** `links` and `link: true`: the URI schemes made into links; `https`, `http` and `mailto` by default. */
+  schemes?: readonly string[]
+  /** `links`: also link bare domains (`example.org/path`) on these top-level domains; a common list by default, `[]` for none. */
+  domains?: readonly string[]
+  /** `trailingMarker`, `leadingMarker`: the marker letters, as a character list with ranges (`a-h`); `a-z` by default. */
+  markers?: string
+  /** `formulaDigits`: the formulas whose digits are set low (`CaCO3`, `NO3`). Required. */
+  formulas?: readonly string[]
+  /** Only in these kinds of text. Everywhere when absent. */
+  in?: readonly TextPlace[]
+  /** Applied wherever the rule's places allow (true, the default), or only where a block or filter names it (false). */
+  auto?: boolean
 }

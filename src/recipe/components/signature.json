@@ -2,23 +2,93 @@
   "kind": "component",
   "id": "signature",
   "title": "Signature",
-  "description": "A signature block: a label, the signature picture or room to sign, the signing rule with the name under it, and a title and date line. A name or line the data lacks is a blank to complete.",
+  "description": "A signature block: a label, the signature picture (fitted to a box, sitting on the rule) or room to sign by hand, the signing rule with the name (and title) under it, and lines under that. Kept on one page. A name or line the data lacks is a blank to complete.",
   "params": {
     "label": { "default": "Signed" },
+    "labelPosition": { "default": null, "description": "above (default) or below the name and lines." },
+    "labelGap": { "default": null, "description": "Points between the label and the picture or signing room (4)." },
     "image": { "default": null },
+    "imageWidth": { "default": 140, "description": "The box the picture is fitted into, points." },
+    "imageHeight": { "default": 55 },
+    "inkGap": { "default": null, "description": "Room to sign by hand when there is no picture, points (36)." },
     "name": { "required": true },
     "title": { "default": null },
-    "date": { "default": null }
+    "titleLayout": { "default": "row", "description": "row: a \"Title:\" line under the name; sameLine: \"Name, Title\"; nextLine: the title alone under the name." },
+    "titleSeparator": { "default": null, "description": "Between the name and the title on one line (\", \")." },
+    "date": { "default": null },
+    "dateLine": { "default": true, "description": "Print a \"Date:\" line (a blank to complete when no date is given)." },
+    "lines": { "default": null, "description": "[{ label, value }]: the lines under the name, in place of the title and date lines." },
+    "align": { "default": null, "description": "left (default), center or right." },
+    "ruleWidth": { "default": null, "description": "The signing rule's length, points (216)." },
+    "ruleThickness": { "default": null },
+    "ruleColor": { "default": null },
+    "ruleGap": { "default": null, "description": "Points between the rule and the name (2)." },
+    "spaceAbove": { "default": null, "description": "Points above the block (12)." },
+    "spaceBelow": { "default": null, "description": "Points under the block (2)." },
+    "keepTogether": { "default": true }
   },
   "blocks": [
     {
-      "type": "signature",
-      "label": "{{ params.label }}",
-      "image": "{{ params.image }}",
-      "name": "{{ params.name }}",
-      "lines": [
-        { "label": "Title", "value": "{{ params.title }}" },
-        { "label": "Date", "value": "{{ params.date }}" }
+      "if": "params.titleLayout == \"row\"",
+      "then": [
+        {
+          "type": "signature",
+          "label": "{{ params.label }}",
+          "labelPosition": "{{ params.labelPosition }}",
+          "labelGap": "{{ params.labelGap }}",
+          "image": "{{ params.image }}",
+          "imageBox": { "width": "{{ params.imageWidth }}", "height": "{{ params.imageHeight }}" },
+          "signingSpace": "{{ params.inkGap }}",
+          "name": "{{ params.name }}",
+          "align": "{{ params.align }}",
+          "ruleWidth": "{{ params.ruleWidth }}",
+          "ruleThickness": "{{ params.ruleThickness }}",
+          "ruleColor": "{{ params.ruleColor }}",
+          "ruleGap": "{{ params.ruleGap }}",
+          "spaceAbove": "{{ params.spaceAbove }}",
+          "spaceBelow": "{{ params.spaceBelow }}",
+          "keepTogether": "{{ params.keepTogether }}",
+          "lines": [
+            {
+              "if": "params.lines",
+              "then": [{ "for": "line in params.lines", "do": [{ "label": "{{ line.label }}", "value": "{{ line.value }}" }] }],
+              "else": [
+                { "label": "Title", "value": "{{ params.title }}" },
+                { "if": "params.dateLine", "then": [{ "label": "Date", "value": "{{ params.date }}" }] }
+              ]
+            }
+          ]
+        }
+      ],
+      "else": [
+        {
+          "type": "signature",
+          "label": "{{ params.label }}",
+          "labelPosition": "{{ params.labelPosition }}",
+          "labelGap": "{{ params.labelGap }}",
+          "image": "{{ params.image }}",
+          "imageBox": { "width": "{{ params.imageWidth }}", "height": "{{ params.imageHeight }}" },
+          "signingSpace": "{{ params.inkGap }}",
+          "name": "{{ params.name }}",
+          "title": "{{ params.title }}",
+          "titleLayout": "{{ params.titleLayout }}",
+          "titleSeparator": "{{ params.titleSeparator }}",
+          "align": "{{ params.align }}",
+          "ruleWidth": "{{ params.ruleWidth }}",
+          "ruleThickness": "{{ params.ruleThickness }}",
+          "ruleColor": "{{ params.ruleColor }}",
+          "ruleGap": "{{ params.ruleGap }}",
+          "spaceAbove": "{{ params.spaceAbove }}",
+          "spaceBelow": "{{ params.spaceBelow }}",
+          "keepTogether": "{{ params.keepTogether }}",
+          "lines": [
+            {
+              "if": "params.lines",
+              "then": [{ "for": "line in params.lines", "do": [{ "label": "{{ line.label }}", "value": "{{ line.value }}" }] }],
+              "else": [{ "if": "params.dateLine", "then": [{ "label": "Date", "value": "{{ params.date }}" }] }]
+            }
+          ]
+        }
       ]
     }
   ]

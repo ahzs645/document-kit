@@ -2,9 +2,17 @@
   "kind": "recipe",
   "id": "laboratory",
   "name": "Laboratory report",
-  "description": "A made-up laboratory report: letterhead line, title and addressee, notes, a table per set of results, a signature.",
+  "description": "A made-up laboratory report: letterhead line, title and addressee, notes, a table per set of results, footnotes, a signature and a contact block pinned to the foot of the last page.",
+  "meta": { "family": "laboratory", "reviewedBy": "nobody: a made-up fixture" },
   "document": {
-    "metadata": { "title": "{{ report.title }}", "author": "Made-up Testing Laboratory", "created": "2026-03-12T09:00:00Z" }
+    "metadata": { "title": "{{ report.title }}", "author": "Made-up Testing Laboratory", "created": "2026-03-12T09:00:00Z" },
+    "textRules": [
+      { "id": "links", "builtIn": "links", "in": ["paragraph", "value"] },
+      { "id": "species", "terms": ["M. exemplum"], "style": { "italic": true }, "in": ["cell", "note"] },
+      { "id": "cell-markers", "builtIn": "trailingMarker", "markers": "a-h", "in": ["cell"] },
+      { "id": "footnote-markers", "builtIn": "leadingMarker", "markers": "a-h", "auto": false },
+      { "id": "formulas", "builtIn": "formulaDigits", "formulas": ["CaCO3", "NO3"] }
+    ]
   },
   "options": { "notes": "standard" },
   "sections": [
@@ -22,18 +30,37 @@
             "rows": [
               { "label": "Attention", "value": "{{ client.contact }}" },
               { "label": "Organisation", "value": "{{ client.name }}" },
+              { "label": "E-mail", "value": "{{ client.email }}" },
+              { "label": "Phone", "value": "{{ client.phone }}", "sameLine": true },
               { "label": "Re", "value": "{{ report.subject }}" },
               { "label": "Date", "value": "{{ report.date | format \"d MMMM yyyy\" }}" },
               { "label": "Reference", "value": "{{ client.reference }}", "what": "Client reference" }
             ]
           }
         },
-        { "use": "sample-notes", "id": "notes" },
+        { "use": "sample-notes", "id": "notes", "missing": "placeholder", "meta": { "wording": "standard notes" } },
         { "use": "results-table", "id": "results", "for": "table in tables", "with": { "table": "{{ table }}" } },
+        { "use": "footnotes", "id": "footnotes", "if": "footnotes", "with": { "lines": "{{ footnotes }}" } },
         {
           "use": "signature",
           "id": "sign-off",
-          "with": { "label": "Reviewed and approved", "name": "{{ signer.name }}", "title": "{{ signer.title }}", "date": "{{ report.date | format \"d MMMM yyyy\" }}" }
+          "with": {
+            "label": "Reviewed and approved",
+            "name": "{{ signer.name }}",
+            "title": "{{ signer.title }}",
+            "titleLayout": "sameLine",
+            "date": "{{ report.date | format \"d MMMM yyyy\" }}",
+            "align": "center",
+            "ruleWidth": 200,
+            "inkGap": 30,
+            "spaceAbove": 18
+          }
+        },
+        {
+          "use": "text-section",
+          "id": "contact",
+          "pin": { "spaceBelow": 12 },
+          "with": { "heading": "Contact", "paragraphs": ["Made-up Testing Laboratory, 1 Example Road", "{{ lab.contact }}"] }
         }
       ]
     }

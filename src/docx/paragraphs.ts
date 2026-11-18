@@ -106,17 +106,19 @@ export function writeParagraph(block: ParagraphBlock, context: WriterContext, br
     border: borders,
     shading: block.shading ? { fill: hex(block.shading), color: 'auto', type: 'clear' as const } : undefined,
     tabStops: block.tabs?.map((stop) => tabStop(stop, context)),
+    frame: context.frame,
     children,
   })
   return new Paragraph(options)
 }
 
 /** An empty paragraph exactly `height` points tall (a spacer, or the carrier of a page break before a table). */
-export function gapParagraph(height: number, breakBefore = false): Paragraph {
+export function gapParagraph(height: number, breakBefore = false, frame?: WriterContext['frame']): Paragraph {
   return new Paragraph(
     compact({
       spacing: { before: 0, after: 0, line: Math.max(1, twips(height)), lineRule: LineRuleType.EXACT },
       pageBreakBefore: breakBefore || undefined,
+      frame,
       children: [],
     }),
   )
@@ -151,6 +153,7 @@ export function captionParagraph(
       keepNext: options.keepNext || undefined,
       pageBreakBefore: options.breakBefore || undefined,
       alignment: alignment(options.align),
+      frame: context.frame,
       children,
     }),
   )
@@ -168,6 +171,7 @@ export function styledParagraph(
       style: STYLE_IDS[style],
       alignment: alignment(options.align),
       keepNext: options.keepNext || undefined,
+      frame: context.frame,
       children: inlineChildren(content, context, compact({ style: options.text, source: options.source })),
     }),
   )

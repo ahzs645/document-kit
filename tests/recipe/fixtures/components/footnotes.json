@@ -1,0 +1,15 @@
+{
+  "kind": "component",
+  "id": "footnotes",
+  "title": "Table footnotes",
+  "description": "Footnote lines under a heading, each opening with its marker letter, which the recipe's footnote-marker text rule raises.",
+  "meta": { "source": "made-up fixture", "rules": ["footnote-markers"] },
+  "params": {
+    "heading": { "default": "Table Footnotes" },
+    "lines": { "default": [] }
+  },
+  "blocks": [
+    { "type": "heading", "level": 2, "content": "{{ params.heading }}" },
+    { "for": "line in params.lines", "do": [{ "type": "paragraph", "style": "note", "textRules": ["footnote-markers"], "content": "{{ line }}" }] }
+  ]
+}

@@ -24,6 +24,10 @@ export interface FilledSentence {
 
 const SLOT = /\{(\w+)\}/g
 
+/** How a tick box reads as text: the characters the layout draws and `pageText` holds. */
+export const CHECKED_BOX = '\u2612'
+export const EMPTY_BOX = '\u2610'
+
 /**
  * Fills `{slot}`s from `values`. A slot whose value is null, undefined or an empty string leaves the whole sentence
  * unfilled (`text: null`): a sentence is never printed with a hole or a brace in it.
@@ -41,8 +45,45 @@ export function fillSlots(template: string, values: SlotValues): FilledSentence 
   return { text: missing.length ? null : text, missing }
 }
 
-/** A sentence run's printed text, or null when it is left out. */
-export const sentenceText = (run: SentenceRun): string | null => fillSlots(run.template, run.values).text
+/**
+ * A sentence run's printed text, or null when it is left out. A sentence that prints its missing slots as
+ * placeholders reads them as `[slot]`.
+ */
+export const sentenceText = (run: SentenceRun): string | null => {
+  if (run.missing !== 'placeholder') return fillSlots(run.template, run.values).text
+  return plainText(placeholderSentence(run))
+}
+
+const isNoValue = (value: unknown) => value === null || value === undefined || value === ''
+
+/**
+ * A sentence printed with each missing slot as a placeholder (`[slot]`, a {@link BlankRun} shown as its name), the
+ * filled text as text runs in the sentence's style.
+ */
+export function placeholderSentence(run: SentenceRun): Inline[] {
+  const { type: _type, template, values, label: _label, missing: _missing, ...style } = run
+  const out: Inline[] = []
+  let last = 0
+  let text = ''
+  const flush = () => {
+    if (text) out.push({ ...style, type: 'text', text })
+    text = ''
+  }
+  for (const match of template.matchAll(SLOT)) {
+    const key = match[1] ?? ''
+    const at = match.index ?? 0
+    text += template.slice(last, at)
+    last = at + match[0].length
+    const value = values[key]
+    if (isNoValue(value)) {
+      flush()
+      out.push({ ...style, type: 'blank', what: key, show: 'placeholder' })
+    } else text += String(value)
+  }
+  text += template.slice(last)
+  flush()
+  return out
+}
 
 const isSpace = (inline: Inline | undefined): inline is string => typeof inline === 'string' && /^\s*$/.test(inline)
 
@@ -57,13 +98,18 @@ export function resolveSentences(text: RichText): Inline[] {
   let dropSpaceAfter = false
   for (const inline of list) {
     if (typeof inline !== 'string' && inline.type === 'sentence') {
+      if (inline.missing === 'placeholder' && fillSlots(inline.template, inline.values).text === null) {
+        out.push(...placeholderSentence(inline))
+        dropSpaceAfter = false
+        continue
+      }
       const filled = sentenceText(inline)
       if (filled === null) {
         // Drop the separator after this sentence, or the one before it when it ends the run.
         dropSpaceAfter = true
         continue
       }
-      const { type: _type, template: _template, values: _values, label: _label, ...style } = inline
+      const { type: _type, template: _template, values: _values, label: _label, missing: _missing, ...style } = inline
       out.push({ ...style, type: 'text', text: filled })
       dropSpaceAfter = false
       continue
@@ -97,7 +143,9 @@ export function plainText(text: RichText | null | undefined): string {
         case 'tab':
           return '\t'
         case 'blank':
-          return '______'
+          return inline.show === 'placeholder' ? `[${inline.what ?? ''}]` : '______'
+        case 'checkbox':
+          return inline.checked ? CHECKED_BOX : EMPTY_BOX
         case 'image':
           return inline.alt ?? ''
         case 'sentence':

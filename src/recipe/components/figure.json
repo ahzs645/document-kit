@@ -6,6 +6,7 @@
   "params": {
     "image": { "required": true },
     "caption": { "default": null },
+    "numbered": { "default": true, "description": "true: \"Figure 2: …\"; false: the caption alone, taking no number; \"silent\": the caption alone, taking a number." },
     "note": { "default": null },
     "placeholder": { "default": "Picture to come" },
     "width": { "default": null },
@@ -16,7 +17,7 @@
       "type": "figure",
       "image": "{{ params.image }}",
       "align": "center",
-      "caption": "{{ params.caption }}",
+      "caption": { "text": "{{ params.caption }}", "numbered": "{{ params.numbered }}" },
       "note": "{{ params.note }}",
       "placeholder": "{{ params.placeholder }}",
       "fit": { "width": "{{ params.width }}", "height": "{{ params.height }}" }

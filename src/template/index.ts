@@ -19,6 +19,7 @@ import { check, render, tags, TemplateInput } from './officeTemplate.js';
 import { OfficeErrorType, TemplateConfig, TemplateData, TemplateProblem, TemplateTagInfo } from './types.js';
 
 export { isTemplateError, TemplateError } from './errors.js';
+export { capitalize, plural, prose, ranges, SENTENCE_FILTER_NAMES, SentenceFilterError } from './sentenceFilters.js';
 export type { TemplateInput } from './officeTemplate.js';
 export { OfficeErrorType, OfficeWarningType } from './types.js';
 export type {

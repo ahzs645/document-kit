@@ -1,20 +1,33 @@
 /** Every kit block as docx paragraphs and tables. Custom blocks are expanded before this runs. */
 import {
+  FrameAnchorType,
+  FrameWrap,
   HeadingLevel,
+  HeightRule,
+  HorizontalPositionAlign,
   LineRuleType,
   Paragraph,
   Table,
   TableOfContents,
+  TextRun,
+  VerticalPositionAlign,
+  type IFrameOptions,
+  type IParagraphOptions,
+  type ParagraphChild,
 } from 'docx'
 import { fitImage, isRichText, plainText, resolveImage } from '../model/index'
 import type {
   Block,
+  ChoicesBlock,
+  FieldRow,
   FieldsBlock,
   FigureBlock,
   FigureGridBlock,
   HeadingBlock,
   ListBlock,
+  Inline,
   ListItem,
+  PinnedBlock,
   RichText,
   SignatureBlock,
   TableBlock,
@@ -55,14 +68,14 @@ export function writeBlocks(blocks: readonly Block[], context: WriterContext): F
       breakNext = true
       continue
     }
-    const breakBefore = (breakNext || block.pageBreakBefore === true) && context.part === 'body'
+    const breakBefore = (breakNext || block.pageBreakBefore === true) && context.part === 'body' && !context.frame
     const written = writeBlock(block, context, breakBefore)
     if (written.length) breakNext = false
     else if (breakBefore) breakNext = true
     out.push(...written)
   }
   // A break with nothing after it still starts a new page.
-  if (breakNext) out.push(gapParagraph(1, true))
+  if (breakNext && !context.frame) out.push(gapParagraph(1, true))
   return out
 }
 
@@ -89,13 +102,21 @@ function writeBlock(block: Block, context: WriterContext, breakBefore: boolean):
       return writeFigureGrid(block, context, breakBefore)
     case 'signature':
       return writeSignature(block, context, breakBefore)
+    case 'choices':
+    {
+      const blocks = choiceBlocks(block, context)
+      if (breakBefore && blocks[0]) blocks[0] = { ...blocks[0], pageBreakBefore: true }
+      return writeBlocks(blocks, context)
+    }
+    case 'pinned':
+      return writePinned(block, context, breakBefore)
     case 'toc':
       return writeToc(block, context, breakBefore)
     case 'spacer':
       if (block.height <= 0) return breakBefore ? [gapParagraph(1, true)] : []
-      return [gapParagraph(block.height, breakBefore)]
+      return [gapParagraph(block.height, breakBefore, context.frame)]
     case 'pageBreak':
-      return [gapParagraph(1, true)]
+      return context.frame ? [] : [gapParagraph(1, true)]
     case 'custom':
       throw new Error(`document-kit: custom block "${block.kind}" reached the Word writer unexpanded`)
   }
@@ -108,6 +129,7 @@ function writeHeading(block: HeadingBlock, context: WriterContext, breakBefore: 
       heading: HEADINGS[level - 1],
       alignment: alignment(block.align),
       pageBreakBefore: breakBefore || undefined,
+      frame: context.frame,
       children: inlineChildren(block.content, context, compact({ source: block.source })),
     }),
   )
@@ -133,6 +155,7 @@ function writeList(block: ListBlock, context: WriterContext, breakBefore: boolea
           compact({
             numbering: { reference, level: Math.min(level, 8), instance },
             pageBreakBefore: (breakBefore && out.length === 0) || undefined,
+            frame: context.frame,
             children: inlineChildren(item.content, context, compact({ source: block.source })),
           }),
         ),
@@ -163,6 +186,7 @@ function writeFields(block: FieldsBlock, context: WriterContext, breakBefore: bo
         compact({
           keepNext: true,
           pageBreakBefore: breakBefore || undefined,
+          frame: context.frame,
           children: inlineChildren(block.title, context, { style: { bold: true } }),
         }),
       ),
@@ -188,30 +212,61 @@ function writeFields(block: FieldsBlock, context: WriterContext, breakBefore: bo
   }
   const separator = block.separator ?? ': '
   const tabAt = block.labelWidth
+  // Rows that go on the line of the row before them join its paragraph.
+  const lines: FieldRow[][] = []
   block.rows.forEach((row, index) => {
-    const style = compact({ size })
-    const label = inlineChildren(row.label, context, { style: { ...style, bold: true } })
+    const last = lines[lines.length - 1]
+    if (row.sameLine && index > 0 && last) last.push(row)
+    else lines.push([row])
+  })
+  const style = compact({ size })
+  const rowChildren = (row: FieldRow, unbreakable: boolean): ParagraphChild[] => {
+    const label = inlineChildren(keep(row.label, unbreakable), context, { style: { ...style, bold: true } })
     const gap =
-      tabAt === undefined
-        ? inlineChildren(separator, context, { style: { ...style, bold: true } })
+      tabAt === undefined || unbreakable
+        ? inlineChildren(keep(separator, unbreakable), context, { style: { ...style, bold: true } })
         : inlineChildren([separator.trimEnd(), { type: 'tab' }], context, { style: { ...style, bold: true } })
     const value =
       row.value === null
         ? blankChildren(context, style)
-        : inlineChildren(row.value, context, compact({ style, source: row.source }))
+        : inlineChildren(keep(row.value, unbreakable), context, compact({ style, source: row.source }))
+    return [...label, ...gap, ...value]
+  }
+  const gapSpaces = ' '.repeat(Math.max(1, Math.round((block.sameLineGap ?? 24) / ((size ?? context.theme.body.size) * 0.25))))
+  lines.forEach((line, index) => {
+    const children: ParagraphChild[] = []
+    line.forEach((row, at) => {
+      if (at > 0) children.push(new TextRun(compact({ text: gapSpaces, size: size === undefined ? undefined : size * 2 })))
+      children.push(...rowChildren(row, at > 0))
+    })
     out.push(
       new Paragraph(
         compact({
-          keepNext: index < block.rows.length - 1 || undefined,
+          keepNext: index < lines.length - 1 || undefined,
           pageBreakBefore: (breakBefore && !titleFirst && index === 0) || undefined,
           tabStops: tabAt === undefined ? undefined : [{ type: 'left' as const, position: twips(tabAt) }],
           indent: tabAt === undefined ? undefined : { left: twips(tabAt), hanging: twips(tabAt) },
-          children: [...label, ...gap, ...value],
+          spacing: block.rowSpacing === undefined ? undefined : { after: twips(block.rowSpacing) },
+          frame: context.frame,
+          children,
         }),
       ),
     )
   })
   return out
+}
+
+const NO_BREAK_HYPHEN = '\u2011'
+
+/**
+ * Text that does not break: its spaces made no-break spaces and its hyphens no-break hyphens (written as
+ * Word's own `w:noBreakHyphen`), so a row on another row's line moves whole when it does not fit.
+ */
+function keep(text: RichText, unbreakable: boolean): RichText {
+  if (!unbreakable) return text
+  const fix = (value: string) => value.replace(/ /g, '\u00a0').replace(/-/g, NO_BREAK_HYPHEN)
+  const list = typeof text === 'string' ? [text] : Array.isArray(text) ? (text as readonly Inline[]) : [text as Inline]
+  return list.map((inline): Inline => (typeof inline === 'string' ? fix(inline) : inline.type === 'text' ? { ...inline, text: fix(inline.text) } : inline))
 }
 
 /* ------------------------------------------------------------------ figures */
@@ -301,6 +356,7 @@ function writeFigure(block: FigureBlock, context: WriterContext, breakBefore: bo
           alignment: alignment(align),
           keepNext: (block.caption !== undefined && !captionAbove) || undefined,
           pageBreakBefore: breakHere || undefined,
+          frame: context.frame,
           spacing: { before: 0, after: 0, line: 240, lineRule: LineRuleType.AUTO },
           children: [imageRun(block.image, size.width, size.height, alt, look)],
         }),
@@ -357,91 +413,203 @@ function writeFigureGrid(block: FigureGridBlock, context: WriterContext, breakBe
 
 /* ------------------------------------------------------------------ signature */
 
+/**
+ * The signature block as paragraphs: the label, the picture (fitted to its box, sitting on the rule) or room to sign,
+ * the rule as the top border of the name's paragraph (as long as `ruleWidth`), the name and title, the lines, and the
+ * label when it goes below. Kept on one page unless `keepTogether` is false.
+ */
 function writeSignature(block: SignatureBlock, context: WriterContext, breakBefore: boolean): Paragraph[] {
-  const out: Paragraph[] = []
+  const items: Array<Record<string, unknown>> = []
   const align = block.align ?? 'left'
   const ruleWidth = Math.min(block.ruleWidth ?? 216, context.width)
   const spare = Math.max(0, context.width - ruleWidth)
-  const indent = align === 'center' ? { left: twips(spare / 2), right: twips(spare / 2) } : { right: twips(spare) }
-  const first = () => (breakBefore && out.length === 0) || undefined
-  if (block.label !== undefined) {
-    out.push(
-      new Paragraph(
-        compact({
-          alignment: alignment(align),
-          keepNext: true,
-          pageBreakBefore: first(),
-          spacing: { before: twips(12), after: twips(4) },
-          children: inlineChildren(block.label, context, { style: { bold: true } }),
-        }),
-      ),
-    )
-  }
+  const indent =
+    align === 'center'
+      ? { left: twips(spare / 2), right: twips(spare / 2) }
+      : align === 'right'
+        ? { left: twips(spare) }
+        : { right: twips(spare) }
+  const labelStyle = block.labelStyle ?? { bold: true }
+  const nameStyle = block.nameStyle ?? { bold: true }
+  const labelBelow = block.labelPosition === 'below'
+  const label = () =>
+    items.push({
+      alignment: alignment(align),
+      spacing: { before: 0, after: twips(labelBelow ? 2 : (block.labelGap ?? 4)) },
+      children: inlineChildren(block.label!, context, { style: labelStyle }),
+    })
+  if (block.label !== undefined && !labelBelow) label()
   if (block.image) {
     const box = block.imageBox ?? { width: 140, height: 55 }
-    const size = fitImage(resolveImage(block.image), box, true)
-    out.push(
-      new Paragraph(
-        compact({
-          alignment: alignment(align),
-          keepNext: true,
-          pageBreakBefore: first(),
-          spacing: { before: 0, after: 0, line: 240, lineRule: LineRuleType.AUTO },
-          children: [imageRun(block.image, size.width, size.height, 'Signature')],
-        }),
-      ),
-    )
+    const size = fitImage(resolveImage(block.image), box, block.imageUpscale ?? true)
+    items.push({
+      alignment: alignment(align),
+      spacing: { before: 0, after: 0, line: 240, lineRule: LineRuleType.AUTO },
+      children: [imageRun(block.image, size.width, size.height, 'Signature')],
+    })
   } else {
-    out.push(
-      new Paragraph(
-        compact({
-          keepNext: true,
-          pageBreakBefore: first(),
-          spacing: { before: 0, after: 0, line: twips(block.signingSpace ?? 36), lineRule: LineRuleType.EXACT },
-          children: [],
-        }),
-      ),
-    )
+    items.push({
+      spacing: { before: 0, after: 0, line: twips(Math.max(1, block.signingSpace ?? 36)), lineRule: LineRuleType.EXACT },
+      children: [],
+    })
   }
   // The signing rule is the top border of the name's paragraph, as wide as the rule.
-  const rule = border({ style: 'single', width: 0.75, color: context.theme.body.color })
-  out.push(
-    new Paragraph(
+  const rule = border({ style: 'single', width: block.ruleThickness ?? 0.75, color: block.ruleColor ?? context.theme.body.color })
+  const name = block.name === null || block.name === undefined ? [] : inlineChildren(block.name, context, compact({ style: nameStyle, source: block.source }))
+  const title = block.title === null || block.title === undefined ? [] : inlineChildren(block.title, context, compact({ style: nameStyle, source: block.source }))
+  const sameLine = (block.titleLayout ?? 'sameLine') === 'sameLine'
+  const separator = name.length && title.length ? inlineChildren(block.titleSeparator ?? ', ', context, { style: nameStyle }) : []
+  items.push({
+    alignment: alignment(align),
+    indent,
+    ...(rule ? { border: { top: { ...rule, space: Math.max(0, Math.round(block.ruleGap ?? 2)) } } } : {}),
+    spacing: { before: 0, after: twips(2) },
+    children: sameLine ? [...name, ...separator, ...title] : name,
+  })
+  if (!sameLine && title.length) items.push({ alignment: alignment(align), indent, spacing: { before: 0, after: twips(2) }, children: title })
+  for (const line of block.lines ?? []) {
+    const labelText = plainText(line.label).trim()
+    const separator = labelText ? (/[:]\s*$/.test(plainText(line.label)) ? ' ' : ': ') : ''
+    items.push({
+      alignment: alignment(align),
+      indent,
+      spacing: { before: 0, after: twips(2) },
+      children: [
+        ...(labelText ? inlineChildren(line.label, context, {}) : []),
+        ...(separator ? inlineChildren(separator, context, {}) : []),
+        ...(line.value === null
+          ? blankChildren(context, {}, ruleWidth * 0.6)
+          : inlineChildren(line.value, context, compact({ source: line.source }))),
+      ],
+    })
+  }
+  if (block.label !== undefined && labelBelow) label()
+  const keepTogether = block.keepTogether !== false
+  return items.map((item, index) => {
+    const first = index === 0
+    const last = index === items.length - 1
+    const spacing = { ...(item.spacing ?? {}) } as Record<string, unknown>
+    if (first) spacing.before = twips(block.spaceAbove ?? 12)
+    if (last) spacing.after = twips(block.spaceBelow ?? 2)
+    return new Paragraph(
       compact({
-        alignment: alignment(align),
-        indent,
-        keepNext: (block.lines?.length ?? 0) > 0 || undefined,
-        border: rule ? { top: { ...rule, space: 2 } } : undefined,
-        spacing: { before: 0, after: twips(2) },
-        children:
-          block.name === null || block.name === undefined
-            ? []
-            : inlineChildren(block.name, context, compact({ style: { bold: true }, source: block.source })),
-      }),
-    ),
-  )
-  const lines = block.lines ?? []
-  lines.forEach((line, index) => {
-    const label = inlineChildren(line.label, context, {})
-    const separator = plainText(line.label).trim() && !/[:]\s*$/.test(plainText(line.label)) ? ': ' : ' '
-    out.push(
-      new Paragraph(
-        compact({
-          alignment: alignment(align),
-          indent,
-          keepNext: index < lines.length - 1 || undefined,
-          spacing: { before: 0, after: twips(2) },
-          children: [
-            ...label,
-            ...inlineChildren(separator, context, {}),
-            ...(line.value === null
-              ? blankChildren(context, {}, ruleWidth * 0.6)
-              : inlineChildren(line.value, context, compact({ source: line.source }))),
-          ],
-        }),
-      ),
+        ...item,
+        spacing,
+        keepNext: (keepTogether && !last) || undefined,
+        keepLines: keepTogether || undefined,
+        pageBreakBefore: (breakBefore && first) || undefined,
+        frame: context.frame,
+      }) as IParagraphOptions,
     )
   })
+}
+
+/* ------------------------------------------------------------------ tick boxes */
+
+const isChosen = (block: ChoicesBlock, option: string) =>
+  Array.isArray(block.chosen) ? block.chosen.includes(option) : block.chosen === option
+
+/** A tick box and its option's words, kept together. */
+function choiceRuns(block: ChoicesBlock, option: string): Inline[] {
+  const source = block.source ? { source: block.source } : {}
+  return [{ type: 'checkbox', checked: isChosen(block, option), ...source }, { type: 'text', text: ` ${option}`, ...source }]
+}
+
+/**
+ * A tick-box question as the kit's own blocks: the question and its boxes on one line (`inline`), the question over one
+ * option a line (`list`), or a ruled box with the question at the left and the boxes at the right (`boxed`). The
+ * answer line, when there is one, goes under the question.
+ */
+function choiceBlocks(block: ChoicesBlock, context: WriterContext): Block[] {
+  const answer: Block[] =
+    block.answer === undefined
+      ? []
+      : [
+          {
+            type: 'paragraph',
+            content: block.answer === null ? [{ type: 'blank' }] : block.answer,
+            text: { bold: true },
+            ...(block.source ? { source: block.source } : {}),
+          },
+        ]
+  const label = block.label === undefined ? [] : [block.label]
+  if (block.boxed) {
+    const look = context.theme.table
+    const options: Block[] = block.options.map((option) => ({ type: 'paragraph', content: choiceRuns(block, option), spacing: { after: 0 } }))
+    return [
+      {
+        type: 'table',
+        columnWidths: [3, 1],
+        borders: { insideVertical: look.outerBorder },
+        rows: [
+          {
+            cantSplit: true,
+            cells: [
+              { blocks: [...label.map((content): Block => ({ type: 'paragraph', content, spacing: { after: 2 } })), ...answer] },
+              { blocks: options, verticalAlign: 'center' },
+            ],
+          },
+        ],
+      },
+    ]
+  }
+  if ((block.layout ?? 'inline') === 'list') {
+    return [
+      ...label.map((content): Block => ({ type: 'paragraph', content, keepWithNext: true, spacing: { after: 2 } })),
+      ...block.options.map((option, i): Block => ({
+        type: 'paragraph',
+        content: choiceRuns(block, option),
+        indent: { left: 14 },
+        spacing: { after: 0 },
+        keepWithNext: i < block.options.length - 1 || answer.length > 0,
+      })),
+      ...answer,
+    ]
+  }
+  const runs: Inline[] = []
+  if (block.label !== undefined) runs.push(...(Array.isArray(block.label) ? block.label : [block.label as Inline]), '   ')
+  block.options.forEach((option, i) => {
+    if (i) runs.push('   ')
+    runs.push(...choiceRuns(block, option))
+  })
+  return [{ type: 'paragraph', content: runs, keepWithNext: answer.length > 0 }, ...answer]
+}
+
+/* ------------------------------------------------------------------ pinned blocks */
+
+const FRAMED = new Set<Block['type']>(['heading', 'paragraph', 'list', 'fields', 'signature', 'choices', 'spacer', 'figure', 'pageBreak'])
+
+/**
+ * Blocks pinned to the foot of the page: every paragraph they make carries one text frame anchored to the bottom
+ * margin, centred across the text width, so Word (and the layout) set them as one box at the foot of the page the
+ * pinned block falls on. Tables cannot sit in such a frame, so a block that would make one is refused.
+ */
+function writePinned(block: PinnedBlock, context: WriterContext, breakBefore: boolean): FileChild[] {
+  if (context.frame) return writeBlocks(block.blocks, context)
+  const refuse = (what: string) => {
+    throw new Error(`document-kit: a pinned block cannot hold ${what}: Word's frames take paragraphs only`)
+  }
+  for (const inner of block.blocks) {
+    if (!FRAMED.has(inner.type)) refuse(`a ${inner.type} block`)
+    if (inner.type === 'fields' && inner.layout === 'table') refuse('fields in table layout')
+    if (inner.type === 'choices' && inner.boxed) refuse('boxed tick boxes')
+    if (inner.type === 'figure' && (!inner.image || inner.caption)) refuse('a figure without its picture, or with a caption')
+  }
+  const frame: IFrameOptions = {
+    type: 'alignment',
+    width: twips(context.width),
+    height: 20,
+    rule: HeightRule.AUTO,
+    anchor: { horizontal: FrameAnchorType.MARGIN, vertical: FrameAnchorType.MARGIN },
+    alignment: { x: HorizontalPositionAlign.CENTER, y: VerticalPositionAlign.BOTTOM },
+    wrap: FrameWrap.AROUND,
+  }
+  const out: FileChild[] = []
+  if (breakBefore) out.push(gapParagraph(1, true))
+  const inner = { ...context, frame }
+  out.push(...writeBlocks(block.blocks, inner))
+  if ((block.spaceBelow ?? 0) > 0) out.push(gapParagraph(block.spaceBelow!, false, frame))
+  if (out.some((child) => child instanceof Table)) refuse('a table')
   return out
 }
 
@@ -456,6 +624,7 @@ function writeToc(block: TocBlock, context: WriterContext, breakBefore: boolean)
         compact({
           style: TOC_TITLE_STYLE_ID,
           pageBreakBefore: breakBefore || undefined,
+          frame: context.frame,
           children: inlineChildren(block.title, context, {}),
         }),
       ),

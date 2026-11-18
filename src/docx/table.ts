@@ -17,7 +17,7 @@ import type { Align, RowRole, TableBlock, TableCell, TextStyle, ThemeText, Verti
 import type { WriterContext } from './context'
 import { blankChildren, inlineChildren } from './inline'
 import { alignment, captionParagraph, compact, gapParagraph, styledParagraph, TABLE_STYLE_ID } from './paragraphs'
-import { border, hex, twips } from './units'
+import { border, hex, lineMultiple, twips } from './units'
 
 /** Writes nested blocks inside a cell. Set by the block writer, which tables call back into. */
 export type BlockWriter = (blocks: TableCell['blocks'] & object, context: WriterContext) => Array<Paragraph | Table>
@@ -150,11 +150,13 @@ export function writeTable(
       )
       column += 1
     }
+    // A row's own height wins; else the theme's least height for header rows or for the others.
+    const least = row.height ?? (role === 'header' ? look.headerRowHeight : look.rowHeight)
     const height =
       role === 'spacer'
         ? { value: twips(row.height ?? look.spacerHeight), rule: HeightRule.EXACT }
-        : row.height !== undefined
-          ? { value: twips(row.height), rule: HeightRule.ATLEAST }
+        : least !== undefined
+          ? { value: twips(least), rule: HeightRule.ATLEAST }
           : undefined
     // Keep with next is Word's: `w:keepNext` on the paragraphs of the row's cells (the docx library puts it on every
     // one, the rows it adds under a merged cell too). The last row has no row to keep with.
@@ -191,7 +193,14 @@ export function writeTable(
               ? []
               : inlineChildren(content, context, compact({ style: base, source: cell.source }))
         children = [
-          new Paragraph(compact({ style: TABLE_STYLE_ID, alignment: alignment(cellAlign), children: runs })),
+          new Paragraph(
+            compact({
+              style: TABLE_STYLE_ID,
+              alignment: alignment(cellAlign),
+              spacing: table.line === undefined ? undefined : { line: lineMultiple(table.line) },
+              children: runs,
+            }),
+          ),
         ]
       }
       return new DocxCell(
@@ -220,7 +229,7 @@ export function writeTable(
       rows,
       width: { size: columnTwips.reduce((a, b) => a + b, 0), type: WidthType.DXA },
       columnWidths: columnTwips,
-      layout: TableLayoutType.FIXED,
+      layout: table.autoFit ? TableLayoutType.AUTOFIT : TableLayoutType.FIXED,
       alignment: alignment(table.align),
       margins: {
         top: twips(padding.top),

@@ -1,4 +1,5 @@
 /** What every part of the writer needs to know while it writes one section. */
+import type { IFrameOptions } from 'docx'
 import type { CaptionedBlock, PageBox } from '../model/index'
 import type { TextStyle, Theme } from '../model/types'
 
@@ -12,6 +13,8 @@ export interface WriterContext {
   sourceStyles: Readonly<Record<string, TextStyle>>
   nullCells: 'empty' | 'rule'
   lists: ListRegistry
+  /** Inside a pinned block: the text frame every paragraph written there carries (one frame together). */
+  frame?: IFrameOptions
 }
 
 /** The numbering definitions the lists of a document need, gathered while the body is written. */

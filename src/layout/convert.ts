@@ -36,6 +36,7 @@ import { PdfDocument } from '../ream/pdf/writer';
 import { writeSvg } from '../ream/svg/svg-writer';
 import { docxReader } from '../ream/word/docx-reader';
 import { STAND_IN_NAMES } from './fonts';
+import { TICK_BOX_CHARACTERS, tickBoxRegistry } from './tickBoxes';
 
 /** Something the conversion dropped, degraded or substituted (the engine's `Loss`). */
 export type LayoutLoss = Loss;
@@ -421,6 +422,19 @@ async function renderOptions(
         'which document-kit does not bundle; they are drawn from another face on hand, at its own widths',
     });
   }
+  // Tick boxes (☐ ☑ ☒) no face on hand draws are drawn from a face of boxes
+  // built for them (./tickBoxes), which the engine falls back to per character.
+  const before = [...registriesByFamily.values(), ...embedded.values()].flatMap(facesOf);
+  const boxes = new Set<number>();
+  forEachTextInFlow(flow, (text) => {
+    for (const ch of text) {
+      const cp = ch.codePointAt(0) ?? 0;
+      if (TICK_BOX_CHARACTERS.includes(cp)) boxes.add(cp);
+    }
+  });
+  const undrawnBox = [...boxes].some((cp) => !before.some((face) => face.glyphForCodepoint(cp) !== 0));
+  if (undrawnBox && !registriesByFamily.has('symbols2')) registriesByFamily.set('symbols2', tickBoxRegistry());
+
   // A script is named only for the characters of it that no face on hand
   // draws: the engine sends ▼ ■ ↑ to a symbol face it would download, but the
   // stand-ins draw most of them themselves, and a loss for those misled.

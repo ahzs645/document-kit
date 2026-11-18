@@ -93,11 +93,13 @@ describe('docxToPdf', () => {
   });
 
   it('still names symbols no supplied face has, by code point', async () => {
-    const docx = await sampleDocx({ rows: 3, extra: [{ text: 'Done ☐ ▼' }] });
+    // A tick box is drawn from the kit's face of boxes (src/layout/tickBoxes.ts); a telephone sign is not.
+    const docx = await sampleDocx({ rows: 3, extra: [{ text: 'Done ☐ ☎ ▼' }] });
     const { losses } = await docxToPdf(docx, { fonts });
     const loss = losses.find((l) => /symbol text/.test(l.detail));
     expect(loss?.severity).toBe('degraded');
-    expect(loss?.detail).toContain('U+2610');
+    expect(loss?.detail).toContain('U+260E');
+    expect(loss?.detail).not.toContain('U+2610');
     expect(loss?.detail).not.toContain('U+25BC');
   });
 

@@ -18,6 +18,7 @@ Column widths in a table are **shares** (any numbers; `[3, 1, 1]` gives the firs
 interface Document {
   metadata?: { title?, author?, subject?, description?, keywords?, created?, modified? }
   theme?: ThemeInput      // any part of the theme; the rest is the kit's neutral default
+  textRules?: TextRule[]  // automatic text touches: links, italic terms, raised markers (below)
   sections: Section[]     // at least one
 }
 ```
@@ -50,11 +51,13 @@ A section is a run of pages with one page set-up:
 | `heading` | Levels 1 to 6. Written as Word's Heading styles with outline levels, so the navigation pane and a table of contents read them. |
 | `paragraph` | Rich text with a style (`normal`, `title`, `subtitle`, `caption`, `note`, `small`), alignment (including justify), spacing before/after/line, indent (left, right, first line, hanging), keep with next, keep lines together, page break before, tab stops (`at: 'end'` is the right edge), borders and shading. |
 | `list` | Bulleted or ordered, nested to any depth; an item may change kind for its children. Real Word numbering; each ordered list counts from its own `start`. |
-| `fields` | Label and value rows, as lines (`Label: value`, optional tab stop) or as a two-column table. A `null` value prints a blank rule. |
-| `table` | Rows with roles: `header` (theme header look, repeated at the top of each page while among the first rows), `group` (shaded band), `note` (one small cell across the table), `spacer` (a short empty row), `body`. Cells span columns and rows (`colSpan`, `rowSpan`, listed as in HTML: a covered cell is not written). Per-cell alignment, vertical alignment, shading, borders, text style, a corner-to-corner rule (`diagonal`, a struck cell), text turned a quarter (`textDirection: 'up'` or `'down'`), and blocks inside a cell (paragraphs, lists, pictures, nested tables). Column shares, width as a share of the text, table borders, cell padding, text size, a caption above or below, a note under it, rows kept whole (`cantSplit`), a row kept with the next (`keepWithNext`, on by default for a `header` row with a row after it), the whole table on one page (`keepTogether`). |
+| `fields` | Label and value rows, as lines (`Label: value`, optional tab stop) or as a two-column table. A `null` value prints a blank rule. In lines, `rowSpacing` is the space after each row, and a row with `sameLine: true` goes on the line of the row before it after `sameLineGap` points (24) — "E-mail: …   Phone: …" — when it fits; when it does not, it moves whole to the next line, since its spaces and hyphens are written unbreakable (the hyphen as Word's no-break hyphen). It then shares the paragraph of the row before it, so it lacks that row's `rowSpacing` above it. |
+| `table` | Rows with roles: `header` (theme header look, repeated at the top of each page while among the first rows), `group` (shaded band), `note` (one small cell across the table), `spacer` (a short empty row), `body`. Cells span columns and rows (`colSpan`, `rowSpan`, listed as in HTML: a covered cell is not written). Per-cell alignment, vertical alignment, shading, borders, text style, a corner-to-corner rule (`diagonal`, a struck cell), text turned a quarter (`textDirection: 'up'` or `'down'`), and blocks inside a cell (paragraphs, lists, pictures, nested tables). Column shares, width as a share of the text, table borders, cell padding, text size, a caption above or below, a note under it, rows kept whole (`cantSplit`), a row kept with the next (`keepWithNext`, on by default for a `header` row with a row after it), the whole table on one page (`keepTogether`), its own line height (`line`), and `autoFit` (Word's AutoFit to contents, the shares only a start; fixed by default). A `header` row further down the table (a stacked block's own header) is drawn in the header look and not repeated. |
 | `figure` | A PNG or JPEG with its pixel size (read from its header when not given), fitted into a box (`fit: { width, height, upscale }`, or `'page'` to fill what the section's page leaves under the caption), a caption, a note, alignment. `crop: { top, right, bottom, left }` shows a band of it (the share, 0 to 1, cut away at each edge; the part shown is what is fitted), and `border: { width, color }` draws a solid frame round it. `image: null` prints a placeholder box with `placeholder` text. |
 | `figureGrid` | Pictures in `columns` columns (one column stacks them), each with a label above or below and a placeholder when missing, under one caption. |
-| `signature` | A label, the signature picture or room to sign by hand, the signing rule with the name under it, and lines under that (`Title`, `Date`), any of which can be blank. |
+| `signature` | A label, the signature picture or room to sign by hand, the signing rule with the name (and title) under it, and lines under that (`Title`, `Date`), any of which can be blank. Kept on one page. Options below. |
+| `choices` | A tick-box question: `label`, `options` (strings), `chosen` (one of them, a list for several, or null: unanswered, listed), `answer` (a free-text answer line; null is a blank to complete; absent, no line), `layout` `inline` (default) or `list`, `boxed` (a ruled box, the boxes at the right). |
+| `pinned` | Blocks pinned to the foot of the page they fall on (below). |
 | `pageBreak` | The next block starts a new page. Every block also takes `pageBreakBefore`. |
 | `toc` | A table of contents over heading levels 1 to `levels`, filled from the headings when written. Word fills the page numbers when it updates the field; `document-kit/layout` fills them itself, each in its page's numbering. |
 | `spacer` | Vertical space of an exact height. |
@@ -71,9 +74,116 @@ Every block may carry `id` (the application's own), `source`, and `pending` (see
   (a URI; written as a real hyperlink). In text, a newline is a line break and a tab character a tab.
 - `field`: `page`, `pages` (the document's page count) or `sectionPages`.
 - `break`, `tab`.
-- `blank`: a rule to fill by hand, with `what` it is for.
+- `blank`: a rule to fill by hand, with `what` it is for. `show: 'placeholder'` prints `[what]` instead, in the
+  theme's `placeholderMark` look (a yellow highlight by default): a value nobody gave, set apart in its sentence.
+- `checkbox`: a tick box, `checked` or not (below).
 - `image`: a picture in the line (a logo in a header) at a stated size in points.
 - `sentence`: a template over named slots (below).
+
+## Tick boxes
+
+A `checkbox` run, and each option of a `choices` block, is written as Word's own check box (a `w14:checkbox`
+content control showing ☒ or ☐ from MS Gothic), which a reader can tick in Word. The bundled fonts have no ☐ ☑ ☒,
+so `document-kit/layout` draws them from a small face of boxes it builds for them (`src/layout/tickBoxes.ts`): a
+square, crossed when ticked, in the PDF and the page pictures alike. The characters stay in the text, so
+`pageText` reads a box as `☐` or `☒`, and `plainText` the same.
+
+## Pinned blocks
+
+`{ type: 'pinned', blocks, spaceBelow? }` takes its blocks out of the text's flow and sets them at the foot of the
+page the block falls on: a disclaimer at the bottom of the first page, a contact block at the bottom of the last.
+The Word writer gives each paragraph the blocks make one text frame anchored to the bottom margin and centred across
+the text width (`w:framePr`, `w:vAnchor="margin"`, `w:yAlign="bottom"`, wrapping around); Word sets consecutive
+paragraphs that share a frame as one box. `spaceBelow` keeps empty room under the blocks inside the frame, so the
+last line clears the margin.
+
+- It holds headings, paragraphs, lists, `lines` fields, a signature, tick boxes (not boxed), spacers and pictures
+  without a caption. A frame cannot hold a table, so a table, a boxed question, `table` fields, a placeholder
+  picture or a captioned figure there is refused with an error naming it.
+- The text of the page flows above it. A line that would run into it goes on to the next page.
+- When the text above it already reaches lower than its top — the page is too full for it under its text — it goes
+  to the foot of the next page instead (with nothing else on that page if nothing follows). `document-kit/layout`
+  does both (`docs/ream-upstream.md`, changes 10 and 11); Word does the same.
+- Its blocks are walked like any others: to-complete, caption numbers, custom blocks and hand edits reach into it.
+
+## Signature options
+
+| Option | Default | |
+|---|---|---|
+| `label`, `labelPosition` | | `above` the block, or `below` the name and lines |
+| `labelStyle`, `labelGap` | bold, 4 | The label's look; points between it and the picture or signing room |
+| `image`, `imageBox`, `imageUpscale` | none, 140 × 55, true | The picture is fitted into the box, keeping its shape, and sits on the rule |
+| `signingSpace` | 36 | Room to sign by hand when there is no picture, points |
+| `name`, `title`, `titleLayout`, `titleSeparator` | | `sameLine`: "Name, Title"; `nextLine`: the title under the name. A null name or title is a blank to complete |
+| `nameStyle` | bold | |
+| `lines` | | Rows under the name ("Date: …"); a row with an empty label prints its value alone |
+| `align` | `left` | `left`, `center` or `right` (the rule and the lines follow it) |
+| `ruleWidth`, `ruleThickness`, `ruleColor`, `ruleGap` | 216, 0.75, body colour, 2 | The rule's length and weight; points between it and the name |
+| `spaceAbove`, `spaceBelow` | 12, 2 | |
+| `keepTogether` | true | Every paragraph kept with the next and whole, so the block never splits across pages |
+
+## Text rules
+
+`document.textRules` states, as data, the automatic touches an application gives its text: web and e-mail addresses
+as links, a species name in italics, a footnote marker raised, a formula's digits set low. The Word writer applies
+them to the text's ordinary runs before it writes (`applyTextRules`), so the layout and the PDF follow, and the
+document an application keeps is left as it was. Each rule says what to find and what to do with it:
+
+```json
+"textRules": [
+  { "id": "links", "builtIn": "links", "in": ["paragraph", "value"] },
+  { "id": "species", "terms": ["M. exemplum"], "style": { "italic": true }, "in": ["cell", "note"] },
+  { "id": "markers", "builtIn": "trailingMarker", "markers": "a-h", "in": ["cell", "label"] },
+  { "id": "footnotes", "builtIn": "leadingMarker", "markers": "a-h", "auto": false },
+  { "id": "formulas", "builtIn": "formulaDigits", "formulas": ["CaCO3", "NO3"] },
+  { "id": "run", "pattern": "Run (\\d+)", "group": 1, "style": { "bold": true } }
+]
+```
+
+| Key | |
+|---|---|
+| `pattern`, `flags`, `group` | A regular expression from the safe subset below (`flags`: `i` only); the style or link goes on the whole match or on one capture group, by number or name |
+| `terms`, `ignoreCase` | Words or phrases, matched whole (a term starting or ending in a letter does not match inside a longer word), longest first |
+| `builtIn` | `links` (e-mail addresses → `mailto:`, `https://` and other schemes, `www.…`, and bare domains `example.org/page` on the top-level domains in `domains`, a common list by default); `trailingMarker` ("Total a", "Lead a, b": the letters after a space at the end, raised); `leadingMarker` ("a Dried at 105 °C", "bAir dried": the letter opening the text, raised); `formulaDigits` (the digits of the listed `formulas`, standing alone, set low) |
+| `style` | A text style (`italic`, `bold`, `superscript`, `subscript`, `color`, `underline`, …) laid over the matched text's own. A built-in's own default (markers superscript, formula digits subscript) is replaced by it |
+| `link`, `schemes` | `link: true` makes the match a link when it reads as an address of an allowed scheme (`https`, `http`, `mailto` by default); the `links` built-in takes `schemes` too. A trailing `.,;:!?` and a closing bracket the address did not open stay outside the link |
+| `in` | Only in these kinds of text: `paragraph`, `heading`, `list`, `label` (a field's label), `value` (a field's value), `cell`, `caption`, `note` (notes, `note` and `small` paragraphs, placeholders), `signature`, `choice` (a question), `header`, `footer` (everything in a header or footer). Everywhere when absent |
+| `id`, `auto` | `auto: false`: the rule applies only where a block or a recipe filter names it by `id` |
+
+**Where.** A block's `textRules` decides which rules touch it: absent, the automatic ones; a list of ids, the
+automatic ones and those; `false`, none. Blocks in a table's cells and in a pinned block take their container's
+setting unless they give their own.
+
+**Order.** A block's rules apply one after another in the order the document lists them, each to the runs the ones
+before it made. A rule sees a stretch of consecutive text runs as one text (a match can run across two runs of
+different looks); a link, a field, a break, a tab, a blank, a picture or a tick box ends a stretch. **Text inside a
+link** (a run with `link`, given by the application or made by an earlier rule) **is never searched again**: nothing
+is linked twice and an address's digits are never set low. So list `links` first. Hits of one rule that overlap are
+taken left to right, the later dropped.
+
+**Limits** (`TEXT_RULE_LIMITS`, each can be changed through `applyTextRules(document, limits)` or
+`compileTextRules(rules, limits)`): patterns come from JSON a person may edit, so they are read through a safe subset
+and every search is bounded.
+
+| Limit | Default | |
+|---|---|---|
+| `rules` | 100 | rules in a document |
+| `patternLength` | 200 | characters in a pattern |
+| `repeat` | 100 | the most times `*`, `+` or `{n,}` repeat (they are read as `{0,100}`, `{1,100}`, `{n,100}`); an explicit `{n,m}` may not ask for more |
+| `cost` | 12,000 | the product over a pattern's repeats of (most times + 1): two `+` (101² = 10,201) pass, three do not |
+| `terms`, `termLength` | 1,000, 100 | terms in a list (and formulas), characters in one |
+| `textLength` | 10,000 | characters of one stretch a pattern or term list searches; a longer stretch is left as it is and reported in `applyTextRules(…).skipped` (the built-ins, which are linear, search any length) |
+| `matches` | 20,000 | matches in one document, every rule together; past it, `TextRuleError` |
+
+Refused, each named in the error's `problems`: back-references (`\1`, `\k<…>`), look-arounds (`(?=`, `(?!`,
+`(?<=`, `(?<!`), Unicode property escapes (`\p{…}`), control escapes, a repeat of a group that holds a repeat or an
+alternative (`(a+)+`, `(a|b)*`, the patterns that can run away), a `{` that is not a repeat, flags other than `i`, a
+rule that says neither `style` nor `link`, an unknown key or style key, and a built-in without what it needs
+(`formulaDigits` without `formulas`). A worst case of what is allowed searches 10,000 characters in well under a
+second (`tests/model/text-rules.test.ts`).
+
+`compileTextRules(rules)` reads a list once; `ruleText(richText, compiled, { use: ids })` applies named rules to one
+value (what the recipes' `rules` filter does).
 
 ## Keeping table rows together
 
@@ -92,9 +202,10 @@ row that says `cantSplit`. The writer says both that way:
 
 The theme is how a document looks, so one application can be Times with a green band and the other Arial and grey,
 and the kit knows neither: body font, size and colour; title, subtitle, six heading levels, caption, note, small,
-header and footer text (font, size, colour, bold, italic, caps, alignment, spacing); link colour; the table look
-(header fill and text, group fill, note text, label fill, outer and inner borders, cell padding, spacer height,
-placeholder box); the caption words and separator (`Table 3: Results`, or `Figure 2. View`); the blank rule's
+header and footer text (font, size, colour, bold, italic, caps, alignment, spacing before and after, line height);
+link colour; the placeholder mark (`placeholderMark`, a text style); the table look (text size, line height `line`,
+header fill and text, group fill, note text, label fill, outer and inner borders, cell padding, least heights of
+header and other rows `headerRowHeight` and `rowHeight`, spacer height, placeholder box); the caption words and separator (`Table 3: Results`, or `Figure 2. View`); the blank rule's
 width; and the default page. `resolveTheme(partial)` merges a partial theme over `DEFAULT_THEME`, heading level by
 heading level.
 
@@ -115,7 +226,10 @@ Word writer marks text by it only when told: `writeDocx(doc, { sourceStyles: { r
 
 A value nobody gave is `null`: a field row's value, a table cell, a signature's name or line, a figure's image. It
 prints as a blank rule (an empty cell in a table, unless `nullCells: 'rule'`). A sentence with a slot that has no
-value is not printed at all, and its separating space goes with it.
+value is not printed at all, and its separating space goes with it — unless it says `missing: 'placeholder'`: then
+it prints with each missing slot as `[slot]`, marked. A placeholder blank (`show: 'placeholder'`) prints `[what]`,
+marked. Both are listed to complete like the rest. An unanswered tick-box question (`chosen` null) and a null answer
+are listed as `choice` and `answer`.
 
 `toComplete(document, { registry? })` walks the document (bodies, headers, footers, inside table cells) and lists
 everything still to complete: each null value, blank rule, left-out sentence (with its missing slots), missing
@@ -186,8 +300,9 @@ always, and the same bytes whenever `created` is given.
 | Row roles `groupHeader`, `note`, `spacer`, `data` | roles `group`, `note`, `spacer`, `body` |
 | Merged header cells (repeated labels, blanks under a label) | `colSpan` / `rowSpan` (the app decides the merges) |
 | Struck cells of a short final block | cell `diagonal: 'up'` |
-| Footnote markers in cells and footnote lines | `sup('a')` runs; footnote lines as `note` paragraphs |
-| Chemistry (CaCO3) | `sub('3')` runs (the app finds the formulas) |
+| Footnote markers in cells and footnote lines | text rules `trailingMarker` (cells, labels) and `leadingMarker` (footnote lines, named by their blocks); or `sup('a')` runs |
+| Chemistry (CaCO3) | text rule `formulaDigits` with the app's list of formulas; or `sub('3')` runs |
+| E. coli in italics | text rule `terms` with `style: { italic: true }` |
 | `align` (label/value/header), `exportLayoutPreset` density | `columnAlign`, cell `align`, table `size`, `cellPadding`, `columnWidths` |
 | Wide tables: `separateTables` / `stackedBlocks` | several `table`s, or one table with `header` rows inside it (they do not repeat); the split itself stays in the app's `table-layout.ts` |
 | `tableContinuation` (repeat / none / auto) | row `repeat` and table `repeatHeader: false` |
@@ -195,9 +310,12 @@ always, and the same bytes whenever `created` is given.
 | Captions "Table N: …", `captionMode` none / explicit | `caption`, `numbered: false` / `'silent'` |
 | Figures (`layout` wide / standard / half) and placeholders | `figure` with a `fit` box; `image: null` and `placeholder` |
 | Attachments (image page, companion file, external report) | `figure` with `pageBreakBefore`, or a placeholder `figure` |
-| Signature block (label, picture or wet-ink gap, rule, name and title) | `signature` |
+| Signature block (label, picture or wet-ink gap, rule, name and title) | `signature` with `titleLayout: 'sameLine'`, `align: 'center'`, `signingSpace`, `ruleWidth`, `ruleGap`, `spaceAbove`/`spaceBelow` |
+| Service Disclaimer at the foot of page 1, Contact at the foot of the last page (`pinBottom`, `CONTACT_LIFT_LINES`) | `pinned` with `spaceBelow` |
+| E-mail and phone on one line when they fit | `fields` row `sameLine: true` |
+| An unfilled `[placeholder]` marked in its sentence | `blank` with `show: 'placeholder'`; a sentence's `missing: 'placeholder'` |
 | Header code; footer reference + "Page X of Y" | section `header` paragraph; footer paragraph with `tabs: [{ at: 'end', align: 'right' }]`, `pageNumber()`, `pageCount()` |
-| Links in prose (URLs, e-mail) | `link` runs (the app finds them) |
+| Links in prose (URLs, e-mail) | text rule `links` (scheme list, trailing punctuation outside); or `link` runs |
 | Filled-value and placeholder marks | `source` tags with `sourceStyles`, or `highlight` on runs |
 | Letter / A4 | `page.paper` |
 
@@ -213,7 +331,7 @@ always, and the same bytes whenever `created` is given.
 | `table` with `note` | `table` with a `header` row and `note` |
 | `matrix` (marked cells, tints, class grid) | `custom` → `table` (marked cell shaded; tints as cell `shading`) |
 | `scale` (bar, arrow axis, guide) | `custom` → a table of coloured band cells, or a picture the app draws (see below) |
-| `choices` (tick boxes, boxed) | `custom` → `paragraph` with ☒ / ☐, or a one-row `table` when boxed |
+| `choices` (tick boxes, boxed, answer) | `choices` (`boxed`, `answer`); hand edits of the tick and the answer in recipes |
 | `figure` with placeholder | `figure` |
 | `signature` lines | `signature` with `lines` whose values are `null` |
 | `form` (numbered sections with title bars) | `table` whose title rows are `group` rows and whose cells hold blocks |
@@ -232,11 +350,13 @@ always, and the same bytes whenever `created` is given.
 
 - Shapes and vector drawing: a scale bar with an arrow, a mark between matrix cells, an X on a grid, a north arrow.
   The app draws them as a PNG or builds them from table cells. SVG pictures are not written.
-- Tick boxes ☐ ☑ ☒ in text print only where a face that has them is embedded: the bundled stand-ins have none. Draw
-  them as pictures.
+- Tick boxes typed as characters (☐ in a text run) are drawn by the layout's face of boxes too, but only the
+  `checkbox` run is a real check box in Word.
 - A picture border other than a solid line (dashed, double): the layout draws a picture's frame solid only. Crop and
   border are on `figure`; a `figureGrid` item and an inline picture take neither yet.
-- A frame pinned to the foot of the page (the laboratory contact block's `pinBottom`).
+- A table pinned to the foot of the page (Word frames hold paragraphs only).
+- Fitting a `sameLine` field by measuring: the kit does not measure text, so a row that does not fit wraps inside
+  the row before it's paragraph rather than becoming a paragraph of its own.
 - A label printed inside a picture's corner (the `inset` placement of a figure pair); labels go above or below.
 - A list of figures (the contents' Images list); only headings make a table of contents.
 - Internal links and bookmarks the app names; `link` takes URIs only.

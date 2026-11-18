@@ -2,24 +2,33 @@
   "kind": "component",
   "id": "data-table",
   "title": "Data table",
-  "description": "A table: a header row from a list of column labels, one row per item of the data (a list of cell values), group rows ({ group }) and note rows ({ note }) among them, a caption and a note. A cell the data leaves empty prints empty and is listed to complete.",
+  "description": "A table: a header row from a list of column labels, one row per item of the data (a list of cell values), group rows ({ group }), note rows ({ note }) and further header rows ({ header: [labels] }, a stacked block's own) among them, a caption and a note. A cell the data leaves empty prints empty and is listed to complete.",
   "params": {
     "caption": { "default": null },
+    "numbered": { "default": true, "description": "true: \"Table 3: …\"; false: the caption alone, taking no number; \"silent\": the caption alone, taking a number." },
     "columns": { "required": true, "description": "The column labels." },
-    "rows": { "default": [], "description": "Each a list of cell values, or { group: text }, or { note: text }." },
+    "rows": { "default": [], "description": "Each a list of cell values, or { group: text }, { note: text } or { header: [labels] }." },
     "note": { "default": null },
     "widths": { "default": null, "description": "Column shares, as [3, 1, 1]." },
     "align": { "default": null, "description": "Body alignment by column, as [\"left\", \"right\"]." },
     "size": { "default": null },
+    "padding": { "default": null, "description": "Cell padding, points: { top, bottom, left, right }." },
+    "line": { "default": null, "description": "Line height of the table's text, as a multiple." },
+    "repeatHeader": { "default": null, "description": "false: the header row is not repeated at the top of each page." },
+    "autoFit": { "default": null, "description": "true: the columns fit their content, the widths only a start." },
     "empty": { "default": "No results." }
   },
   "blocks": [
     {
       "type": "table",
-      "caption": "{{ params.caption }}",
+      "caption": { "text": "{{ params.caption }}", "numbered": "{{ params.numbered }}" },
       "columnWidths": "{{ params.widths }}",
       "columnAlign": "{{ params.align }}",
       "size": "{{ params.size }}",
+      "cellPadding": "{{ params.padding }}",
+      "line": "{{ params.line }}",
+      "repeatHeader": "{{ params.repeatHeader }}",
+      "autoFit": "{{ params.autoFit }}",
       "note": "{{ params.note }}",
       "rows": [
         { "role": "header", "cells": [{ "for": "column in params.columns", "do": ["{{ column }}"] }] },
@@ -33,7 +42,13 @@
                 {
                   "if": "row.note",
                   "then": [{ "role": "note", "cells": ["{{ row.note }}"] }],
-                  "else": [{ "cells": [{ "for": "cell in row", "do": ["{{ cell }}"] }] }]
+                  "else": [
+                    {
+                      "if": "row.header",
+                      "then": [{ "role": "header", "cells": [{ "for": "label in row.header", "do": ["{{ label }}"] }] }],
+                      "else": [{ "cells": [{ "for": "cell in row", "do": ["{{ cell }}"] }] }]
+                    }
+                  ]
                 }
               ]
             }

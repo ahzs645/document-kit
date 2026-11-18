@@ -8,18 +8,20 @@ export interface BlockVisit {
   section: number
   /** Where it is: `body`, `header`, `footer`, `firstHeader`, `firstFooter`. */
   part: 'body' | 'header' | 'footer' | 'firstHeader' | 'firstFooter'
-  /** The blocks it sits inside (a table holding it), outermost first. */
+  /** The blocks it sits inside (a table or pinned block holding it), outermost first. */
   parents: readonly Block[]
 }
 
-/** Every block of a list in reading order, a table's cell blocks after the table itself. */
+/** Every block of a list in reading order, a table's cell blocks (and a pinned block's blocks) after the block itself. */
 export function* walkBlocks(
   blocks: readonly Block[],
   context: Omit<BlockVisit, 'block'>,
 ): Generator<BlockVisit> {
   for (const block of blocks) {
     yield { ...context, block }
-    if (block.type === 'table') {
+    if (block.type === 'pinned') {
+      yield* walkBlocks(block.blocks, { ...context, parents: [...context.parents, block] })
+    } else if (block.type === 'table') {
       for (const row of block.rows) {
         for (const input of row.cells) {
           const cell = toCell(input)

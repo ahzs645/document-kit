@@ -6,10 +6,10 @@ no server, no Node at run time, no network.
 
 | Entry | What it does | Guide |
 |---|---|---|
-| `document-kit` | The block model: a document as data, with provenance, blanks to complete, captions and custom blocks | `docs/model.md` |
+| `document-kit` | The block model: a document as data, with provenance, blanks and placeholders to complete, captions, tick boxes, blocks pinned to the foot of the page, text rules and custom blocks | `docs/model.md` |
 | `document-kit/docx` | `writeDocx(document)` writes the model as a Word file | `docs/model.md` |
 | `document-kit/layout` | `docxToPdf`, `docxToPages` (one SVG a page), `docxToHtml`, with fonts passed in as bytes | `docs/layout.md` |
-| `document-kit/template` | `fillTemplate`, `templateTags`, `checkTemplate` for Word templates with `{{ tags }}` | `docs/template.md` |
+| `document-kit/template` | `fillTemplate`, `templateTags`, `checkTemplate` for Word templates with `{{ tags }}`, and the sentence filters (`capitalize`, `plural`, `prose`, `ranges`) shared with recipes | `docs/template.md` |
 | `document-kit/recipe` | Reports from JSON: components and recipes compiled into one JSON object (`compileRecipe`), rendered against data into the block model (`renderRecipe`), with the to-complete list, provenance and hand edits; the same `{{ tag }}` language as Word templates | `docs/recipe.md` |
 | `document-kit/ream` | The layout engine itself | `docs/ream-upstream.md` |
 | `document-kit/fonts/*` | Open fonts that stand in for Times New Roman, Arial, Calibri, Cambria and Courier New | `fonts/README.md` |

@@ -78,7 +78,7 @@ export function stylesFor(theme: Theme): IStylesOptions {
       style('KitSmall', 'Small', theme.small),
       style('Header', 'header', { after: 0, line: 1, ...theme.header }),
       style('Footer', 'footer', { after: 0, line: 1, ...theme.footer }),
-      style(TABLE_STYLE_ID, 'Table text', { size: table.size, before: 0, after: 0, line: 1 }),
+      style(TABLE_STYLE_ID, 'Table text', { size: table.size, before: 0, after: 0, line: table.line ?? 1 }),
       // The contents' own title looks like a first-level heading but is not one, so it does not list itself.
       style(TOC_TITLE_STYLE_ID, 'Contents title', theme.headings[0] ?? {}, { keepNext: true }),
     ],

@@ -128,6 +128,11 @@ losses of its own:
   come out as empty boxes (and a `dropped` `text` loss names them per page).
 - `degraded` `text`: page numbers in body fields did not settle (see below).
 
+Tick boxes ☐ ☑ ☒ (U+2610–2612), which a Word check box prints (the block model's `checkbox` run and `choices`
+block), are drawn from a small face the kit builds from outlines (`src/layout/tickBoxes.ts`, through the engine's
+TrueType builder): a square, ticked or crossed. It is added only when the document has such a character that no
+supplied or embedded face draws, so they are no longer named as missing symbols; the characters stay in `pageText`.
+
 ## What the layout does with a Word file's page set-up and fields
 
 - **Vertical alignment of a section** (`w:vAlign`, the model's `page.verticalAlign`): `center`
@@ -149,6 +154,11 @@ losses of its own:
   §17.4.66: a cell's own border before the table's, a side with none gives way, then the
   heavier (width × the style's number), then the earlier style, then the darker colour. Heavier
   rules are painted over lighter ones, so a thick border keeps its corners.
+- **Frames at the foot of the page** (`w:framePr` with `w:yAlign="bottom"` against the page or margin, the model's
+  `pinned` block): set at the foot of the page their anchor falls on, the text flowing above them. A line the frame
+  would push below the text area starts the next page, and a frame that would cover text already set on its page
+  (the page is too full for it under its text) stands at the foot of the next page instead
+  (`docs/ream-upstream.md`, changes 10 and 11).
 - **Rows kept together.** A row whose first cell's paragraphs keep with the next stays on the
   page of the next row (the model's `keepWithNext`, on by default for header rows, and
   `keepTogether`); a run of such rows that fits a page moves to the next page whole rather than
@@ -170,8 +180,8 @@ losses of its own:
   (the build cannot split them out because `document-kit/ream` shares it).
 - **SVG pages have no text layer**; `pageText` stands in for search. Pages repeat glyph
   outlines unless `sharedGlyphs` is asked for.
-- **No vector tick boxes.** The bundled faces have no ☐ ☑ ☒; they print as empty boxes with a
-  loss. Draw them as pictures, or embed a face that has them.
+- **Tick boxes only.** Of the symbols the bundled faces lack, only ☐ ☑ ☒ are drawn (see Losses);
+  other symbols still print as empty boxes with a loss.
 - **HTML has no headers, footers or page numbers.**
 - **Fidelity is the engine's.** Stand-ins match widths, not shapes. Layout differences from
   Word in particular documents are the engine's to fix (and record in `docs/ream-upstream.md`).

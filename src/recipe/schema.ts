@@ -57,7 +57,7 @@ export const ITEM_OF: Partial<Record<Pos, Pos>> = {
   richOpt: 'inline',
 }
 
-const BASE: Record<string, Pos> = { id: 'text', source: 'text', pending: 'any', pageBreakBefore: 'scalar' }
+const BASE: Record<string, Pos> = { id: 'text', source: 'text', pending: 'any', pageBreakBefore: 'scalar', textRules: 'any' }
 
 const STYLE: Record<string, Pos> = {
   bold: 'scalar',
@@ -100,6 +100,8 @@ export const BLOCK_KEYS: Record<string, Record<string, Pos>> = {
     labelWidth: 'scalar',
     separator: 'text',
     size: 'scalar',
+    rowSpacing: 'scalar',
+    sameLineGap: 'scalar',
   },
   table: {
     ...BASE,
@@ -113,10 +115,12 @@ export const BLOCK_KEYS: Record<string, Record<string, Pos>> = {
     size: 'scalar',
     borders: 'any',
     cellPadding: 'any',
+    line: 'scalar',
     cantSplit: 'scalar',
     keepTogether: 'scalar',
     repeatHeader: 'scalar',
     columnAlign: 'any',
+    autoFit: 'scalar',
   },
   figure: {
     ...BASE,
@@ -143,14 +147,38 @@ export const BLOCK_KEYS: Record<string, Record<string, Pos>> = {
   signature: {
     ...BASE,
     label: 'richOpt',
+    labelPosition: 'scalar',
+    labelStyle: 'any',
+    labelGap: 'scalar',
     image: 'image',
     imageBox: 'any',
+    imageUpscale: 'scalar',
     name: 'richNull',
+    title: 'richNull',
+    titleLayout: 'scalar',
+    titleSeparator: 'text',
+    nameStyle: 'any',
     lines: 'fieldRows',
     align: 'scalar',
     ruleWidth: 'scalar',
+    ruleThickness: 'scalar',
+    ruleColor: 'scalar',
+    ruleGap: 'scalar',
     signingSpace: 'scalar',
+    spaceAbove: 'scalar',
+    spaceBelow: 'scalar',
+    keepTogether: 'scalar',
   },
+  choices: {
+    ...BASE,
+    label: 'richOpt',
+    options: 'any',
+    chosen: 'any',
+    answer: 'richNull',
+    layout: 'scalar',
+    boxed: 'scalar',
+  },
+  pinned: { ...BASE, at: 'scalar', blocks: 'blocks', spaceBelow: 'scalar' },
   pageBreak: { ...BASE },
   toc: { ...BASE, title: 'richOpt', levels: 'scalar' },
   spacer: { ...BASE, height: 'scalar' },
@@ -182,10 +210,11 @@ export const CELL_KEYS: Record<string, Pos> = {
   what: 'text',
 }
 
-export const FIELD_ROW_KEYS: Record<string, Pos> = { label: 'rich', value: 'richNull', source: 'text', what: 'text' }
+export const FIELD_ROW_KEYS: Record<string, Pos> = { label: 'rich', value: 'richNull', source: 'text', what: 'text', sameLine: 'scalar' }
 export const LIST_ITEM_KEYS: Record<string, Pos> = { content: 'rich', items: 'listItems', ordered: 'scalar' }
 export const GRID_ITEM_KEYS: Record<string, Pos> = { image: 'image', label: 'richOpt', placeholder: 'richOpt', alt: 'text' }
-export const CAPTION_KEYS: Record<string, Pos> = { text: 'rich', numbered: 'scalar' }
+/** A caption's `text` is optional rich text: a caption whose lone tag has no value is left out whole. */
+export const CAPTION_KEYS: Record<string, Pos> = { text: 'richOpt', numbered: 'scalar' }
 
 /** Each inline run type's keys (besides `type`). A text run's `text` is read as rich text in that run's style. */
 export const INLINE_KEYS: Record<string, Record<string, Pos>> = {
@@ -193,9 +222,10 @@ export const INLINE_KEYS: Record<string, Record<string, Pos>> = {
   field: { ...STYLE, field: 'scalar' },
   break: {},
   tab: {},
-  blank: { ...STYLE, what: 'text', width: 'scalar', source: 'text' },
+  blank: { ...STYLE, what: 'text', width: 'scalar', source: 'text', show: 'scalar' },
+  checkbox: { ...STYLE, checked: 'scalar', source: 'text' },
   image: { image: 'image', width: 'scalar', height: 'scalar', alt: 'text' },
-  sentence: { ...STYLE, template: 'literal', values: 'slots', label: 'text', source: 'text' },
+  sentence: { ...STYLE, template: 'literal', values: 'slots', label: 'text', source: 'text', missing: 'scalar' },
 }
 
 /** Keys of a recipe section and the document, beyond parts. */

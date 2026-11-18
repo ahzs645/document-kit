@@ -13,6 +13,7 @@ import {
   sharedLibrary,
 } from 'document-kit/recipe';
 
+import footnotes from '../../recipe/fixtures/components/footnotes.json';
 import reportTitle from '../../recipe/fixtures/components/report-title.json';
 import resultsTable from '../../recipe/fixtures/components/results-table.json';
 import sampleNotes from '../../recipe/fixtures/components/sample-notes.json';
@@ -42,7 +43,7 @@ export default async function recipeCase(ctx) {
     extends: 'laboratory',
     changes: [{ add: { use: 'sample-count' }, after: 'notes' }],
   };
-  const library = sharedLibrary({ components: [reportTitle, resultsTable, sampleNotes], recipes: [laboratory, interim, own] });
+  const library = sharedLibrary({ components: [reportTitle, resultsTable, sampleNotes, footnotes], recipes: [laboratory, interim, own] });
 
   const started = performance.now();
   const compiled = compileRecipe('own-lab-with-count', library, { code });

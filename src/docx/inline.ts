@@ -1,7 +1,9 @@
 /** Inline text to docx runs: styles, links, fields, breaks, tabs, blanks and pictures in a line. */
 import {
+  CheckBox,
   ExternalHyperlink,
   ImageRun,
+  NoBreakHyphen,
   PageNumber,
   Tab,
   TextRun,
@@ -66,7 +68,7 @@ function blankRun(width: number, size: number, style: TextStyle): TextRun {
   return new TextRun({ ...runOptions(style), underline: {}, text: ' '.repeat(count) })
 }
 
-/** Plain text with its newlines as line breaks and its tab characters as tabs. */
+/** Plain text with its newlines as line breaks, its tab characters as tabs and its no-break hyphens as Word's. */
 function textRuns(text: string, options: IRunOptions): TextRun[] {
   const out: TextRun[] = []
   text.split('\n').forEach((line, index) => {
@@ -74,7 +76,18 @@ function textRuns(text: string, options: IRunOptions): TextRun[] {
     const parts = line.split('\t')
     parts.forEach((part, partIndex) => {
       if (partIndex) out.push(new TextRun({ ...options, children: [new Tab()] }))
-      if (part) out.push(new TextRun({ ...options, text: part }))
+      if (!part) return
+      // U+2011 is written as Word's own no-break hyphen, which every font draws as its hyphen.
+      if (!part.includes('\u2011')) {
+        out.push(new TextRun({ ...options, text: part }))
+        return
+      }
+      const children: Array<string | NoBreakHyphen> = []
+      part.split('\u2011').forEach((piece, at) => {
+        if (at) children.push(new NoBreakHyphen())
+        if (piece) children.push(piece)
+      })
+      out.push(new TextRun({ ...options, children }))
     })
   })
   return out
@@ -192,10 +205,19 @@ export function inlineChildren(text: RichText, context: WriterContext, base: Inl
         break
       case 'blank': {
         const style = sourced({ ...baseStyle, ...styleOf(inline as unknown as TextStyle & Record<string, unknown>) }, inline.source)
+        if (inline.show === 'placeholder') {
+          // The bracketed name, marked so it cannot pass for prose.
+          children.push(...textRuns(`[${inline.what ?? ''}]`, runOptions({ ...style, ...context.theme.placeholderMark })))
+          break
+        }
         const size = style.size ?? context.theme.body.size
         children.push(blankRun(inline.width ?? context.theme.blankWidth, size, style))
         break
       }
+      case 'checkbox':
+        // A real check box (a content control Word lets the reader tick), its box drawn from the symbol character.
+        children.push(new CheckBox({ checked: inline.checked }))
+        break
       case 'image':
         children.push(imageRun(inline.image, inline.width, inline.height, inline.alt))
         break

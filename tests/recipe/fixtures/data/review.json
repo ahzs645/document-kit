@@ -9,6 +9,7 @@
     "objective": "Partial retention",
     "inventoryDate": null
   },
+  "judgement": { "met": "Partly", "why": null },
   "viewpoints": [
     { "name": "Viewpoint 1, lake shore", "visibility": { "$value": "Easy to see", "$source": "reviewer" }, "share": 0.18, "distanceKm": 3.2 },
     { "name": "Viewpoint 2, highway pull-out", "share": 0.07, "distanceKm": 5.75 }

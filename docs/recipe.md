@@ -69,6 +69,7 @@ hand edits).
 | `params` | Each parameter: `default` (any JSON, tags read in the caller's scope) or `required: true`, and `description` |
 | `variants` | Alternatives: each a `title` and either `blocks` (another body) or `with` (other parameter values), or both |
 | `blocks` | The body: block templates (below) |
+| `meta` | Extra details of the application's own (below) |
 
 A parameter is read as `{{ params.name }}`. The caller's `with` wins over a variant's `with`, which wins over the
 default. A `with` naming a parameter the component does not declare is an error, as is a required one not given.
@@ -76,12 +77,14 @@ default. A `with` naming a parameter the component does not declare is an error,
 ### Block templates
 
 A block template is the model's JSON (`docs/model.md`: `heading`, `paragraph`, `list`, `fields`, `table`, `figure`,
-`figureGrid`, `signature`, `pageBreak`, `toc`, `spacer`, `custom`) in which any string may hold tags. Every key is
+`figureGrid`, `signature`, `choices`, `pinned`, `pageBreak`, `toc`, `spacer`, `custom`) in which any string may hold tags. Every key is
 checked against the model at compile time: a misspelt key is an error naming its JSON path.
 
 Two shorthands the model does not have:
 
 - a table's or figure's `caption` may be written as text (`"caption": "Results"`), which is `{ "text": "Results" }`;
+  written as `{ "text": "{{ … }}", "numbered": … }`, it is left out whole when its text has no value, and a lone tag
+  may give it whole from the data (`{ text, numbered }`);
 - an optional text key (a table's or a figure's `note`, a fields block's or a contents block's `title`, a figure's
   `placeholder`, a signature's `label`, a picture's `label`) whose lone tag has no value is left out.
 
@@ -96,6 +99,9 @@ syntax for Word templates and JSON components.
 ```text
 {{ client.name }}                       a field; data inside data, list items by number: {{ samples.0.id }}
 {{ total | format "#,##0.00" }}         number and date pictures, upper, lower, and the application's filters
+{{ n | plural "sample" "samples" }}     the sentence filters: capitalize, plural, prose, ranges (docs/template.md)
+{{ run.date | missing "placeholder" "run date" }}   this value's missing-value rule (below)
+{{ unit | rules "formulas" }}           named text rules applied to this value (below)
 {{ if approved }}yes{{ else }}no{{ endif }}             inside one string
 {{ for t in tags }}{{ t }}{{ if not loop.last }}, {{ endif }}{{ endfor }}
 ```
@@ -166,13 +172,17 @@ object a control node.
 |---|---|
 | `kind`, `version`, `id`, `name`, `description` | As for components |
 | `extends` | Another recipe's id: this recipe is that one with `changes` |
-| `document` | `metadata` and `theme` as the model takes them; strings may hold tags |
+| `document` | `metadata` and `theme` as the model takes them; strings may hold tags. `textRules` as the model takes them (`docs/model.md`, "Text rules"), carried as written: no tags are read in them. They are checked at compile, each problem named by its place (`recipe/lab:document.textRules[2].pattern`) |
+| `missing` | The missing-value rule of every part that does not give its own: `blank` (default) or `placeholder` (below) |
+| `meta` | Extra details of the application's own (below) |
 | `options` | Constants the components read as `options.*` |
 | `sections` | Each: `id` (for changes), `page`, `header`, `footer`, `firstPage: { header, footer }`, `pageNumbers`, `parts`. Headers and footers are block templates, `use` included. Left out, a header is the section before's (Word's rule); a section with another page shape should give its own, since a tab stop at the right edge is measured on the page it was written for |
 | `changes` | For an extending recipe (below) |
 | `own` | `{ "basedOn": id }` on a person's own recipe |
 
-A **part** is `{ "use", "id"?, "title"?, "variant"?, "with"?, "if"?, "for"?, "pageBreakBefore"? }`. Its id (the
+A **part** is `{ "use", "id"?, "title"?, "variant"?, "with"?, "if"?, "for"?, "pageBreakBefore"?, "missing"?, "pin"?,
+"meta"? }`. `missing` is the part's missing-value rule; `pin` (`"bottom"`, or `{ "spaceBelow": 24 }`) pins the part's
+blocks to the foot of the page they fall on, as one `pinned` block (`docs/model.md`, "Pinned blocks"); Its id (the
 component's when not given) is how changes and hand edits name it, unique in the recipe. `for` prints the part once per
 item, and the item is seen by `with` and `if`; `if` is tested on each pass.
 
@@ -202,7 +212,7 @@ applied in order:
 | `{ "remove": id }` | |
 | `{ "replace": id, "by": part }` | The part keeps its id (and its hand edits) unless `by` names its own |
 | `{ "move": id, "before" \| "after" \| "section": … }` | |
-| `{ "set": id, "variant", "with", "if", "for", "title", "pageBreakBefore" }` | Each given key replaces the part's; `with` merges by parameter; `null` removes |
+| `{ "set": id, "variant", "with", "if", "for", "title", "pageBreakBefore", "missing", "pin", "meta" }` | Each given key replaces the part's; `with` merges by parameter; `null` removes |
 | `{ "setSection": id \| index, "page", "header", "footer", "firstPage", "pageNumbers" }` | `null` removes |
 | `{ "addSection": section, "after": id \| index }` | |
 
@@ -340,15 +350,17 @@ order. `readCompiledRecipe` reads one back, refusing a newer version.
 
 - `document`: a kit `Document`, ready for `writeDocx` (pass the same `registry`) and the layout.
 - `parts`: per part instance, its `id`, `component`, `title`, `section`, where its blocks are in the section's body
-  (`start`, `end`), how many top-level blocks it printed (0 when its `if` was false or it printed nothing), how many
-  values it left to complete, and how many times it was printed (`repeats`).
+  (`start`, `end`), how many top-level blocks it printed (0 when its `if` was false or it printed nothing; a pinned
+  part prints one), how many values it left to complete, how many times it was printed (`repeats`), and the part's
+  and its component's `meta` (`meta`, `componentMeta`).
 - `toComplete`: the model's `toComplete` items (`docs/model.md`), each with its `partId` (null for a header or footer),
   in reading order, and a `value` kind for a value the data lacks at a place that prints no blank (a number, a plain
   text key).
 
 ### Missing values
 
-The two rules both applications have:
+Three rules. The first two both applications have, and are the default (`blank`); the third is chosen by
+`"missing": "placeholder"` on a recipe, on a part, or for one value through the `missing` filter:
 
 - **A value the data lacks in a field, a cell or text prints blank and is listed.** A field's value or a cell given by a
   lone tag becomes `null` (the model prints a blank rule or an empty cell); a tag inside text becomes a blank rule run.
@@ -357,6 +369,16 @@ The two rules both applications have:
   tags: `{ "type": "sentence", "label": "Visibility", "template": "It is {visibility} from {viewpoint}.",
   "values": { "visibility": "{{ vp.visibility }}", "viewpoint": "{{ vp.name }}" } }`. A sentence's `template` takes
   `{slots}`, never tags.
+- **Placeholder: a value the data lacks prints its bracketed name, marked, and is listed.** A field's value, a cell or
+  a tag inside text prints `[name]` in the theme's `placeholderMark` look (a yellow highlight by default), so an
+  unfilled value cannot pass for prose: "Run on [metals run date]." The name is the field's label for a field's
+  value, else the tag's path, or the one the value gives: `{{ run.date | missing "placeholder" "metals run date" }}`.
+  A sentence prints with its missing slots so (`[visibility]`) rather than being left out (a sentence may say its own
+  `"missing": "drop"` or `"placeholder"`). Places that print nothing for a missing value (an optional note or title, a
+  number) are unchanged. Listed to complete as a `blank` or a `sentence`, like the others.
+
+`{{ x | missing "blank" }}` asks for the first rule for one value inside a placeholder part. The compiled recipe keeps
+the recipe's rule (`missing`) and each part's.
 
 A condition reads a missing value as false; a missing list repeats nothing. `checkRecipe(compiled, data, options)`
 reports, without making the document, every data path a printed tag or a loop reads that the data does not have (by its
@@ -388,9 +410,31 @@ carrying `editSource`. The key is the part instance id and the place in the part
 its first cell, never its place) and column header; a repeated key gains `#2`, `#3`. Keys name no recipe, so two
 recipes sharing a part share its edits.
 
+A **tick-box question** (`choices` block) gives two more kinds: `choice`, whose edit is one of the question's
+options (or `""` for none ticked) and is the option ticked, and `answer`, the free-text answer line. The key is the
+same shape, labelled by the question: `part||choice|Is the objective met?`. Its target lists the `options`; an edit
+that is not one of them is not applied and is reported in `orphans`. A question with several ticks is not editable by
+tick. Blocks in a pinned block take edits like any others.
+
 `edits.targets` lists every editable value with its key, its printed `original` and its `edited` text when edited.
 `edits.orphans` lists edits for this recipe's parts whose place was not printed this time: kept, reported, never applied
 elsewhere. `edits.otherParts` lists edits for parts this recipe does not have.
+
+### Extra details: meta
+
+A recipe, a component and a part may carry `meta`: any JSON object of the application's own (its sources, tags,
+counts, its own ids). It is read as JSON and nothing more — no tags are read in it, and no key in it is checked —
+and carried through compile untouched: the recipe's to `compiled.recipe.meta`, a part's to its mark
+(`part.meta`), its component's to `part.componentMeta`, and both to the rendered part. Unknown keys anywhere else
+are still errors.
+
+### Text rules in a recipe
+
+The recipe's `document.textRules` go to the document, where the Word writer applies them (`docs/model.md`, "Text
+rules"). A block template says which touch it with the model's `textRules` key (a list of rule ids, or `false`). One
+value can take named rules wherever it is printed with the `rules` filter: `{{ unit | rules "formulas" }}` applies
+those rules (whatever their `auto` and `in`) to the value and prints the runs they make, inside text too. A `rules`
+filter naming an id the document does not have is an error at compile (`bad-tag`).
 
 ## Limits
 
@@ -421,6 +465,7 @@ Every refusal is a `RecipeError` with a `code` and a `path` (`component/notice:b
 | `unknown-key`, `bad-node` | A key the model does not have there; a node that does not stand there |
 | `duplicate-part`, `component-conflict`, `limit` | |
 | `unknown-filter`, `missing-code`, `missing-custom-kind` | What the application did not give |
+| `invalid` | Also a text rule that does not read, each problem by its place |
 | `not-text`, `bad-value` | A list or an object printed as text; a value a filter or place cannot take |
 | `code-failed`, `undeclared-use` | A code component that threw or returned no list; one using a component it did not declare |
 
@@ -432,13 +477,13 @@ Every refusal is a `RecipeError` with a `code` and a `path` (`component/notice:b
 |---|---|
 | `cover-page` | `title`*, `subtitle`, `lines` ([{ label, value }]), `note` |
 | `contents` | `title` ("Contents"), `levels` (2) |
-| `fields` | `rows`* ([{ label, value, what? }]), `heading`, `level`, `layout` (lines / table), `labelWidth` |
+| `fields` | `rows`* ([{ label, value, what?, sameLine? }]), `heading`, `level`, `layout` (lines / table), `labelWidth`, `size`, `rowSpacing`, `sameLineGap` |
 | `text-section` | `heading`, `level`, `paragraphs` (text or rich text each) |
 | `notice` | `text`*, `title`, `fill`, `rule` |
-| `data-table` | `columns`* (labels), `rows` (each a list of cells, `{ group }` or `{ note }`), `caption`, `note`, `widths`, `align`, `size`, `empty` |
-| `figure` | `image`*, `caption`, `note`, `placeholder`, `width`, `height` (300) |
+| `data-table` | `columns`* (labels), `rows` (each a list of cells, `{ group }`, `{ note }` or `{ header: [labels] }`), `caption`, `numbered` (true; false: the caption alone, taking no number; `"silent"`), `note`, `widths`, `align`, `size`, `padding` ({ top, bottom, left, right }), `line`, `repeatHeader`, `autoFit`, `empty` |
+| `figure` | `image`*, `caption`, `numbered` (true), `note`, `placeholder`, `width`, `height` (300) |
 | `figure-page` | `title`*, `image`*, `caption`, `facts`, `height` (360), `level`, `placeholder` |
-| `signature` | `name`*, `label` ("Signed"), `image`, `title`, `date` |
+| `signature` | `name`*, `label` ("Signed"), `labelPosition`, `labelGap`, `image`, `imageWidth` (140), `imageHeight` (55), `inkGap` (room to sign by hand), `title`, `titleLayout` (`row`: a "Title:" line, the default; `sameLine`: "Name, Title"; `nextLine`), `titleSeparator`, `date`, `dateLine` (true), `lines` ([{ label, value }] in place of the title and date lines), `align`, `ruleWidth`, `ruleThickness`, `ruleColor`, `ruleGap`, `spaceAbove`, `spaceBelow`, `keepTogether` (true) |
 | `to-complete` | `title`, `level`, `none` |
 | `page-footer` | `text`, `page`, `of`: "text … Page X of Y" |
 | `running-header` | `left`, `right` |
@@ -451,12 +496,17 @@ Every refusal is a `RecipeError` with a `code` and a `path` (`component/notice:b
 few of their own.
 
 - **Laboratory** (`recipes/laboratory.json`): a running header and a "Page X of Y" footer, a title, the addressee as
-  fields (one blank), notes with two wordings (`components/sample-notes.json`, variants; one sentence left out for a
-  missing slot), one results table component used once per table in the data (`for`), a signature.
+  fields (one blank; the phone on the e-mail's line), notes with two wordings (`components/sample-notes.json`,
+  variants) under the placeholder rule (a missing slot printed `[basis]`), one results table component used once per
+  table in the data (`for`), footnote lines whose markers a rule named by their blocks raises
+  (`components/footnotes.json`), a signature with its options, and a contact block pinned to the foot of the last
+  page. Its document states text rules (links, a term in italics, raised cell markers, formula digits) and it carries
+  `meta` on the recipe, a part and a component.
   `recipes/laboratory-interim.json` extends it: its status in the title, an interim notice after it, the brief notes.
 - **Review** (`recipes/review.json`): a centred cover section, contents, project fields with blanks, a summary computed
   by a code component (`code.ts`, which uses the shared `notice`), one heading and two sentences per viewpoint (one
-  left out), a rating matrix drawn by a custom block kind (the application's registry, `library.ts`), a landscape
+  left out), a boxed tick-box question with an answer line (`components/tick-question.json`) that a hand edit can
+  change, a rating matrix drawn by a custom block kind (the application's registry, `library.ts`), a landscape
   section with a wide table, an 11 × 17 figure page, and the to-complete list.
 
 `data/` holds their made-up data; `tests/recipe/end-to-end.test.ts` runs them to PDF and reads the pages.

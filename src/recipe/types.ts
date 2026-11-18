@@ -40,7 +40,19 @@ export interface Component {
   params?: Record<string, ParamSpec>
   variants?: Record<string, ComponentVariant>
   blocks: Json[]
+  /** Extra details of the application's own (sources, tags, an id): any JSON, carried through compile untouched. */
+  meta?: JsonObject
 }
+
+/**
+ * What a value nobody gave prints: `blank` (the default) — a blank rule, or an empty cell, for a value, and a sentence
+ * left out for a missing slot; `placeholder` — the value's bracketed name, marked (`[run date]`), and a sentence
+ * printed with its missing slots so. Listed to complete either way.
+ */
+export type MissingRule = 'blank' | 'placeholder'
+
+/** A part pinned to the foot of the page: `"bottom"`, or the room kept under it. */
+export type PartPin = 'bottom' | { at?: 'bottom'; spaceBelow?: number }
 
 /* ------------------------------------------------------------------ recipes */
 
@@ -53,6 +65,12 @@ export interface PartRef {
   title?: string
   variant?: string
   with?: JsonObject
+  /** What a value the data lacks prints in this part; the recipe's rule when absent. */
+  missing?: MissingRule
+  /** Pin the part's blocks to the foot of the page they fall on. */
+  pin?: PartPin
+  /** Extra details of the application's own: any JSON, carried to the compiled part and the rendered part. */
+  meta?: JsonObject
   /** A condition (no braces): the part prints only when it holds. */
   if?: string
   /** `item in list`: the part prints once per item; `item` is seen by `with` and `if`. */
@@ -93,6 +111,9 @@ export type RecipeChange =
       for?: string | null
       title?: string | null
       pageBreakBefore?: boolean | null
+      missing?: MissingRule | null
+      pin?: PartPin | null
+      meta?: JsonObject | null
     }
   | {
       setSection: string | number
@@ -107,6 +128,8 @@ export type RecipeChange =
 export interface RecipeDocument {
   metadata?: JsonObject
   theme?: JsonObject
+  /** The document's text rules (the model's `TextRule`s), carried as written: no tags are read in them. */
+  textRules?: Json[]
 }
 
 export interface Recipe {
@@ -125,6 +148,10 @@ export interface Recipe {
   changes?: RecipeChange[]
   /** An own recipe: the recipe it was copied or extended from. */
   own?: { basedOn: string | null }
+  /** What a value the data lacks prints, for every part that does not say (`blank` by default). */
+  missing?: MissingRule
+  /** Extra details of the application's own: any JSON, carried to the compiled recipe untouched. */
+  meta?: JsonObject
 }
 
 /* ------------------------------------------------------------------ libraries and overrides */
@@ -192,6 +219,10 @@ export interface CompiledPartMark {
   id: string
   component: string
   title: string
+  /** The part's own `meta`, as written. */
+  meta?: JsonObject
+  /** Its component's `meta`, as written. */
+  componentMeta?: JsonObject
 }
 
 /** A part as compiled: its mark, its condition and loop, and its body (a component instance or a code node). */
@@ -202,6 +233,8 @@ export interface CompiledPart {
   pageBreakBefore?: boolean
   /** A JSON component's variant, when one was chosen. */
   variant?: string
+  missing?: MissingRule
+  pin?: PartPin
   /** Parameter bindings, read in the part's scope at render (tags allowed). */
   params: JsonObject
   /** A JSON component's blocks, every `use` inlined. */
@@ -234,8 +267,10 @@ export interface CompiledFrom {
 export interface CompiledRecipe {
   kind: 'compiled-recipe'
   version: number
-  recipe: { id: string; name: string; description?: string }
+  recipe: { id: string; name: string; description?: string; meta?: JsonObject }
   from: CompiledFrom
+  /** The recipe's missing-value rule, when it is not `blank`. */
+  missing?: MissingRule
   document: RecipeDocument
   options: JsonObject
   sections: CompiledSection[]

@@ -10707,6 +10707,23 @@ function paginateSections(
           newNotes = asm.lineFootnotes(line); // reserve restarts on the fresh page
           columnEnd = keptColumnEnd(lineIdx);
         }
+        // document-kit: a float that leaves no room beside it pushes the line
+        // under itself (below), and one standing at the foot of the page — a
+        // frame anchored to the bottom margin — pushes it past the text area.
+        // Word sets that line on the next page; it was drawn in the margin.
+        if (pairPending === undefined && asm.exclusions.length > 0 && asm.colHasContent()) {
+          let pushed = asm.cursorY;
+          for (let guard = 0; guard < 8; guard++) {
+            const blocked = asm.lineGeometryAt(pushed, h).blockedUntilYUp;
+            if (blocked === undefined || blocked >= pushed) break;
+            pushed = blocked;
+          }
+          if (pushed < asm.cursorY && pushed - h < asm.bottomLimit() + addedReserve(newNotes)) {
+            advanceBefore(lineIdx);
+            newNotes = asm.lineFootnotes(line);
+            columnEnd = keptColumnEnd(lineIdx);
+          }
+        }
         if (newNotes.length > 0) {
           asm.noteReserve += addedReserve(newNotes);
           for (const x of newNotes) {
@@ -10895,7 +10912,21 @@ function paginateSections(
         emitShapeItems(block, x, bottomYUp, sink, asm.ctx.pageHeight, figId);
       if (isOutOfFlowFloat(block.float)) {
         const fx = asm.floatX(block.float, block.widthPt);
-        const fy = asm.floatTopYUp(block.float, block.heightPt);
+        let fy = asm.floatTopYUp(block.float, block.heightPt);
+        // document-kit: a box aligned to the FOOT of the page or margin that
+        // would cover text already set on this page — the page is too full for
+        // it under its text — stands at the foot of the next page instead,
+        // where its anchor then falls. Drawn here, it printed over that text.
+        if (
+          block.float.posV?.align === 'bottom' &&
+          block.float.posV.relativeFrom !== 'paragraph' &&
+          block.float.wrap !== 'none' &&
+          fy > asm.cursorY &&
+          asm.colHasContent()
+        ) {
+          asm.advanceColumn();
+          fy = asm.floatTopYUp(block.float, block.heightPt);
+        }
         emitShapeAt(
           fx,
           fy - block.heightPt,
