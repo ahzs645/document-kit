@@ -123,3 +123,37 @@ describe('a table whose grid is a stand-in', () => {
     expect(third! - second!).toBe(156);
   });
 });
+
+describe('a border thinner than Word draws', () => {
+  // Five rows ruled between with an inside border of `sz` eighths, as the `docx` library writes a hairline.
+  const ruled = (sz: number) =>
+    buildDocxFromBody(
+      `<w:tbl><w:tblPr><w:tblW w:type="dxa" w:w="4000"/><w:tblBorders><w:insideH w:val="single" w:sz="${sz}" w:color="cbd5e1"/></w:tblBorders></w:tblPr>` +
+        '<w:tblGrid><w:gridCol w:w="4000"/></w:tblGrid>' +
+        Array.from({ length: 5 }, (_, i) => `<w:tr><w:tc><w:p><w:r><w:t>Row ${i + 1}</w:t></w:r></w:p></w:tc></w:tr>`).join('') +
+        '</w:tbl>',
+    );
+  const lastRow = (docx: Uint8Array) =>
+    layOut(docx)
+      .pages[0]!.commands.filter((c): c is TextLineItem => c.type === 'line')
+      .at(-1)!.baselineY;
+
+  it('is drawn a quarter point, the least §17.3.4 allows, so rows stand where Word sets them', () => {
+    expect(lastRow(ruled(1))).toBeCloseTo(lastRow(ruled(2)), 3);
+    expect(lastRow(ruled(4))).toBeGreaterThan(lastRow(ruled(2)));
+  });
+});
+
+describe('a table whose stand-in grid sits beside cells narrower than the table', () => {
+  it('spans the width the table states, its cells’ widths as shares of it', () => {
+    const docx = buildDocxFromBody(
+      '<w:tbl><w:tblPr><w:tblW w:type="dxa" w:w="9360"/></w:tblPr><w:tblGrid><w:gridCol w:w="100"/><w:gridCol w:w="100"/></w:tblGrid><w:tr>' +
+        '<w:tc><w:tcPr><w:tcW w:type="dxa" w:w="3557"/></w:tcPr><w:p><w:r><w:t>Sample</w:t></w:r></w:p></w:tc>' +
+        '<w:tc><w:tcPr><w:tcW w:type="dxa" w:w="1685"/></w:tcPr><w:p><w:r><w:t>Value</w:t></w:r></w:p></w:tc>' +
+        '</w:tr></w:tbl><w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720"/></w:sectPr>',
+    );
+    const [first, second] = layOut(docx).pages[0]!.commands.filter((c): c is TextLineItem => c.type === 'line').map((line) => line.originX);
+    // 3557 of 5242: the second column starts about 68% of 468pt in.
+    expect(second! - first!).toBeCloseTo((468 * 3557) / 5242, 0);
+  });
+});

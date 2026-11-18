@@ -154,12 +154,22 @@ Each change is marked in the source with a `document-kit:` comment unless noted.
     sizes such a table from the cells. Upstream trusts the grid of a table not laid out `fixed`,
     so the grid, scaled to the table's width, drew every column the same: a results table's
     parameter column a quarter of its width, every name wrapping. A grid less than half the width
-    the table states is now taken as that stand-in and the cells' declared widths decide, as for a
-    `fixed` table; a table whose cells declare none keeps the grid. Pinned by
+    the table states is now taken as that stand-in and the cells' declared widths decide the
+    columns, as shares of the width the table states (an autofit table's own width wins over its
+    cells': a two-column table whose cells ask for 56% of a full-width table spans it); a table
+    whose cells declare none keeps the grid. Pinned by
     `tests/layout/pictures-and-cells.test.ts` ("a table whose grid is a stand-in").
 
+15. **A border held to the widths Word draws** (`word/table-parser.ts`, `borderEighths`;
+    `word/paragraph-properties.ts`, `parseParagraphBorders`; both marked `document-kit:`).
+    §17.3.4 gives a border's `w:sz` the range two to 96 eighths of a point, and Word draws a
+    smaller one as two. The `docx` library writes a hairline as `w:sz="1"`; read as an eighth,
+    every row of a table ruled that way stood an eighth of a point shorter than Word sets it, a
+    line and a half over a forty-row page. A size of zero is kept. Pinned by
+    `tests/layout/pictures-and-cells.test.ts` ("a border thinner than Word draws").
+
 Nothing else differs. `diff -r` against the upstream tree, after running the rewrite script
-over a fresh copy, shows only the fourteen changes above.
+over a fresh copy, shows only the fifteen changes above.
 
 ## Bringing in a newer upstream
 
@@ -169,11 +179,11 @@ over a fresh copy, shows only the fourteen changes above.
    included; skip `corpus/`, `stand/`, `docs/`, `scripts/`). Delete files upstream deleted.
 3. Run `node scripts/rewrite-ream-aliases.mjs`, then `node scripts/rewrite-ream-aliases.mjs
    --check` (exits 1 if an alias import or root-relative fixture path is left).
-4. Re-apply changes 1, 2 and 4 to 14 above unless upstream has made them itself (check
+4. Re-apply changes 1, 2 and 4 to 15 above unless upstream has made them itself (check
    `FIXED_MTIME`, a `w:r` split for complex fields, every fallback to the global `fetch` in
    `core/fonts`, `core/converter` and `excel`, `familyNamesInFlow`, `w:vAlign`, PAGEREF and
    body fields, §17.4.66 border conflicts, `w:keepNext` in table rows, and the two foot-frame
-   checks of changes 10 and 11, the no-break hyphen of change 12, percentage widths with their sign of change 13, the stand-in grid of change 14). Search for
+   checks of changes 10 and 11, the no-break hyphen of change 12, percentage widths with their sign of change 13, the stand-in grid of change 14, border widths of change 15). Search for
    `document-kit:` in the old tree to find each place. Search for new uses of
    `fetch`, `XMLHttpRequest` and `node:` in `src/ream` and treat any as change 4.
 5. Check `src/layout` still compiles against the internals it imports (`core/converter/project`,

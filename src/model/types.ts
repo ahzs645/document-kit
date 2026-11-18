@@ -710,6 +710,11 @@ export interface ThemeText {
   after?: number
   /** Line height multiple. */
   line?: number
+  /**
+   * A heading level: keep it on the page of what follows it (and its own lines together). True by default; false lets a
+   * heading end a page, as a document whose own heading style does not keep with the next sets it.
+   */
+  keepWithNext?: boolean
 }
 
 /** How tables look unless a table says otherwise. */

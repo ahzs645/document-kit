@@ -528,3 +528,16 @@ describe('a rule set off from its text, and a cell with its own padding', () => 
     expect(cells[1]).toContain('<w:tcMar><w:top w:type="dxa" w:w="70"/><w:left w:type="dxa" w:w="110"/><w:bottom w:type="dxa" w:w="70"/><w:right w:type="dxa" w:w="110"/></w:tcMar>')
   })
 })
+
+describe('a heading level that lets a heading end a page', () => {
+  it('keeps headings with the next paragraph by default, and not when its theme says so', async () => {
+    const styleOf = (styles: string) => styles.slice(styles.indexOf('w:styleId="Heading2"'), styles.indexOf('</w:style>', styles.indexOf('w:styleId="Heading2"')))
+    const kept = (await writeDoc(document([section([heading(2, 'Made-up heading'), paragraph('Text.')])]))).text('word/styles.xml')
+    expect(styleOf(kept)).toContain('<w:keepNext/>')
+    const loose = (
+      await writeDoc(document([section([heading(2, 'Made-up heading'), paragraph('Text.')])], { theme: { headings: [{}, { keepWithNext: false }] } }))
+    ).text('word/styles.xml')
+    expect(styleOf(loose)).not.toContain('<w:keepNext/>')
+    expect(styleOf(loose)).not.toContain('<w:keepLines/>')
+  })
+})

@@ -353,7 +353,10 @@ function parseParagraphBorders(node: unknown): CellBorders | undefined {
     if (!b) return undefined;
     const style = borderStyleOf(getVal(b));
     if (!style) return undefined;
-    const sz = parseIntAttr(b, 'sz');
+    // document-kit: held to §17.3.4's two to 96 eighths, as Word draws it (as table-parser's
+    // `borderEighths`; repeated here because the table parser imports this module).
+    const rawSz = parseIntAttr(b, 'sz');
+    const sz = rawSz === undefined || rawSz <= 0 ? rawSz : Math.min(96, Math.max(2, rawSz));
     const space = parseIntAttr(b, 'space');
     const color = getAttr(b, 'color');
     return {

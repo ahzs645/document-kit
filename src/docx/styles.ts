@@ -53,7 +53,7 @@ export function stylesFor(theme: Theme): IStylesOptions {
     return {
       run: runOf({ ...text, color: text.color ?? theme.body.color }),
       // The outline level is what the navigation pane and a table of contents read.
-      paragraph: { ...paragraphOf(text, true), outlineLevel: level - 1 },
+      paragraph: { ...paragraphOf(text, text.keepWithNext ?? true), outlineLevel: level - 1 },
     }
   }
   const table = theme.table

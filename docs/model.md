@@ -202,7 +202,7 @@ row that says `cantSplit`. The writer says both that way:
 
 The theme is how a document looks, so one application can be Times with a green band and the other Arial and grey,
 and the kit knows neither: body font, size and colour; title, subtitle, six heading levels, caption, note, small,
-header and footer text (font, size, colour, bold, italic, caps, alignment, spacing before and after, line height);
+header and footer text (font, size, colour, bold, italic, caps, alignment, spacing before and after, line height; a heading level's `keepWithNext`, true by default, false to let a heading end a page);
 link colour; the placeholder mark (`placeholderMark`, a text style); the table look (text size, line height `line`,
 header fill and text, group fill, note text, label fill, outer and inner borders, cell padding, least heights of
 header and other rows `headerRowHeight` and `rowHeight`, spacer height, placeholder box); the caption words and separator (`Table 3: Results`, or `Figure 2. View`); the blank rule's

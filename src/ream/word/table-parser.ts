@@ -73,6 +73,17 @@ const MULTI_LINE_BORDERS = new Set([
  * number at all, the table fell back to its grid, and that grid was the library's 100-twip stand-in:
  * a placeholder box meant to fill most of the line was drawn five points wide, a word a line.
  */
+/**
+ * document-kit: a border's `w:sz` held to §17.3.4's range, two to 96 eighths of a point, as Word
+ * draws it. The `docx` library writes a hairline as `w:sz="1"`; Word draws a quarter point, and
+ * read as an eighth every row of a table ruled that way stood an eighth of a point shorter than
+ * Word sets it, a line and a half over a forty-row page. Zero (no width) is kept.
+ */
+export function borderEighths(sz: number | undefined): number | undefined {
+  if (sz === undefined || sz <= 0) return sz;
+  return Math.min(96, Math.max(2, sz));
+}
+
 function pctFraction(node: PoNode, fiftieths: number | undefined): number | undefined {
   const raw = poAttr(node, 'w')?.trim();
   if (raw !== undefined && raw.endsWith('%')) {
@@ -572,7 +583,7 @@ function parseBorder(node: PoNode | undefined): Border | undefined {
         : MULTI_LINE_BORDERS.has(raw)
           ? 'double'
           : 'single';
-  const sz = poIntAttr(node, 'sz');
+  const sz = borderEighths(poIntAttr(node, 'sz'));
   const color = poAttr(node, 'color');
   const out: Mutable<Border> = { style: val as BorderStyle };
   // `w:sz` on a compound pattern is the width of ONE of its lines; the rule as

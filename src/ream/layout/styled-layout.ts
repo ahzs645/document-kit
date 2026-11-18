@@ -8317,12 +8317,17 @@ function computeColumnWidths(
   // layout mode says: fdo59273.docx grids four columns and then spans its four
   // cells across eleven, and the two on the right fell off the table.
   const gridShort = gridColTwips(table).length < colCount;
-  const declared = declaredColumnWidths(
-    table,
-    colCount,
-    contentWidth,
-    gridShort || gridIsStandIn(table, contentWidth),
-  );
+  const standIn = !gridShort && table.properties.layout !== 'fixed' && gridIsStandIn(table, contentWidth);
+  const declared = declaredColumnWidths(table, colCount, contentWidth, gridShort || standIn);
+  // document-kit: a table sized from its cells because its grid is a stand-in is
+  // still as wide as it says it is: an autofit table's own width wins over its
+  // cells', so the cells' widths are shares of it (a two-column table whose
+  // cells ask for 56% of a full-width table spans the full width).
+  if (declared && standIn) {
+    const total = declared.reduce((sum, width) => sum + width, 0);
+    const target = totalTableTarget(table, contentWidth);
+    if (total > 0) return declared.map((width) => (width * target) / total);
+  }
   if (declared) return declared;
 
   if (gridColTwips(table).some((w) => w > 0)) {
@@ -8384,8 +8389,8 @@ function computeColumnWidths(
  * table from the cells' widths; scaled up, the grid drew every column the same
  * width, a narrow label column wrapping each parameter name. A grid less than
  * half the width the table states is taken as that stand-in, and the cells'
- * declared widths decide (as for a `fixed` table); with no cell declaring one
- * the grid still does.
+ * declared widths decide its columns as shares of the width the table states;
+ * with no cell declaring one the grid still does.
  */
 function gridIsStandIn(table: Table, contentWidth: number): boolean {
   const explicit = explicitTableTargetWidth(table, contentWidth);
