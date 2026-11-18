@@ -118,6 +118,12 @@ Names a tag reads:
 So `params`, `options` and `loop` are not data names. A component does not see its caller's loop items: what it needs
 comes through its parameters.
 
+**A text run keeps its shape.** A run whose tags all fill renders as one run, in its own look, and content written as
+one run (`"content": { "type": "text", "text": "{{ a }}: {{ b }}" }`) renders as one run, not a list; a run splits
+only where a piece prints differently (a missing value's blank or placeholder, a value with a source of its own, runs
+the data gives whole). An application that compares a recipe's document with its own writer's can so write the same
+runs.
+
 **A string that is exactly one tag gives the raw value** (a list, an object, a number), so data can be handed to a
 table's rows, a parameter, a custom block's data: `"rows": "{{ table.rows }}"`. Any text around the tag, even a space,
 makes the string text. Every `{{` starts a tag; a tag that does not read is an error at compile time.
@@ -259,6 +265,7 @@ const code = defineCodeComponents([{
   params: { assessor: { required: true } },
   needs: ['viewpoints[].share'],            // added to the compiled recipe's needs
   uses: ['notice'],                         // JSON components its blocks may `use`
+  meta: { family: 'review' },               // carried as the part's componentMeta, as a JSON component's
   build: ({ params, variant, data, options, value, source }) => [
     { type: 'paragraph', content: `${count(value('viewpoints'))} viewpoints see it.`, source: 'computed' },
     { type: 'fields', rows: [{ label: 'Assessed by', value: '{{ params.assessor }}' }] },
@@ -269,6 +276,9 @@ const code = defineCodeComponents([{
 const compiled = compileRecipe('review', library, { code })
 renderRecipe(compiled, data, { code })
 ```
+
+A code component's `meta` is checked as a JSON component's (a JSON object, read as JSON and nothing more) and travels
+the same way: to the compiled part's `componentMeta` and the rendered part.
 
 A recipe or a JSON component uses one exactly as a JSON component: `{ "use": "review-summary", "with": … }`, with
 `variant` (declared in `variants`), `if`, `for` and `pageBreakBefore`. The compiled recipe keeps a marked reference

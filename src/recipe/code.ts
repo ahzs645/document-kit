@@ -9,6 +9,7 @@
  * its lists control nodes, and a `use` of a JSON component it declared in `uses` (or of another code component).
  */
 import type { Block } from '../model'
+import { readComponent } from './read'
 import type { Json, JsonObject, ParamSpec } from './types'
 
 /** What a code component's `build` is given. */
@@ -42,6 +43,11 @@ export interface CodeComponent {
   needs?: readonly string[]
   /** JSON components its blocks may `use`: the compile carries them in the compiled recipe (`embedded`). */
   uses?: readonly string[]
+  /**
+   * Extra details of the application's own, as a JSON component's `meta`: any JSON object, carried untouched to the
+   * compiled part's mark (`componentMeta`) and the rendered part.
+   */
+  meta?: JsonObject
   build(input: CodeBuildInput): readonly CodeBlock[]
 }
 
@@ -59,6 +65,14 @@ export function defineCodeComponent(component: CodeComponent): CodeComponent {
     throw new Error(`document-kit/recipe: a code component's id is not an id: ${JSON.stringify(component.id)}`)
   if (typeof component.build !== 'function')
     throw new Error(`document-kit/recipe: the code component "${component.id}" has no build function`)
+  if (component.meta !== undefined) {
+    // The same check a JSON component's meta takes: a JSON object, read as JSON and nothing more.
+    try {
+      readComponent({ kind: 'component', id: component.id, title: component.title, blocks: [], meta: component.meta })
+    } catch (error) {
+      throw new Error(`document-kit/recipe: the code component "${component.id}" has meta that is not a JSON object (${error instanceof Error ? error.message : String(error)})`)
+    }
+  }
   return component
 }
 

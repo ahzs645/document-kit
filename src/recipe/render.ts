@@ -26,7 +26,7 @@ import type { CodeComponents } from './code'
 import { compileCodeBlocks, TO_COMPLETE_KIND } from './compile'
 import { applyEdits, type EditTarget, type RecipeEdits } from './edits'
 import { jsonPath, RecipeError } from './errors'
-import { hasOwn, isRecord } from './json'
+import { hasOwn, isRecord, sameJson } from './json'
 import { readCompiledRecipe } from './read'
 import { CONTROL_KEYS, controlKind, ITEM_OF, isListPos, keysOf, type Pos } from './schema'
 import { missingOf, readCondition, readLoop, readString, type Condition, type FieldSeg, type Loop, type ParsedString, type Seg } from './tags'
@@ -486,7 +486,29 @@ function richFromString(state: State, text: string, scope: Scope, out: Out, styl
     else if (piece.source || Object.keys(style).length) runs.push({ ...style, type: 'text', text: piece.text, ...(piece.source ? { source: piece.source } : {}) } as Inline)
     else runs.push(piece.text)
   }
-  return merge(runs)
+  return joinRuns(merge(runs))
+}
+
+/**
+ * One written run's pieces joined back where they print alike: a text run whose tags all filled stays one run, as it
+ * was written. Pieces stay apart only where they differ (a blank for a missing value, a value with another source,
+ * runs the data gave whole).
+ */
+function joinRuns(runs: Inline[]): Inline[] {
+  const out: Inline[] = []
+  for (const run of runs) {
+    const last = out[out.length - 1]
+    if (last !== undefined && typeof last === 'object' && typeof run === 'object' && last.type === 'text' && run.type === 'text') {
+      const { text: a, ...lookA } = last
+      const { text: b, ...lookB } = run
+      if (sameJson(lookA as never, lookB as never)) {
+        out[out.length - 1] = { ...last, text: a + b }
+        continue
+      }
+    }
+    out.push(run)
+  }
+  return out
 }
 
 /** A value with none, printed: a blank rule, or under the placeholder rule its bracketed name, marked. */
@@ -678,7 +700,9 @@ function evalValue(state: State, value: unknown, pos: Pos, scope: Scope, out: Ou
     case 'listItem': {
       if (typeof record.type === 'string') {
         const runs = evalInline(state, record, scope, out)
-        return pos === 'inline' ? runs : richValue(runs)
+        if (pos === 'inline') return runs
+        // Written as one run, it stays one run when it fills to one.
+        return runs.length === 1 && typeof runs[0] === 'object' ? runs[0] : richValue(runs)
       }
       if (pos === 'cell') return evalObject(state, record, keysOf('cell', record) ?? {}, scope, out)
       if (pos === 'listItem') return evalObject(state, record, keysOf('listItem', record) ?? {}, scope, out)

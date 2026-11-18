@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { numberCaptions, plainText, resolveSentences, type Block, type Document, type Inline, type RichText } from '../../src'
-import { compileRecipe, isRecipeError, readCompiledRecipe, renderRecipe, sharedLibrary, type Json, type RenderOptions } from '../../src/recipe'
+import { compileRecipe, defineCodeComponents, isRecipeError, readCompiledRecipe, renderRecipe, sharedLibrary, type Json, type RenderOptions } from '../../src/recipe'
 import { comp, lib, para, recipe } from './helpers'
 
 const body = (document: Document): readonly Block[] => document.sections[0]?.body ?? []
@@ -27,6 +27,16 @@ describe('meta', () => {
     expect(parts[0]).toMatchObject({ meta: { order: 1, note: '{{ not a tag }}' }, componentMeta: { family: 'notes' } })
   })
 
+  it('carries a code component\'s meta as its component meta', () => {
+    const code = defineCodeComponents([{ id: 'made', title: 'Made', meta: { sources: ['A', 'B'], kind: 'computed' }, build: () => [para('Built')] }])
+    const compiled = compileRecipe(recipe('r', [{ use: 'made', meta: { order: 2 } }]), lib([]), { code })
+    expect(compiled.sections[0]!.parts[0]!.part).toMatchObject({ meta: { order: 2 }, componentMeta: { sources: ['A', 'B'], kind: 'computed' } })
+    expect(readCompiledRecipe(JSON.parse(JSON.stringify(compiled)))).toEqual(compiled)
+    const { parts } = renderRecipe(compiled, {}, { code })
+    expect(parts[0]).toMatchObject({ meta: { order: 2 }, componentMeta: { sources: ['A', 'B'], kind: 'computed' } })
+    expect(() => defineCodeComponents([{ id: 'bad', title: 'Bad', meta: { n: Infinity } as never, build: () => [] }])).toThrow(/not a JSON object/)
+  })
+
   it('refuses meta that is not a JSON object, and still refuses unknown keys elsewhere', () => {
     for (const bad of [
       () => compileRecipe(recipe('r', [{ use: 'c', meta: 'x' as never }]), lib([comp('c', [para('Hi')])])),
@@ -40,6 +50,37 @@ describe('meta', () => {
         expect(isRecipeError(error, 'invalid')).toBe(true)
       }
     }
+  })
+})
+
+describe('the runs a written run renders as', () => {
+  it('keeps a run whose tags all fill as one run, and one written run as one run', () => {
+    const { document } = render(
+      [
+        { type: 'paragraph', content: { type: 'text', text: '{{ a }}: {{ b }} left', bold: true } },
+        { type: 'paragraph', content: { type: 'text', text: 'Plain {{ a }}' } },
+        { type: 'paragraph', content: [{ type: 'text', text: '{{ a }}', size: 8 }, { type: 'text', text: ' {{ b }}', size: 8 }] },
+      ],
+      { a: 'One', b: 'two' },
+    )
+    const [bold, plain, written] = body(document) as Array<Extract<Block, { type: 'paragraph' }>>
+    expect(bold!.content).toEqual({ type: 'text', text: 'One: two left', bold: true })
+    expect(plain!.content).toEqual({ type: 'text', text: 'Plain One' })
+    // Runs written apart stay apart.
+    expect(written!.content).toEqual([
+      { type: 'text', text: 'One', size: 8 },
+      { type: 'text', text: ' two', size: 8 },
+    ])
+  })
+
+  it('splits a run only where its pieces print differently: a blank for a missing value', () => {
+    const { document } = render([{ type: 'paragraph', content: { type: 'text', text: '{{ a }} and {{ gone }}.', italic: true } }], { a: 'One' })
+    const [one] = body(document) as Array<Extract<Block, { type: 'paragraph' }>>
+    expect(one!.content).toEqual([
+      { type: 'text', text: 'One and ', italic: true },
+      { type: 'blank', what: 'gone', italic: true },
+      { type: 'text', text: '.', italic: true },
+    ])
   })
 })
 

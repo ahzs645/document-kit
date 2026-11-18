@@ -692,7 +692,7 @@ export function compileRecipe(recipe: string | Recipe, libraryIn: Library, optio
       if (part.for !== undefined) sym = loop(part.for, ctx, sym, at(ploc, 'for'), [...pout, 'for']).sym
       if (part.if !== undefined) condition(part.if, ctx, sym, at(ploc, 'if'), [...pout, 'if'])
       const use = resolveUse(part.use, part.variant, part.with, 'block', ctx, sym, ploc, pout)
-      const componentMeta = use.kind === 'json' ? ctx.components.get(use.id)?.meta : undefined
+      const componentMeta = use.kind === 'json' ? ctx.components.get(use.id)?.meta : ctx.code?.get(use.id)?.meta
       const result: CompiledPart = {
         part: {
           id,
