@@ -1,0 +1,674 @@
+// Remote font provider — downloads open-licensed fonts so the converters can
+// "just work" without the caller supplying font bytes.
+//
+// Word/Excel documents reference fonts by name (Calibri, Arial, Times…), most
+// of which are proprietary and can't be bundled. We map each referenced family
+// to an open substitute hosted on a CDN and fetch the raw TrueType file at
+// runtime. Source: @expo-google-fonts packages served as static .ttf via
+// jsDelivr (full character sets — Latin, Cyrillic, Greek — in a single file,
+// parseable directly by our TTF parser).
+//
+// Two tiers, mirroring LibreOffice's substitution:
+//   • Metric-compatible twins — open fonts engineered to reproduce a specific
+//     proprietary font's advance widths 1:1, so text breaks into lines at the
+//     same points and visual parity is much closer:
+//       Calibri → Carlito   Cambria → Caladea
+//       Arial   → Arimo     Times New Roman → Tinos   Courier New → Cousine
+//     (the Croscore + Carlito/Caladea set LibreOffice bundles for this purpose).
+//   • Class fallback — for families without a known twin, a reasonable style
+//     match (serif → Tinos, mono → Cousine, else → Arimo). Widths are only
+//     approximate here; the twins above are width-exact.
+//
+// fetch() is used (universal in Node 18+, browsers, and edge runtimes); a
+// custom implementation can be injected for tests / offline use.
+//
+// document-kit: the kit never reaches the network on its own. Where upstream
+// fell back to the global `fetch`, this copy falls back to NO_NETWORK, which
+// refuses every download; only a `fetch` the caller injects can download a
+// face. (docs/ream-upstream.md, "No network by default".)
+
+import type { FontBytesByVariant, FontVariant } from '../font';
+
+const CDN_BASE = 'https://cdn.jsdelivr.net/npm/@expo-google-fonts';
+
+/**
+ * The `fetch` used when the caller injects none: it refuses every request, so
+ * the engine never touches the network unless the caller hands it a `fetch`.
+ * A required face then fails as it would offline; a best-effort face is missing.
+ */
+export const NO_NETWORK: FetchLike = (url) =>
+  Promise.reject(
+    new Error(`document-kit does not download fonts (no fetch was injected for ${url})`),
+  );
+
+const VARIANT_SUFFIX: Record<FontVariant, string> = {
+  regular: '400Regular',
+  bold: '700Bold',
+  italic: '400Regular_Italic',
+  boldItalic: '700Bold_Italic',
+};
+
+/**
+ * A curated open substitute family (the Croscore + Carlito/Caladea set, like
+ * LibreOffice), or the family a twin borrows the letters it lacks from (see
+ * {@link companionOf}).
+ */
+export type FamilyKey = 'arimo' | 'tinos' | 'cousine' | 'carlito' | 'caladea' | 'notoserif';
+
+/**
+ * A WRITING SYSTEM the curated five cannot draw at all. They are Latin families
+ * — Greek, Cyrillic and Hebrew ride along, everything else is a notdef box —
+ * and 2145 characters of the corpus fall outside them: Han, Kana, Hangul,
+ * Arabic, the geometric symbols a form's checkbox is made of. The scripts of
+ * India are outside them too, and a line of Hindi, Tamil or Bengali came out
+ * as a row of boxes.
+ *
+ * These are fetched only when a document actually holds such a character, and
+ * only in the regular weight: Noto Sans SC is ten megabytes, and a bold run in
+ * it is better stroked (see `SyntheticFace`) than downloaded four times over.
+ */
+export type ScriptKey =
+  | 'jp'
+  | 'kr'
+  | 'sc'
+  | 'arabic'
+  | 'hebrew'
+  | 'thai'
+  | 'devanagari'
+  | 'bengali'
+  | 'gurmukhi'
+  | 'gujarati'
+  | 'oriya'
+  | 'tamil'
+  | 'telugu'
+  | 'kannada'
+  | 'malayalam'
+  | 'symbols1'
+  | 'symbols2';
+
+/** Either kind of substitute — a Latin family or a per-script face. */
+export type SubstituteKey = FamilyKey | ScriptKey;
+
+interface ScriptFamily {
+  readonly pkg: string;
+  readonly file: string;
+}
+
+const SCRIPTS: Record<ScriptKey, ScriptFamily> = {
+  jp: { pkg: 'noto-sans-jp', file: 'NotoSansJP' },
+  kr: { pkg: 'noto-sans-kr', file: 'NotoSansKR' },
+  sc: { pkg: 'noto-sans-sc', file: 'NotoSansSC' },
+  arabic: { pkg: 'noto-sans-arabic', file: 'NotoSansArabic' },
+  hebrew: { pkg: 'noto-sans-hebrew', file: 'NotoSansHebrew' },
+  thai: { pkg: 'noto-sans-thai', file: 'NotoSansThai' },
+  // One face per script of India, 59 to 217 KB each. Their letters are drawn
+  // from these, but not yet SHAPED: a vowel sign that stands before its
+  // consonant is set after it, and two consonants joined by a virama keep the
+  // virama instead of forming a conjunct.
+  devanagari: { pkg: 'noto-sans-devanagari', file: 'NotoSansDevanagari' },
+  bengali: { pkg: 'noto-sans-bengali', file: 'NotoSansBengali' },
+  gurmukhi: { pkg: 'noto-sans-gurmukhi', file: 'NotoSansGurmukhi' },
+  gujarati: { pkg: 'noto-sans-gujarati', file: 'NotoSansGujarati' },
+  oriya: { pkg: 'noto-sans-oriya', file: 'NotoSansOriya' },
+  tamil: { pkg: 'noto-sans-tamil', file: 'NotoSansTamil' },
+  telugu: { pkg: 'noto-sans-telugu', file: 'NotoSansTelugu' },
+  kannada: { pkg: 'noto-sans-kannada', file: 'NotoSansKannada' },
+  malayalam: { pkg: 'noto-sans-malayalam', file: 'NotoSansMalayalam' },
+  // The symbol repertory did not fit in one file, and Noto ships two that
+  // barely overlap: of the dingbats U+2700–27BF, 145 are in the second face and
+  // 35 — the crosses U+271D–2721 among them — only in the first, and the
+  // circled numbers U+2460–24FF are the first face's alone. So a document that
+  // holds one symbol is given BOTH (see `scriptsInFlow`): whichever is tried
+  // first, the other answers for what it lacks.
+  symbols1: { pkg: 'noto-sans-symbols', file: 'NotoSansSymbols' },
+  symbols2: { pkg: 'noto-sans-symbols-2', file: 'NotoSansSymbols2' },
+};
+
+/** Whether a substitute key names a writing system rather than a Latin family. */
+export function isScriptKey(key: SubstituteKey): key is ScriptKey {
+  return key in SCRIPTS;
+}
+
+/**
+ * Fetch the ONE face a writing system is drawn with.
+ *
+ * @param script The writing system.
+ * @param fetchImpl Injectable `fetch` (defaults to {@link NO_NETWORK}, which refuses).
+ * @returns The regular face, or `undefined` when the download fails.
+ */
+export async function fetchScriptFont(
+  script: ScriptKey,
+  fetchImpl: FetchLike = NO_NETWORK,
+): Promise<FontBytesByVariant | undefined> {
+  const family = SCRIPTS[script];
+  const url = `${CDN_BASE}/${family.pkg}/400Regular/${family.file}_400Regular.ttf`;
+  const bytes = await fetchTtf(url, fetchImpl, false);
+  return bytes ? { regular: bytes } : undefined;
+}
+
+interface CuratedFamily {
+  readonly pkg: string; // @expo-google-fonts package name
+  readonly file: string; // capitalised file prefix
+  // Newer @expo-google-fonts packages nest each variant in its own folder
+  // (`/400Regular/Carlito_400Regular.ttf`) rather than flat at the package root.
+  readonly nested?: boolean;
+}
+
+const FAMILIES: Record<FamilyKey, CuratedFamily> = {
+  arimo: { pkg: 'arimo', file: 'Arimo' },
+  tinos: { pkg: 'tinos', file: 'Tinos' },
+  cousine: { pkg: 'cousine', file: 'Cousine' },
+  carlito: { pkg: 'carlito', file: 'Carlito', nested: true },
+  caladea: { pkg: 'caladea', file: 'Caladea' },
+  notoserif: { pkg: 'noto-serif', file: 'NotoSerif', nested: true },
+};
+
+/**
+ * The letters a metric twin does not draw, and the family it borrows them
+ * from — squeezed, per writing system and face, to the width of the face the
+ * twin stands in for.
+ */
+export interface Companion {
+  /** The family that draws them. */
+  readonly family: FamilyKey;
+  /**
+   * The blocks it is borrowed for (inclusive ranges), each with the factor
+   * its advances are multiplied by in each face.
+   */
+  readonly ranges: ReadonlyArray<readonly [number, number, Readonly<Record<FontVariant, number>>]>;
+}
+
+// Caladea, Cambria's twin, is a Latin face: its cmap stops at U+017F and a few
+// more (fc-query, 2026-11-06), with no Greek and no Cyrillic, so every Russian,
+// Kazakh, Uzbek or Greek letter of a Cambria run fell to whichever family was
+// loaded first — Arimo, a grotesque, beside the roman Latin around it.
+//
+// Noto Serif is the roman that comes closest to Cambria's Cyrillic. Against
+// Cambria 6.90 (Microsoft Office for Mac), letter by letter over the Russian
+// and the 52 Turkic letters, Tinos is off by 8.0 % on average and Arimo by
+// 8.6 %; Noto Serif by 11.6 %, but almost all of it is one factor — it is 12 %
+// wider throughout — and with that taken out it is off by 4.2 % (3.5 % bold,
+// 4.6 % italic, 5.0 % bold italic). The factors are the width of Cambria's
+// letters over Noto Serif's, measured on running Russian and Turkic text
+// (Cyrillic) and Greek text, so that a line holds about as much as Word's.
+//
+// Each factor is kept to a tenth of a percent, the step the PDF writer sets
+// horizontal scaling (`Tz`) in: a factor between two steps is measured at one
+// width and drawn at another.
+const CAMBRIA_CYRILLIC: Readonly<Record<FontVariant, number>> = {
+  regular: 0.894,
+  bold: 0.918,
+  italic: 0.9,
+  boldItalic: 0.915,
+};
+const CAMBRIA_GREEK: Readonly<Record<FontVariant, number>> = {
+  regular: 0.932,
+  bold: 0.953,
+  italic: 0.909,
+  boldItalic: 0.938,
+};
+
+const COMPANIONS: Partial<Record<FamilyKey, Companion>> = {
+  caladea: {
+    family: 'notoserif',
+    ranges: [
+      [0x0370, 0x03ff, CAMBRIA_GREEK],
+      [0x0400, 0x052f, CAMBRIA_CYRILLIC],
+      [0x1f00, 0x1fff, CAMBRIA_GREEK],
+    ],
+  },
+};
+
+/**
+ * The family a substitute borrows the letters it lacks from, if it borrows any.
+ *
+ * @param key The substitute.
+ * @returns Its companion, or `undefined`.
+ */
+export function companionOf(key: string): Companion | undefined {
+  return Object.hasOwn(COMPANIONS, key) ? COMPANIONS[key as FamilyKey] : undefined;
+}
+
+/**
+ * How much a companion squeezes a character it draws in a face.
+ *
+ * @param companion The companion.
+ * @param cp        The code point.
+ * @param variant   The face it is drawn in.
+ * @returns The factor, or `undefined` when the companion is not borrowed for it.
+ */
+export function companionScale(
+  companion: Companion,
+  cp: number,
+  variant: FontVariant,
+): number | undefined {
+  for (const [lo, hi, scale] of companion.ranges) if (cp >= lo && cp <= hi) return scale[variant];
+  return undefined;
+}
+
+// Metric-compatible twins: an open font engineered to reproduce the named
+// proprietary font's advance widths 1:1. Matched before the class fallback so
+// e.g. Cambria resolves to its exact twin Caladea, not the generic serif Tinos.
+const EXACT: Record<string, FamilyKey> = {
+  calibri: 'carlito',
+  // A theme's HEADING font in 240 of the corpus's documents. It is Calibri's
+  // own light weight, so Carlito is its twin too — read as an unknown name it
+  // went to the generic sans and set every heading in Arial's widths.
+  'calibri light': 'carlito',
+  cambria: 'caladea',
+  arial: 'arimo',
+  helvetica: 'arimo',
+  'liberation sans': 'arimo',
+  'times new roman': 'tinos',
+  times: 'tinos',
+  'liberation serif': 'tinos',
+  'courier new': 'cousine',
+  courier: 'cousine',
+  'liberation mono': 'cousine',
+};
+
+// Class fallback for families without an exact twin — a style match only
+// (widths approximate). Anything not serif/mono falls through to sans (Arimo).
+const SERIF = new Set([
+  'georgia',
+  'garamond',
+  'book antiqua',
+  'palatino',
+  'pt serif',
+  'minion pro',
+  'serif',
+]);
+
+// Sans families whose name also starts a mono or serif cut's, matched whole.
+const SANS = new Set([
+  'roboto',
+  'noto sans',
+  'notosans',
+  'dejavu sans',
+  'dejavusans',
+  'lucida sans',
+  'lucidasans',
+  'ubuntu',
+  'lato',
+  'inter',
+  'din',
+  'sans',
+  'sans serif',
+]);
+
+const MONO = new Set([
+  // The word a family is named for its fixed pitch by, standing last:
+  // `Roboto Mono`, `IBM Plex Mono`, `Arial Monospaced`.
+  'mono',
+  'monospaced',
+  'consolas',
+  'monaco',
+  'menlo',
+  'lucida console',
+  'dejavu sans mono',
+  'monospace',
+]);
+
+// The families a PDF names, which are not the families a document names.
+//
+// A word processor asks for "Times New Roman"; a PDF carries the face it was
+// SET in, and TeX and PostScript producers set pages in families whose names
+// are a stem and a size: `LMRoman10-Regular`, `CMR7`, `NimbusRomNo9L-Regu`,
+// `CMTT10`. None of them matches a name in the tables above, so every one of
+// those pages — every paper, every preprint, every LaTeX document there is —
+// came back set in a grotesque. The descriptor cannot help: TeX marks its
+// faces `/Flags 4`, which is Symbolic and says nothing about the shape.
+//
+// These are the stems of the free families that carry the world's typesetting:
+// Latin Modern and Computer Modern (Knuth's own, and the LaTeX default), the
+// URW clones of the PostScript 35 (Nimbus, Palladio, Schoolbook, Bookman), and
+// the serif names a producer writes in full. No stem here starts another, so
+// the order they are tried in does not matter.
+const STEMS: ReadonlyArray<readonly [string, FamilyKey]> = [
+  // Computer Modern and Latin Modern: `R` roman, `BX` bold extended, `TI`
+  // text italic, `SL` slanted, `CSC` small caps, `SS` sans, `TT` typewriter.
+  ['latinmodernroman', 'tinos'],
+  ['latinmodernmath', 'tinos'],
+  ['latinmodernmono', 'cousine'],
+  ['latinmodernsans', 'arimo'],
+  ['lmroman', 'tinos'],
+  ['lmmath', 'tinos'],
+  ['lmmono', 'cousine'],
+  ['lmsans', 'arimo'],
+  ['cmbx', 'tinos'],
+  ['cmcsc', 'tinos'],
+  ['cmti', 'tinos'],
+  ['cmsl', 'tinos'],
+  ['cmmi', 'tinos'],
+  ['cmsy', 'tinos'],
+  ['cmss', 'arimo'],
+  ['cmtt', 'cousine'],
+  ['cmr', 'tinos'],
+  // URW's clones of the PostScript 35, which every PostScript producer embeds.
+  ['nimbusrom', 'tinos'],
+  ['nimbussan', 'arimo'],
+  ['nimbusmon', 'cousine'],
+  ['urwpalladio', 'tinos'],
+  ['urwbookman', 'tinos'],
+  ['centuryschlbk', 'tinos'],
+  ['centuryschoolbook', 'tinos'],
+  ['newcenturyschlbk', 'tinos'],
+  ['bookman', 'tinos'],
+  ['palatino', 'tinos'],
+  // Serif families a producer names in full.
+  ['utopia', 'tinos'],
+  ['charter', 'tinos'],
+  ['baskerville', 'tinos'],
+  ['caslon', 'tinos'],
+  // `Minion Pro` loses its `Pro` as a face word, so the stem is the family's.
+  ['minion', 'tinos'],
+  ['stix', 'tinos'],
+  ['stoneserif', 'tinos'],
+  // The sans families a producer names, which a descriptor can mislabel:
+  // bug898853.pdf flags its FrutigerLTStd-Light Serif, and read off the flag
+  // "Canadian" came back in a roman. None of these starts a mono or serif
+  // cut's name — Roboto Mono and DejaVu Sans Mono are why those two are
+  // matched whole instead (see SANS).
+  ['stonesans', 'arimo'],
+  ['myriad', 'arimo'],
+  ['arial', 'arimo'],
+  ['helvetica', 'arimo'],
+  ['frutiger', 'arimo'],
+  ['univers', 'arimo'],
+  ['futura', 'arimo'],
+  ['gillsans', 'arimo'],
+  ['optima', 'arimo'],
+  ['avenir', 'arimo'],
+  ['verdana', 'arimo'],
+  ['tahoma', 'arimo'],
+  ['trebuchet', 'arimo'],
+  ['segoeui', 'arimo'],
+  ['franklingothic', 'arimo'],
+  ['newsgothic', 'arimo'],
+  ['tradegothic', 'arimo'],
+  ['centurygothic', 'arimo'],
+  ['akzidenz', 'arimo'],
+  ['eurostile', 'arimo'],
+  ['avantgarde', 'arimo'],
+  ['gotham', 'arimo'],
+  ['proximanova', 'arimo'],
+  ['opensans', 'arimo'],
+  ['sourcesans', 'arimo'],
+  ['ptsans', 'arimo'],
+  ['firasans', 'arimo'],
+  ['montserrat', 'arimo'],
+  ['candara', 'arimo'],
+  ['corbel', 'arimo'],
+  ['lucidagrande', 'arimo'],
+  ['mssansserif', 'arimo'],
+  ['microsoftsansserif', 'arimo'],
+  ['dinpro', 'arimo'],
+  ['dinnext', 'arimo'],
+  // Typewriter faces whose name runs the fixed pitch into the family's:
+  // `Monospace821BT`, `LucidaTypewriter`, `LucidaSans-Typewriter`.
+  ['monospace', 'cousine'],
+  ['lucidatypewriter', 'cousine'],
+  ['lucidasanstypewriter', 'cousine'],
+];
+
+/** The family a name STARTS with, for the families named by stem and size. */
+function familyFromStem(name: string): FamilyKey | undefined {
+  for (const [stem, key] of STEMS) {
+    if (!name.startsWith(stem)) continue;
+    // A sans family's cut that names another class is that class's: Arial
+    // Monospaced is a typewriter face and Fira Sans Slab a serif one.
+    if (key === 'arimo') {
+      const cut = name.slice(stem.length);
+      if (/mono|typewriter/u.test(cut)) return 'cousine';
+      if (/serif|slab/u.test(cut)) return 'tinos';
+    }
+    return key;
+  }
+  return undefined;
+}
+
+// The words a family name ends with to say which MEMBER of the family it is —
+// a weight, a width or a slant. Each maps to what the substitute can do about
+// it: take its bold cut, take its italic, squeeze it. `none` is a face no
+// curated family ships (light, medium, thin), and the regular one is the honest
+// answer there — which is what LibreOffice does with them too.
+const WEIGHT_WORDS: ReadonlyMap<string, 'bold' | 'italic' | 'narrow' | 'none'> = new Map([
+  ['black', 'bold'],
+  ['heavy', 'bold'],
+  ['bold', 'bold'],
+  ['semibold', 'bold'],
+  ['demibold', 'bold'],
+  ['demi', 'bold'],
+  ['italic', 'italic'],
+  ['oblique', 'italic'],
+  ['light', 'none'],
+  ['thin', 'none'],
+  ['medium', 'none'],
+  ['regular', 'none'],
+  ['book', 'none'],
+  ['narrow', 'narrow'],
+  ['condensed', 'narrow'],
+  ['cond', 'narrow'],
+  ['expanded', 'none'],
+  ['extra', 'none'],
+  ['ultra', 'none'],
+  ['pro', 'none'],
+]);
+
+/** A family name, read: which substitute it maps to and what it says about the face. */
+export interface FamilyStyle {
+  readonly key: FamilyKey;
+  /** The NAME asks for a heavy face (`Arial Black`, `DIN-Bold`). */
+  readonly bold?: boolean;
+  /** …or a slanted one (`Frutiger Oblique`). */
+  readonly italic?: boolean;
+  /**
+   * …or a narrow one (`Arial Narrow`), as the fraction of the normal advance it
+   * sets at. No curated family ships a condensed cut, so the substitute is
+   * squeezed instead — Arial Narrow's own widths are 82 % of Arial's, which is
+   * also what LibreOffice's Liberation Sans Narrow reproduces.
+   */
+  readonly widthScale?: number;
+}
+
+/** Arial Narrow's advance widths, as a fraction of Arial's. */
+const NARROW_SCALE = 0.82;
+
+/**
+ * Map a document-referenced font family to a curated open substitute: an exact
+ * metric twin when one is known (e.g. Calibri → Carlito), otherwise a
+ * serif/mono/sans style fallback.
+ *
+ * The name may also carry the FACE — `Times New Roman Bold` is the Times
+ * family, and read whole it matches no twin at all and fell through to the
+ * generic sans, which is how a Times heading came out in a grotesque.
+ *
+ * @param name The referenced family name (case-insensitive); empty ⇒ Arimo.
+ * @returns The chosen family and what the name said about the face.
+ */
+export function resolveFamilyStyle(name: string | undefined): FamilyStyle {
+  if (!name) return { key: 'arimo' };
+  const { words, bold, italic, narrow } = readName(name);
+  return {
+    key: familyOfWords(words) ?? 'arimo',
+    ...(bold ? { bold } : {}),
+    ...(italic ? { italic } : {}),
+    ...(narrow ? { widthScale: NARROW_SCALE } : {}),
+  };
+}
+
+/**
+ * Whether the tables KNOW a family name — so the substitute it maps to is the
+ * name's own answer, and not the sans that every name nobody knows falls to.
+ *
+ * @param name The referenced family or face name.
+ * @returns `true` where the name matched a twin, a class or a stem.
+ */
+export function knowsFamily(name: string | undefined): boolean {
+  return name !== undefined && name !== '' && familyOfWords(readName(name).words) !== undefined;
+}
+
+/** A name's family words, with the face words that ended it taken off and read. */
+function readName(name: string): {
+  words: Array<string>;
+  bold: boolean;
+  italic: boolean;
+  narrow: boolean;
+} {
+  // PostScript spells the face with a hyphen (`CenturySchoolbook-Bold`), and a
+  // stray comma is how some producers separate it (`Arial,Bold`).
+  const words = name
+    .trim()
+    .toLowerCase()
+    .split(/[\s\-_,]+/u)
+    .filter((w) => w !== '');
+  let bold = false;
+  let italic = false;
+  let narrow = false;
+  // Strip the face words off the END — a family may be NAMED for one of them
+  // (Book Antiqua), and only a trailing word is the face.
+  while (words.length > 1) {
+    const word = WEIGHT_WORDS.get(words[words.length - 1]!);
+    if (word === undefined) break;
+    if (word === 'bold') bold = true;
+    if (word === 'italic') italic = true;
+    if (word === 'narrow') narrow = true;
+    words.pop();
+  }
+  return { words, bold, italic, narrow };
+}
+
+/** The substitute a family's words name, or `undefined` where no table knows them. */
+function familyOfWords(words: ReadonlyArray<string>): FamilyKey | undefined {
+  if (words.length === 0) return undefined;
+  // The whole name first, then the words a foundry prefix or a modifier may be
+  // hiding the family behind: `Adobe Garamond Pro` is a Garamond.
+  const whole = words.join(' ');
+  const tries = [whole, words[words.length - 1]!, words[0]!];
+  for (const n of tries) {
+    const found =
+      EXACT[n] ??
+      (MONO.has(n) ? 'cousine' : SERIF.has(n) ? 'tinos' : undefined) ??
+      // Whole only: `Roboto` is a sans and `Roboto Mono` is not.
+      (n === whole && SANS.has(n) ? 'arimo' : undefined) ??
+      familyFromStem(n.replace(/[^a-z]/gu, ''));
+    if (found) return found;
+  }
+  return undefined;
+}
+
+/**
+ * The curated substitute for a family name — {@link resolveFamilyStyle} without
+ * the face it also carries.
+ *
+ * @param name The referenced family name (case-insensitive); empty ⇒ Arimo.
+ * @returns The chosen {@link FamilyKey}.
+ */
+export function resolveFamilyKey(name: string | undefined): FamilyKey {
+  return resolveFamilyStyle(name).key;
+}
+
+function fontUrl(family: CuratedFamily, variant: FontVariant): string {
+  const suffix = VARIANT_SUFFIX[variant];
+  const leaf = `${family.file}_${suffix}.ttf`;
+  // Nested packages place each variant under its own suffix-named folder.
+  return family.nested
+    ? `${CDN_BASE}/${family.pkg}/${suffix}/${leaf}`
+    : `${CDN_BASE}/${family.pkg}/${leaf}`;
+}
+
+/** A minimal `fetch`-like function (injectable for tests / offline use). */
+export type FetchLike = (
+  url: string,
+) => Promise<{ ok: boolean; arrayBuffer: () => Promise<ArrayBuffer> }>;
+
+// Cache by URL so repeated conversions (and the four variants of one family)
+// don't re-download. Stores the in-flight promise to dedupe concurrent fetches.
+const cache = new Map<string, Promise<Uint8Array | undefined>>();
+
+async function fetchTtf(
+  url: string,
+  fetchImpl: FetchLike,
+  required: boolean,
+): Promise<Uint8Array | undefined> {
+  let pending = cache.get(url);
+  if (!pending) {
+    pending = (async () => {
+      const res = await fetchImpl(url);
+      if (!res.ok) return undefined;
+      const buf = await res.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      // Guard against CDN error pages masquerading as 200: a real sfnt starts
+      // with 0x00010000 (TrueType) or 'OTTO'/'true'/'ttcf'.
+      if (bytes.length < 4) return undefined;
+      const sig = (bytes[0]! << 24) | (bytes[1]! << 16) | (bytes[2]! << 8) | bytes[3]!;
+      const ok =
+        sig === 0x00010000 || sig === 0x4f54544f || sig === 0x74727565 || sig === 0x74746366;
+      return ok ? bytes : undefined;
+    })();
+    cache.set(url, pending);
+  }
+  let result: Uint8Array | undefined;
+  try {
+    result = await pending;
+  } catch (cause) {
+    // The request itself failed: offline, a failed DNS lookup, a dropped
+    // connection. That says nothing about the font, only about the network at
+    // that moment, yet cached it answered every later call with the same error
+    // without asking again, for as long as the process ran. So it is forgotten,
+    // unless a newer download already stands in its place, and a best-effort
+    // face goes missing, as it does when the CDN answers with an error.
+    if (cache.get(url) === pending) cache.delete(url);
+    if (!required) return undefined;
+    throw new Error(`Failed to download font from ${url}`, { cause });
+  }
+  if (!result && required) {
+    cache.delete(url);
+    throw new Error(`Failed to download font from ${url}`);
+  }
+  return result;
+}
+
+/** Options for {@link fetchFontSet}. */
+export interface FetchFontSetOptions {
+  /** Document font family name to substitute, or a curated {@link FamilyKey} directly. */
+  readonly family?: string | FamilyKey;
+  /** Injectable fetch (defaults to {@link NO_NETWORK}: no download without one). */
+  readonly fetch?: FetchLike;
+}
+
+/**
+ * Download a full variant set (regular required; bold/italic/bold-italic
+ * best-effort) for the open family that best matches the requested name.
+ *
+ * @param options The family to substitute and an optional fetch override.
+ * @returns The downloaded font bytes per variant.
+ * @throws Error when the required regular face cannot be downloaded.
+ */
+export async function fetchFontSet(options: FetchFontSetOptions = {}): Promise<FontBytesByVariant> {
+  const fetchImpl: FetchLike = options.fetch ?? NO_NETWORK;
+  const key: FamilyKey =
+    options.family && options.family in FAMILIES
+      ? (options.family as FamilyKey)
+      : resolveFamilyKey(options.family);
+  const family = FAMILIES[key];
+
+  const regular = await fetchTtf(fontUrl(family, 'regular'), fetchImpl, true);
+  const [bold, italic, boldItalic] = await Promise.all([
+    fetchTtf(fontUrl(family, 'bold'), fetchImpl, false),
+    fetchTtf(fontUrl(family, 'italic'), fetchImpl, false),
+    fetchTtf(fontUrl(family, 'boldItalic'), fetchImpl, false),
+  ]);
+
+  return {
+    regular: regular!,
+    ...(bold ? { bold } : {}),
+    ...(italic ? { italic } : {}),
+    ...(boldItalic ? { boldItalic } : {}),
+  };
+}
+
+/** Test / diagnostic helper: clear the in-memory font-download cache. */
+export function clearFontCache(): void {
+  cache.clear();
+}

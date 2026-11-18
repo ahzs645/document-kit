@@ -1,0 +1,1015 @@
+// E-PDF EP6 — decode a PDF image XObject (ISO 32000-1 §8.9) into a standalone
+// raster file the FlowDoc resource store can hold. JPEG (/DCTDecode) and JPEG
+// 2000 (/JPXDecode) pass through verbatim — readers decode those wavelet/DCT
+// codestreams themselves, so we only strip any filters layered before them.
+// Everything else is decoded to raw samples and re-wrapped as PNG (png-encode).
+//
+// Colour spaces: DeviceGray/RGB/CMYK, CalGray/CalRGB, ICCBased (by /N component
+// count), Indexed (expanded against its palette). Filters: Flate, LZW (EP12),
+// RunLength, ASCII85, ASCIIHex, CCITT Group 4 / Group 3 1-D fax (EP15), plus
+// PNG/TIFF predictors on Flate and LZW. Bit depths 1/2/4/8/16. An /SMask becomes
+// the PNG alpha channel, and a stencil /ImageMask (§8.9.6.2) becomes an RGBA
+// picture in the page's own fill colour. The abbreviated keys and filter names
+// an INLINE image writes (§8.9.7 Table 93) are read here too, so one decodes
+// down this same path once wrapped as a stream. A Separation or DeviceN image
+// is run through its own tint transform (§8.6.6.4), which needs a function that
+// can be called (`./function`). Unsupported inputs — CCITT Group 3 2-D —
+// return a typed reason so the caller records a loss instead of emitting a
+// broken image.
+
+import { unzlibSync } from 'fflate';
+
+import { decodeCcitt } from './ccitt';
+import { ascii85Decode, asciiHexDecode, runLengthDecode } from './stream-filters';
+import { labToSrgb } from './cie-color';
+import { readFunction } from './function';
+import { decodeJbig2 } from './jbig2';
+import { decodeJpeg } from './jpeg';
+import { reversePredictor } from './predictor';
+import type { PdfFunction } from './function';
+import type { PngColor } from '../core/png-encode';
+import type { PdfDict, PdfValue } from '../pdf/objects';
+
+import type { PdfFile } from './document';
+import { encodePng } from '../core/png-encode';
+import { lzwDecodeMsb } from '../core/lzw';
+import { PDF_NULL, PdfHexString, PdfName, PdfStream } from '../pdf/objects';
+
+/**
+ * The result of {@link decodePdfImage}: either a decoded standalone raster file
+ * (with pixel dimensions and an optional `degraded` note for a partial loss,
+ * e.g. a JPEG's alpha dropped) or a typed failure carrying the loss severity and
+ * a human-readable reason.
+ */
+export type DecodedImage =
+  | {
+      readonly ok: true;
+      readonly bytes: Uint8Array;
+      readonly format: 'png' | 'jpeg' | 'jpeg2000';
+      readonly widthPx: number;
+      readonly heightPx: number;
+      /** A partial loss note (e.g. a JPEG's alpha dropped). */
+      readonly degraded?: string;
+    }
+  | { readonly ok: false; readonly severity: 'dropped' | 'degraded'; readonly detail: string };
+
+const MAX_PIXELS = 40_000_000; // DoS guard (~40 MP)
+
+/**
+ * Decode a PDF image XObject (ISO 32000-1 §8.9) into a standalone raster file
+ * the FlowDoc resource store can hold. JPEG (`/DCTDecode`) and JPEG 2000
+ * (`/JPXDecode`) pass through verbatim — only the filters layered before them
+ * are stripped; everything else is decoded to raw samples and re-wrapped as PNG.
+ * Supports DeviceGray/RGB/CMYK, CalGray/CalRGB, ICCBased (by `/N`) and Indexed
+ * colour spaces; Flate, LZW (EP12), RunLength, ASCII85, ASCIIHex and CCITT
+ * Group 4 / Group 3 1-D fax (EP15) filters; PNG/TIFF predictors; bit depths
+ * 1/2/4/8/16; an `/SMask` folded in as the PNG alpha channel; and a stencil
+ * `/ImageMask` (§8.9.6.2) given back as RGBA in `fillHex`; `Lab` (§8.6.5.8) and
+ * a `Separation`/`DeviceN` through its own tint transform (§8.6.6.4).
+ * Unsupported inputs (CCITT Group 3 2-D) return a typed failure so the caller
+ * records a loss.
+ *
+ * @param file    The owning file.
+ * @param stream  The image XObject, or an inline image wrapped as one.
+ * @param fillHex §8.9.6.2 — the non-stroking colour a stencil mask paints in.
+ * @returns The decoded image, or `{ ok: false }` with the loss severity and reason.
+ */
+export function decodePdfImage(file: PdfFile, stream: PdfStream, fillHex?: string): DecodedImage {
+  const d = stream.dict;
+  const width = intOf(file.get(d, 'Width')) || intOf(file.get(d, 'W'));
+  const height = intOf(file.get(d, 'Height')) || intOf(file.get(d, 'H'));
+  if (width <= 0 || height <= 0) return fail('dropped', 'image with no dimensions');
+  if (width * height > MAX_PIXELS) return fail('dropped', 'image too large to decode');
+
+  if (boolOf(d.get('ImageMask')) || boolOf(d.get('IM'))) {
+    return stencil(file, stream, width, height, fillHex);
+  }
+
+  const filters = filterNames(file, d);
+  const last = filters[filters.length - 1];
+
+  // JPEG rides through verbatim — decode only the filters that wrap it. Unless
+  // it carries an `/SMask`: alpha cannot be attached to a JPEG, so the picture
+  // has to be taken apart and given back as a PNG. §8.9.5.4.
+  if (last === 'DCTDecode' || last === 'DCT') {
+    const jpegBytes = applyChainExceptLast(filters, stream.data);
+    // A JPEG of four inks cannot travel as it is: the PDF states them as the
+    // ink they are, and a picture file of CMYK is read by every viewer as
+    // Adobe's INVERTED convention — cmykjpeg.pdf's beach photograph came back
+    // a black rectangle. Its colours are worked out here instead.
+    const inks = cmykJpeg(file, d, jpegBytes, width, height);
+    if (inks) return inks;
+    const masked = hasSMask(file, d) ? maskedJpeg(file, d, jpegBytes, width, height) : undefined;
+    if (masked) return masked;
+    const degraded = hasSMask(file, d)
+      ? 'image transparency dropped (JPEG could not be decoded to attach its mask)'
+      : undefined;
+    return {
+      ok: true,
+      bytes: jpegBytes,
+      format: 'jpeg',
+      widthPx: width,
+      heightPx: height,
+      ...(degraded ? { degraded } : {}),
+    };
+  }
+  if (last === 'JPXDecode') {
+    return {
+      ok: true,
+      bytes: applyChainExceptLast(filters, stream.data),
+      format: 'jpeg2000',
+      widthPx: width,
+      heightPx: height,
+      degraded: 'JPEG 2000 image — limited viewer support',
+    };
+  }
+  if (last === 'JBIG2Decode') {
+    const raster = decodeJbig2Image(file, stream, filters, width, height);
+    if (typeof raster === 'string') return fail('dropped', raster);
+    return {
+      ok: true,
+      bytes: encodePng(width, height, raster.color, raster.samples),
+      format: 'png',
+      widthPx: width,
+      heightPx: height,
+    };
+  }
+
+  const isCcitt = last === 'CCITTFaxDecode' || last === 'CCF';
+  const decoded = isCcitt
+    ? decodeCcittImage(file, stream, filters, width, height)
+    : decodeToSamples(file, stream, filters, width, height);
+  if (typeof decoded === 'string') return fail('dropped', decoded);
+
+  // Fold an /SMask in as the alpha channel (PNG path only) — or, where there
+  // is none, what a colour key masks out: §8.9.5.4, a soft mask overrides it.
+  const alpha = decodeSMask(file, d, width, height) ?? decoded.keyed;
+  const { color, samples } = alpha ? combineAlpha(decoded, alpha) : decoded;
+  return {
+    ok: true,
+    bytes: encodePng(width, height, color, samples),
+    format: 'png',
+    widthPx: width,
+    heightPx: height,
+  };
+}
+
+// --- the sample (PNG) path --------------------------------------------------
+
+interface RawColor {
+  readonly color: 'gray' | 'rgb';
+  readonly samples: Uint8Array; // 8-bit interleaved, width*height*(1|3)
+  /** §8.9.6.4 — the samples a colour key masks out, as an alpha. */
+  readonly keyed?: Alpha;
+}
+
+// Returns the decoded colour image, or a human reason string on failure.
+function decodeToSamples(
+  file: PdfFile,
+  stream: PdfStream,
+  filters: ReadonlyArray<string>,
+  width: number,
+  height: number,
+): RawColor | string {
+  const d = stream.dict;
+  const raw = decodeChain(file, stream, filters);
+  if (!raw) return 'undecodable image stream';
+  const cs = resolveColorSpace(file, d.get('ColorSpace') ?? d.get('CS'));
+  if (!cs) return 'unsupported image colour space';
+  const bpc = intOf(file.get(d, 'BitsPerComponent')) || intOf(file.get(d, 'BPC')) || 8;
+  const decodeArr = decodeArrayOf(file, d);
+  const integers = unpackSamples(raw, width, height, cs.components, bpc);
+  const keyed = colorKey(file, d, integers, cs.components, width * height);
+  return { ...toColor(cs, integers, width * height, bpc, decodeArr), ...(keyed ? { keyed } : {}) };
+}
+
+/**
+ * §8.9.6.4 — colour key masking: `/Mask` as an array of a range per colour
+ * component, and a sample whose every component falls inside its range is
+ * not painted. The ranges are in the image's own sample values, before any
+ * `/Decode`. colorkeymask.pdf keys out every sample of full red, and painted
+ * whole its red bar stood beside the green and blue ones the page shows.
+ *
+ * @returns The alpha it comes to, or `undefined` where no sample is keyed out.
+ */
+function colorKey(
+  file: PdfFile,
+  d: PdfDict,
+  samples: Uint16Array,
+  n: number,
+  px: number,
+): Alpha | undefined {
+  const mask = file.resolve(d.get('Mask') ?? PDF_NULL);
+  if (!Array.isArray(mask) || mask.length < 2 * n) return undefined;
+  const ranges = mask.slice(0, 2 * n).map((v) => file.resolve(v));
+  if (!ranges.every((v): v is number => typeof v === 'number')) return undefined;
+  const data = new Uint8Array(px).fill(255);
+  let keyed = false;
+  for (let i = 0; i < px; i++) {
+    let inside = true;
+    for (let c = 0; c < n && inside; c++) {
+      const v = samples[i * n + c]!;
+      inside = v >= ranges[2 * c]! && v <= ranges[2 * c + 1]!;
+    }
+    if (!inside) continue;
+    data[i] = 0;
+    keyed = true;
+  }
+  return keyed ? { data } : undefined;
+}
+
+// E-PDF EP15 — decode a /CCITTFaxDecode image to DeviceGray samples (black → 0,
+// white → 255). Any filters wrapping the fax codestream are stripped first.
+/**
+ * §7.4.7 — a `/JBIG2Decode` image: the stream's own segments, plus the shared
+ * ones a `/JBIG2Globals` holds (the symbol dictionary a scanned book stores
+ * once for all its pages).
+ */
+function decodeJbig2Image(
+  file: PdfFile,
+  stream: PdfStream,
+  filters: ReadonlyArray<string>,
+  width: number,
+  height: number,
+): RawColor | string {
+  const parms = decodeParmsOf(file, stream.dict);
+  const globalsVal = parms ? file.get(parms, 'JBIG2Globals') : undefined;
+  const globalsStream = globalsVal instanceof PdfStream ? globalsVal : undefined;
+  const globals = globalsStream ? file.streamData(globalsStream) : undefined;
+  const packed = decodeJbig2(applyChainExceptLast(filters, stream.data), globals, width, height);
+  if (!packed) return 'JBIG2 image not decoded';
+  const rowBytes = (width + 7) >> 3;
+  const samples = new Uint8Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      // JBIG2 codes 1 as BLACK; DeviceGray reads 0 as black.
+      samples[y * width + x] = (packed[y * rowBytes + (x >> 3)]! >> (7 - (x & 7))) & 1 ? 0 : 255;
+    }
+  }
+  return { color: 'gray', samples };
+}
+
+function decodeCcittImage(
+  file: PdfFile,
+  stream: PdfStream,
+  filters: ReadonlyArray<string>,
+  width: number,
+  height: number,
+): RawColor | string {
+  const parms = decodeParmsOf(file, stream.dict);
+  const columns = (parms ? intOf(file.get(parms, 'Columns')) : 0) || 1728;
+  const packed = decodeCcitt(applyChainExceptLast(filters, stream.data), {
+    k: parms ? intOf(file.get(parms, 'K')) : 0,
+    columns,
+    rows: height,
+    byteAlign: parms ? boolOf(file.get(parms, 'EncodedByteAlign')) : false,
+  });
+  if (!packed) return 'CCITT fax image not decoded (Group 3 2-D or malformed)';
+  // §7.4.6 — the decoder codes a black run as 1 bits, but what the FILTER hands
+  // on is `/BlackIs1`'s business: false (the default) means the black pixel
+  // leaves as a 0, which DeviceGray then reads as black, and true means it
+  // leaves as a 1, which reads as white. images_1bit_grayscale.pdf carries the
+  // same picture twice, once encoded each way, and read without the flag the
+  // second came back white on black.
+  const blackIs1 = parms ? boolOf(file.get(parms, 'BlackIs1')) : false;
+  const rowBytes = (columns + 7) >> 3;
+  const samples = new Uint8Array(width * height);
+  for (let y = 0; y < height; y++) {
+    const rowOff = y * rowBytes;
+    for (let x = 0; x < width; x++) {
+      const bit = x < columns ? (packed[rowOff + (x >> 3)]! >> (7 - (x & 7))) & 1 : 0;
+      samples[y * width + x] = bit === (blackIs1 ? 0 : 1) ? 0 : 255;
+    }
+  }
+  return { color: 'gray', samples };
+}
+
+/**
+ * §8.9.6.2 — a stencil mask: one bit per pixel saying WHERE to paint, and the
+ * colour is whatever the page's non-stroking colour was at the `Do`.
+ *
+ * A sample of 0 paints and 1 leaves the page alone, which `/Decode [1 0]`
+ * swaps. Given back as an RGBA picture — the fill colour throughout, opaque
+ * where the stencil paints and clear where it does not — which is what the mask
+ * MEANS and what every format downstream can show.
+ * images_1bit_grayscale.pdf draws two of them and they were dropped entirely.
+ */
+function stencil(
+  file: PdfFile,
+  stream: PdfStream,
+  width: number,
+  height: number,
+  fillHex: string | undefined,
+): DecodedImage {
+  const d = stream.dict;
+  const filters = filterNames(file, d);
+  const last = filters[filters.length - 1];
+  const packed =
+    last === 'CCITTFaxDecode' || last === 'CCF'
+      ? ccittBits(file, stream, filters, height)
+      : last === 'JBIG2Decode'
+        ? jbig2Bits(file, stream, filters, width, height)
+        : decodeChain(file, stream, filters);
+  if (!packed) return fail('dropped', 'stencil image mask not decoded');
+  // §8.9.5.2 — `/Decode [1 0]` says the OTHER bit paints.
+  const decode = file.resolve(d.get('Decode') ?? d.get('D') ?? PDF_NULL);
+  const paintBit = Array.isArray(decode) && file.resolve(decode[0] ?? PDF_NULL) === 1 ? 1 : 0;
+  const rgb = fillHex !== undefined ? parseHex(fillHex) : [0, 0, 0];
+  const rowBytes = (width + 7) >> 3;
+  if (packed.length < rowBytes * height) return fail('dropped', 'stencil image mask truncated');
+  const samples = new Uint8Array(width * height * 4);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const bit = (packed[y * rowBytes + (x >> 3)]! >> (7 - (x & 7))) & 1;
+      const at = (y * width + x) * 4;
+      samples[at] = rgb[0]!;
+      samples[at + 1] = rgb[1]!;
+      samples[at + 2] = rgb[2]!;
+      samples[at + 3] = bit === paintBit ? 255 : 0;
+    }
+  }
+  return {
+    ok: true,
+    bytes: encodePng(width, height, 'rgba', samples),
+    format: 'png',
+    widthPx: width,
+    heightPx: height,
+  };
+}
+
+/** A 6-hex colour as its three bytes. */
+function parseHex(hex: string): [number, number, number] {
+  const v = Number.parseInt(hex, 16);
+  if (!Number.isFinite(v)) return [0, 0, 0];
+  return [(v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff];
+}
+
+/** A stencil's bits where the file coded them as fax (§7.4.6). */
+function ccittBits(
+  file: PdfFile,
+  stream: PdfStream,
+  filters: ReadonlyArray<string>,
+  height: number,
+): Uint8Array | undefined {
+  const parms = decodeParmsOf(file, stream.dict);
+  const columns = (parms ? intOf(file.get(parms, 'Columns')) : 0) || 1728;
+  const packed = decodeCcitt(applyChainExceptLast(filters, stream.data), {
+    k: parms ? intOf(file.get(parms, 'K')) : 0,
+    columns,
+    rows: height,
+    byteAlign: parms ? boolOf(file.get(parms, 'EncodedByteAlign')) : false,
+  });
+  if (!packed) return undefined;
+  // The decoder codes black as 1; the filter hands on 0 for black unless
+  // `/BlackIs1`, and a stencil's 0 is the bit that PAINTS.
+  const blackIs1 = parms ? boolOf(file.get(parms, 'BlackIs1')) : false;
+  if (blackIs1) return packed;
+  const flipped = new Uint8Array(packed.length);
+  for (let i = 0; i < packed.length; i++) flipped[i] = ~packed[i]! & 0xff;
+  return flipped;
+}
+
+/** …or as JBIG2, which codes 1 as black and so paints on 1. */
+function jbig2Bits(
+  file: PdfFile,
+  stream: PdfStream,
+  filters: ReadonlyArray<string>,
+  width: number,
+  height: number,
+): Uint8Array | undefined {
+  const parms = decodeParmsOf(file, stream.dict);
+  const globalsVal = parms ? file.get(parms, 'JBIG2Globals') : undefined;
+  const globals = globalsVal instanceof PdfStream ? file.streamData(globalsVal) : undefined;
+  const packed = decodeJbig2(applyChainExceptLast(filters, stream.data), globals, width, height);
+  if (!packed) return undefined;
+  const flipped = new Uint8Array(packed.length);
+  for (let i = 0; i < packed.length; i++) flipped[i] = ~packed[i]! & 0xff;
+  return flipped;
+}
+
+interface ColorSpace {
+  readonly kind: 'gray' | 'rgb' | 'cmyk' | 'indexed' | 'lab' | 'tint';
+  readonly components: number;
+  readonly base?: ColorSpace; // indexed
+  readonly hival?: number;
+  readonly lookup?: Uint8Array;
+  /**
+   * §8.6.6.4/§8.6.6.5 — for a `Separation` or `DeviceN` IMAGE, the way out of
+   * it: the tint transform and the space its numbers land in.
+   */
+  readonly tint?: { readonly transform: PdfFunction; readonly alternate: ColorSpace };
+  /** §8.6.5.8 — the `Lab` space's white point and the range of `a*`/`b*`. */
+  readonly lab?: {
+    readonly white: readonly [number, number, number];
+    readonly range: readonly [number, number, number, number];
+  };
+}
+
+function resolveColorSpace(file: PdfFile, csVal: PdfValue | undefined): ColorSpace | undefined {
+  const cs = file.resolve(csVal ?? PDF_NULL);
+  if (cs instanceof PdfName) return namedColorSpace(cs.value);
+  if (!Array.isArray(cs) || cs.length === 0) return undefined;
+  const head = file.resolve(cs[0]!);
+  const tag = head instanceof PdfName ? head.value : '';
+  if (tag === 'ICCBased') {
+    const profile = file.resolve(cs[1]!);
+    if (profile instanceof PdfStream) {
+      const n = intOf(file.get(profile.dict, 'N'));
+      if (n === 1) return { kind: 'gray', components: 1 };
+      if (n === 3) return { kind: 'rgb', components: 3 };
+      if (n === 4) return { kind: 'cmyk', components: 4 };
+      // No /N: fall back to the alternate space.
+      const alt = resolveColorSpace(file, profile.dict.get('Alternate'));
+      if (alt) return alt;
+    }
+    return undefined;
+  }
+  if (tag === 'CalGray' || tag === 'G') return { kind: 'gray', components: 1 };
+  if (tag === 'CalRGB' || tag === 'RGB') return { kind: 'rgb', components: 3 };
+  if (tag === 'Indexed' || tag === 'I') {
+    const base = resolveColorSpace(file, cs[1]);
+    const hival = intOf(file.resolve(cs[2] ?? PDF_NULL));
+    const lookup = valueToBytes(file, cs[3]);
+    if (!base || base.kind === 'indexed' || !lookup) return undefined;
+    return { kind: 'indexed', components: 1, base, hival, lookup };
+  }
+  if (tag === 'Lab') {
+    // §8.6.5.8 — `L*` runs 0..100 and `a*`/`b*` over the stated `/Range`,
+    // which defaults to ±100. issue10339_reduced.pdf paints two grids of blue
+    // swatches through an Indexed palette whose base is one.
+    const params = file.resolve(cs[1] ?? PDF_NULL);
+    const dict = params instanceof Map ? params : undefined;
+    const nums = (v: PdfValue | undefined): Array<number> => {
+      const r = v !== undefined ? file.resolve(v) : undefined;
+      return Array.isArray(r)
+        ? r.map((x) => (typeof file.resolve(x) === 'number' ? (file.resolve(x) as number) : 0))
+        : [];
+    };
+    const white = dict ? nums(file.get(dict, 'WhitePoint')) : [];
+    if (white.length < 3 || !(white[1]! > 0)) return undefined;
+    const range = dict ? nums(file.get(dict, 'Range')) : [];
+    return {
+      kind: 'lab',
+      components: 3,
+      lab: {
+        white: [white[0]!, white[1]!, white[2]!],
+        range:
+          range.length === 4
+            ? [range[0]!, range[1]!, range[2]!, range[3]!]
+            : [-100, 100, -100, 100],
+      },
+    };
+  }
+  if (tag === 'Separation' || tag === 'DeviceN' || tag === 'I') {
+    // §8.6.6.4/§8.6.6.5 — the space names its colorants, an alternate space and
+    // the transform between them. Run it and the samples are a colour; without
+    // it the whole image is unreadable and the page comes back BLANK:
+    // colorspace_sin.pdf is one 256×256 picture in a `/DeviceN [/X /Y /Z]`
+    // whose transform is a PostScript program, and it was the entire page.
+    const names = file.resolve(cs[1] ?? PDF_NULL);
+    const components = tag === 'Separation' ? 1 : Array.isArray(names) ? names.length : 0;
+    const alternate = resolveColorSpace(file, cs[2]);
+    const transform = readFunction(file, cs[3]);
+    if (components < 1 || !alternate || alternate.kind === 'tint' || !transform) return undefined;
+    return { kind: 'tint', components, tint: { transform, alternate } };
+  }
+  // Pattern — a content stream, not a colour.
+  return undefined;
+}
+
+function namedColorSpace(name: string): ColorSpace | undefined {
+  if (name === 'DeviceGray' || name === 'G' || name === 'CalGray')
+    return { kind: 'gray', components: 1 };
+  if (name === 'DeviceRGB' || name === 'RGB' || name === 'CalRGB')
+    return { kind: 'rgb', components: 3 };
+  if (name === 'DeviceCMYK' || name === 'CMYK') return { kind: 'cmyk', components: 4 };
+  return undefined;
+}
+
+// Map raw integer samples (0..2^bpc−1) through the colour space to 8-bit gray/RGB.
+function toColor(
+  cs: ColorSpace,
+  s: Uint16Array,
+  px: number,
+  bpc: number,
+  decode: ReadonlyArray<number> | undefined,
+): RawColor {
+  const maxv = (1 << Math.min(bpc, 15)) * (bpc >= 16 ? 2 : 1) - 1; // 2^bpc − 1
+  const c01 = (v: number, comp: number): number => {
+    const t = maxv > 0 ? v / maxv : 0;
+    if (decode && decode.length >= (comp + 1) * 2) {
+      const dmin = decode[comp * 2]!;
+      const dmax = decode[comp * 2 + 1]!;
+      return clamp01(dmin + t * (dmax - dmin));
+    }
+    return t;
+  };
+  const to8 = (v: number, comp: number): number => Math.round(c01(v, comp) * 255);
+
+  if (cs.kind === 'gray') {
+    const out = new Uint8Array(px);
+    for (let i = 0; i < px; i++) out[i] = to8(s[i]!, 0);
+    return { color: 'gray', samples: out };
+  }
+  if (cs.kind === 'rgb') {
+    const out = new Uint8Array(px * 3);
+    for (let i = 0; i < px; i++) {
+      out[i * 3] = to8(s[i * 3]!, 0);
+      out[i * 3 + 1] = to8(s[i * 3 + 1]!, 1);
+      out[i * 3 + 2] = to8(s[i * 3 + 2]!, 2);
+    }
+    return { color: 'rgb', samples: out };
+  }
+  if (cs.kind === 'cmyk') {
+    const out = new Uint8Array(px * 3);
+    for (let i = 0; i < px; i++) {
+      const c = c01(s[i * 4]!, 0);
+      const m = c01(s[i * 4 + 1]!, 1);
+      const y = c01(s[i * 4 + 2]!, 2);
+      const k = c01(s[i * 4 + 3]!, 3);
+      out[i * 3] = Math.round(255 * (1 - c) * (1 - k));
+      out[i * 3 + 1] = Math.round(255 * (1 - m) * (1 - k));
+      out[i * 3 + 2] = Math.round(255 * (1 - y) * (1 - k));
+    }
+    return { color: 'rgb', samples: out };
+  }
+  if (cs.kind === 'tint' && cs.tint) {
+    // §8.6.6.4 — every sample through the transform, into the alternate space.
+    // A tint image is small (one colorant, or three) and the transform is the
+    // same function for every pixel, so it is worth caching by the components
+    // that reach it: a photograph in a DeviceN repeats very few of them.
+    const { transform, alternate } = cs.tint;
+    const n = cs.components;
+    const cache = new Map<string, [number, number, number]>();
+    const out = new Uint8Array(px * 3);
+    for (let i = 0; i < px; i++) {
+      const comps: Array<number> = [];
+      for (let k = 0; k < n; k++) comps.push(c01(s[i * n + k]!, k));
+      const key = comps.join(',');
+      let rgb = cache.get(key);
+      if (!rgb) {
+        rgb = alternateRgb(alternate, transform(comps));
+        if (cache.size < MAX_TINT_CACHE) cache.set(key, rgb);
+      }
+      out[i * 3] = rgb[0];
+      out[i * 3 + 1] = rgb[1];
+      out[i * 3 + 2] = rgb[2];
+    }
+    return { color: 'rgb', samples: out };
+  }
+  if (cs.kind === 'lab') {
+    // §8.6.5.8 — the samples are already the components; only the DEFAULT
+    // decode differs, running `a*`/`b*` over the space's own range rather than
+    // 0..1. `c01` has applied a stated `/Decode`, so this undoes that scaling.
+    const lab = cs.lab!;
+    const out = new Uint8Array(px * 3);
+    const span = (i: number): [number, number] =>
+      decode && decode.length >= 6
+        ? [0, 1]
+        : i === 0
+          ? [0, 100]
+          : [lab.range[(i - 1) * 2]!, lab.range[(i - 1) * 2 + 1]!];
+    for (let i = 0; i < px; i++) {
+      const comp = [0, 1, 2].map((k) => {
+        const t = c01(s[i * 3 + k]!, k);
+        const [lo, hi] = span(k);
+        return lo + t * (hi - lo);
+      });
+      const [r, g, b] = labToSrgb(lab.white, [comp[0]!, comp[1]!, comp[2]!]);
+      out[i * 3] = Math.round(r * 255);
+      out[i * 3 + 1] = Math.round(g * 255);
+      out[i * 3 + 2] = Math.round(b * 255);
+    }
+    return { color: 'rgb', samples: out };
+  }
+  // indexed
+  const base = cs.base!;
+  const lookup = cs.lookup!;
+  const hival = cs.hival ?? 255;
+  const bn = base.components;
+  // §8.9.5.2 — an Indexed image's `/Decode` maps to INDEX values, not to 0..1:
+  // its default is `[0 2^bpc − 1]`, so the sample IS the index unless the file
+  // says otherwise. issue10339_reduced.pdf draws its two grids of swatches from
+  // one palette, the second through `/Decode [255 0]`, and read without it the
+  // two came back identical instead of mirrored.
+  const index = (v: number): number => {
+    if (!decode || decode.length < 2) return Math.min(v, hival);
+    const lo = decode[0]!;
+    const hi = decode[1]!;
+    const at = maxv > 0 ? lo + (v / maxv) * (hi - lo) : lo;
+    return Math.min(Math.max(0, Math.round(at)), hival);
+  };
+  if (base.kind === 'gray') {
+    const out = new Uint8Array(px);
+    for (let i = 0; i < px; i++) out[i] = lookup[index(s[i]!) * bn] ?? 0;
+    return { color: 'gray', samples: out };
+  }
+  const out = new Uint8Array(px * 3);
+  for (let i = 0; i < px; i++) {
+    const off = index(s[i]!) * bn;
+    const [r, g, b] = paletteRgb(base, lookup, off);
+    out[i * 3] = r;
+    out[i * 3 + 1] = g;
+    out[i * 3 + 2] = b;
+  }
+  return { color: 'rgb', samples: out };
+}
+
+// One palette entry (8-bit per base component) → RGB.
+/** How many distinct tint tuples are remembered before the cache stops growing. */
+const MAX_TINT_CACHE = 1 << 16;
+
+/** §8.6.6.4 — what the alternate space makes of the transform's output. */
+function alternateRgb(alternate: ColorSpace, out: ReadonlyArray<number>): [number, number, number] {
+  const at = (i: number): number => Math.min(1, Math.max(0, out[i] ?? 0));
+  const to255 = (v: number): number => Math.round(v * 255);
+  if (alternate.kind === 'cmyk') {
+    const k = at(3);
+    return [
+      to255((1 - at(0)) * (1 - k)),
+      to255((1 - at(1)) * (1 - k)),
+      to255((1 - at(2)) * (1 - k)),
+    ];
+  }
+  if (alternate.kind === 'lab' && alternate.lab) {
+    const r = alternate.lab.range;
+    const [sr, sg, sb] = labToSrgb(alternate.lab.white, [
+      at(0) * 100,
+      r[0] + at(1) * (r[1] - r[0]),
+      r[2] + at(2) * (r[3] - r[2]),
+    ]);
+    return [to255(sr), to255(sg), to255(sb)];
+  }
+  if (alternate.kind === 'gray') {
+    const g = to255(at(0));
+    return [g, g, g];
+  }
+  return [to255(at(0)), to255(at(1)), to255(at(2))];
+}
+
+function paletteRgb(base: ColorSpace, lookup: Uint8Array, off: number): [number, number, number] {
+  if (base.kind === 'rgb') return [lookup[off] ?? 0, lookup[off + 1] ?? 0, lookup[off + 2] ?? 0];
+  if (base.kind === 'lab' && base.lab) {
+    // §8.6.6.3 — a palette entry is one byte per component, and each is read
+    // over its own component's range: `L*` 0..100, `a*`/`b*` over `/Range`.
+    const r = base.lab.range;
+    const at = (i: number, lo: number, hi: number): number =>
+      lo + ((lookup[off + i] ?? 0) / 255) * (hi - lo);
+    const [sr, sg, sb] = labToSrgb(base.lab.white, [
+      at(0, 0, 100),
+      at(1, r[0], r[1]),
+      at(2, r[2], r[3]),
+    ]);
+    return [Math.round(sr * 255), Math.round(sg * 255), Math.round(sb * 255)];
+  }
+  if (base.kind === 'cmyk') {
+    const c = (lookup[off] ?? 0) / 255;
+    const m = (lookup[off + 1] ?? 0) / 255;
+    const y = (lookup[off + 2] ?? 0) / 255;
+    const k = (lookup[off + 3] ?? 0) / 255;
+    return [
+      Math.round(255 * (1 - c) * (1 - k)),
+      Math.round(255 * (1 - m) * (1 - k)),
+      Math.round(255 * (1 - y) * (1 - k)),
+    ];
+  }
+  const g = lookup[off] ?? 0;
+  return [g, g, g];
+}
+
+// Unpack row-byte-aligned samples (§7.4.4 image data is padded per scanline).
+function unpackSamples(
+  raw: Uint8Array,
+  width: number,
+  height: number,
+  ncomp: number,
+  bpc: number,
+): Uint16Array {
+  const perRow = width * ncomp;
+  const out = new Uint16Array(perRow * height);
+  const rowBytes = Math.ceil((perRow * bpc) / 8);
+  for (let y = 0; y < height; y++) {
+    const rowOff = y * rowBytes;
+    const base = y * perRow;
+    if (bpc === 8) {
+      for (let i = 0; i < perRow; i++) out[base + i] = raw[rowOff + i] ?? 0;
+    } else if (bpc === 16) {
+      for (let i = 0; i < perRow; i++) {
+        out[base + i] = ((raw[rowOff + 2 * i] ?? 0) << 8) | (raw[rowOff + 2 * i + 1] ?? 0);
+      }
+    } else {
+      const mask = (1 << bpc) - 1;
+      let bit = 0;
+      for (let i = 0; i < perRow; i++) {
+        const bytePos = rowOff + (bit >> 3);
+        const shift = 8 - bpc - (bit & 7);
+        out[base + i] = (((raw[bytePos] ?? 0) >> shift) & mask) >>> 0;
+        bit += bpc;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * A JPEG with its `/SMask` folded in, as a PNG.
+ *
+ * A JPEG has no alpha channel, so the only way to honour the mask is to decode
+ * the picture, decode the mask, put them together and re-encode. Both are
+ * usually DCT themselves — 22060_A1_01_Plans.pdf stores each floor plan as a
+ * wash and its line work as a grey JPEG mask of the same 2480x2630 — so this
+ * costs a full baseline decode of two images, and is spent only where a mask
+ * actually exists.
+ *
+ * @returns The recomposed PNG, or `undefined` when either image is beyond the
+ *          baseline decoder — the caller then carries the JPEG through as it is.
+ */
+function maskedJpeg(
+  file: PdfFile,
+  d: PdfDict,
+  jpegBytes: Uint8Array,
+  width: number,
+  height: number,
+): DecodedImage | undefined {
+  const image = decodeJpeg(jpegBytes);
+  if (!image || image.components === 4) return undefined;
+  const alpha = decodeSMask(file, d, image.width, image.height);
+  if (!alpha) return undefined;
+  const color: RawColor =
+    image.components === 1
+      ? { color: 'gray', samples: image.samples }
+      : { color: 'rgb', samples: image.samples };
+  const { color: pngColor, samples } = combineAlpha(color, alpha);
+  return {
+    ok: true,
+    bytes: encodePng(image.width, image.height, pngColor, samples),
+    format: 'png',
+    widthPx: width,
+    heightPx: height,
+  };
+}
+
+// --- /SMask alpha -----------------------------------------------------------
+
+interface Alpha {
+  readonly data: Uint8Array; // 8-bit, width*height
+}
+
+function decodeSMask(file: PdfFile, d: PdfDict, width: number, height: number): Alpha | undefined {
+  const sm = file.resolve(d.get('SMask') ?? PDF_NULL);
+  if (!(sm instanceof PdfStream)) return undefined;
+  const sw = intOf(file.get(sm.dict, 'Width'));
+  const sh = intOf(file.get(sm.dict, 'Height'));
+  if (sw <= 0 || sh <= 0) return undefined;
+  const maskFilters = filterNames(file, sm.dict);
+  const maskLast = maskFilters[maskFilters.length - 1];
+  // A mask is an image like any other and may be a JPEG itself.
+  const decoded =
+    maskLast === 'DCTDecode' || maskLast === 'DCT'
+      ? jpegSamples(applyChainExceptLast(maskFilters, sm.data))
+      : decodeToSamples(file, sm, maskFilters, sw, sh);
+  if (decoded === undefined || typeof decoded === 'string') return undefined;
+  const ch = decoded.color === 'rgb' ? 3 : 1;
+  // The mask is grayscale; take its first channel and resample to the image grid.
+  const gray = new Uint8Array(sw * sh);
+  for (let i = 0; i < sw * sh; i++) gray[i] = decoded.samples[i * ch]!;
+  if (sw === width && sh === height) return { data: gray };
+  const out = new Uint8Array(width * height);
+  for (let y = 0; y < height; y++) {
+    const sy = Math.min(sh - 1, Math.floor((y * sh) / height));
+    for (let x = 0; x < width; x++) {
+      const sx = Math.min(sw - 1, Math.floor((x * sw) / width));
+      out[y * width + x] = gray[sy * sw + sx]!;
+    }
+  }
+  return { data: out };
+}
+
+/** A DCT-coded mask decoded to samples, or `undefined` past the baseline decoder. */
+function jpegSamples(bytes: Uint8Array): RawColor | undefined {
+  const decoded = decodeJpeg(bytes);
+  if (!decoded || decoded.components === 4) return undefined;
+  return decoded.components === 1
+    ? { color: 'gray', samples: decoded.samples }
+    : { color: 'rgb', samples: decoded.samples };
+}
+
+/**
+ * §8.6.4.4 — a four-ink JPEG taken apart and given back as the colours it
+ * paints, through the image's colour space and its `/Decode` (§8.9.5.2) as any
+ * other sampled CMYK image is, with an `/SMask` folded in where it has one.
+ *
+ * @returns The picture as a PNG, or `undefined` where the JPEG is not four
+ *          inks or is past the baseline decoder — it then travels as it is.
+ */
+function cmykJpeg(
+  file: PdfFile,
+  d: PdfDict,
+  jpegBytes: Uint8Array,
+  width: number,
+  height: number,
+): DecodedImage | undefined {
+  const image = decodeJpeg(jpegBytes);
+  if (image?.components !== 4) return undefined;
+  const cs = resolveColorSpace(file, d.get('ColorSpace') ?? d.get('CS'));
+  const inks: ColorSpace = cs?.components === 4 ? cs : { kind: 'cmyk', components: 4 };
+  const px = image.width * image.height;
+  const color = toColor(inks, Uint16Array.from(image.samples), px, 8, decodeArrayOf(file, d));
+  const alpha = hasSMask(file, d) ? decodeSMask(file, d, image.width, image.height) : undefined;
+  const { color: pngColor, samples } = alpha
+    ? combineAlpha(color, alpha)
+    : { color: color.color, samples: color.samples };
+  return {
+    ok: true,
+    bytes: encodePng(image.width, image.height, pngColor, samples),
+    format: 'png',
+    widthPx: width,
+    heightPx: height,
+  };
+}
+
+function combineAlpha(color: RawColor, alpha: Alpha): { color: PngColor; samples: Uint8Array } {
+  const px = alpha.data.length;
+  if (color.color === 'gray') {
+    const out = new Uint8Array(px * 2);
+    for (let i = 0; i < px; i++) {
+      out[i * 2] = color.samples[i]!;
+      out[i * 2 + 1] = alpha.data[i]!;
+    }
+    return { color: 'gray-alpha', samples: out };
+  }
+  const out = new Uint8Array(px * 4);
+  for (let i = 0; i < px; i++) {
+    out[i * 4] = color.samples[i * 3]!;
+    out[i * 4 + 1] = color.samples[i * 3 + 1]!;
+    out[i * 4 + 2] = color.samples[i * 3 + 2]!;
+    out[i * 4 + 3] = alpha.data[i]!;
+  }
+  return { color: 'rgba', samples: out };
+}
+
+// --- filters ----------------------------------------------------------------
+
+function filterNames(file: PdfFile, d: PdfDict): Array<string> {
+  // §8.9.7 Table 93 — an inline image abbreviates the key and the filter alike.
+  const f = file.resolve(d.get('Filter') ?? d.get('F') ?? PDF_NULL);
+  const arr: ReadonlyArray<PdfValue> = Array.isArray(f) ? f : [f];
+  const out: Array<string> = [];
+  for (const x of arr) {
+    const r = file.resolve(x);
+    if (r instanceof PdfName) out.push(FILTER_ABBREVIATIONS[r.value] ?? r.value);
+  }
+  return out;
+}
+
+/** §8.9.7 Table 93 — the short name an inline image writes a filter under. */
+const FILTER_ABBREVIATIONS: Readonly<Record<string, string>> = {
+  AHx: 'ASCIIHexDecode',
+  A85: 'ASCII85Decode',
+  LZW: 'LZWDecode',
+  Fl: 'FlateDecode',
+  RL: 'RunLengthDecode',
+  CCF: 'CCITTFaxDecode',
+  DCT: 'DCTDecode',
+};
+
+// Decode every filter (the sample path never sees DCT/JPX/CCITT — those are
+// handled before this is called), then reverse any /Predictor. Flate and LZW
+// (EP12) both carry the predictor in /DecodeParms.
+function decodeChain(
+  file: PdfFile,
+  stream: PdfStream,
+  filters: ReadonlyArray<string>,
+): Uint8Array | undefined {
+  let data = stream.data;
+  let mayPredict = false;
+  for (const f of filters) {
+    if (f === 'FlateDecode' || f === 'Fl') {
+      try {
+        data = unzlibSync(data);
+        mayPredict = true;
+      } catch {
+        return undefined;
+      }
+    } else if (f === 'LZWDecode' || f === 'LZW') {
+      data = lzwDecode(data, lzwEarlyChange(file, stream.dict));
+      mayPredict = true;
+    } else if (f === 'RunLengthDecode' || f === 'RL') {
+      data = runLengthDecode(data);
+    } else if (f === 'ASCII85Decode' || f === 'A85') {
+      data = ascii85Decode(data);
+    } else if (f === 'ASCIIHexDecode' || f === 'AHx') {
+      data = asciiHexDecode(data);
+    } else {
+      return undefined;
+    }
+  }
+  return mayPredict ? applyPredictor(file, stream.dict, data) : data;
+}
+
+function applyChainExceptLast(filters: ReadonlyArray<string>, raw: Uint8Array): Uint8Array {
+  let data = raw;
+  for (let i = 0; i < filters.length - 1; i++) {
+    const f = filters[i]!;
+    if (f === 'FlateDecode' || f === 'Fl') {
+      try {
+        data = unzlibSync(data);
+      } catch {
+        /* leave undecoded */
+      }
+    } else if (f === 'LZWDecode' || f === 'LZW') data = lzwDecode(data, 1);
+    else if (f === 'RunLengthDecode' || f === 'RL') data = runLengthDecode(data);
+    else if (f === 'ASCII85Decode' || f === 'A85') data = ascii85Decode(data);
+    else if (f === 'ASCIIHexDecode' || f === 'AHx') data = asciiHexDecode(data);
+  }
+  return data;
+}
+
+// §7.4.4.4 — reverse a /Predictor from the stream's /DecodeParms (shared math
+// in predictor.ts).
+function applyPredictor(file: PdfFile, d: PdfDict, data: Uint8Array): Uint8Array {
+  const parms = decodeParmsOf(file, d);
+  if (!parms) return data;
+  const predictor = intOf(file.get(parms, 'Predictor'));
+  if (predictor < 2) return data;
+  return reversePredictor(data, {
+    predictor,
+    colors: intOf(file.get(parms, 'Colors')) || 1,
+    bitsPerComponent: intOf(file.get(parms, 'BitsPerComponent')) || 8,
+    columns: intOf(file.get(parms, 'Columns')) || 1,
+  });
+}
+
+// §7.4.4.2 — LZW, the coder TIFF and PDF share (core/lzw). Output is bounded by
+// the per-image pixel guard to cap a decompression bomb.
+const MAX_LZW_OUT = MAX_PIXELS * 4;
+
+function lzwDecode(data: Uint8Array, earlyChange: number): Uint8Array {
+  return lzwDecodeMsb(data, { earlyChange, limit: MAX_LZW_OUT });
+}
+
+function lzwEarlyChange(file: PdfFile, d: PdfDict): number {
+  const parms = decodeParmsOf(file, d);
+  const ec = parms?.get('EarlyChange');
+  return ec !== undefined && file.resolve(ec) === 0 ? 0 : 1;
+}
+
+// --- small helpers ----------------------------------------------------------
+
+function decodeParmsOf(file: PdfFile, d: PdfDict): PdfDict | undefined {
+  const p = file.resolve(d.get('DecodeParms') ?? d.get('DP') ?? PDF_NULL);
+  if (p instanceof Map) return p;
+  if (Array.isArray(p)) {
+    for (const e of p) {
+      const r = file.resolve(e);
+      if (r instanceof Map) return r; // the predictor parms (Flate / LZW carry them)
+    }
+  }
+  return undefined;
+}
+
+function decodeArrayOf(file: PdfFile, d: PdfDict): Array<number> | undefined {
+  const v = file.resolve(d.get('Decode') ?? d.get('D') ?? PDF_NULL);
+  if (!Array.isArray(v)) return undefined;
+  const nums = v.map((x) => (typeof x === 'number' ? x : NaN));
+  return nums.some((n) => !Number.isFinite(n)) ? undefined : nums;
+}
+
+function hasSMask(file: PdfFile, d: PdfDict): boolean {
+  return file.resolve(d.get('SMask') ?? PDF_NULL) instanceof PdfStream;
+}
+
+function valueToBytes(file: PdfFile, v: PdfValue | undefined): Uint8Array | undefined {
+  const r = file.resolve(v ?? PDF_NULL);
+  if (r instanceof PdfHexString) return r.bytes;
+  if (typeof r === 'string') {
+    const out = new Uint8Array(r.length);
+    for (let i = 0; i < r.length; i++) out[i] = r.charCodeAt(i) & 0xff;
+    return out;
+  }
+  if (r instanceof PdfStream) return file.streamData(r);
+  return undefined;
+}
+
+function intOf(v: PdfValue | undefined): number {
+  return typeof v === 'number' ? Math.round(v) : 0;
+}
+
+function boolOf(v: PdfValue | undefined): boolean {
+  return v === true;
+}
+
+function clamp01(x: number): number {
+  return x < 0 ? 0 : x > 1 ? 1 : x;
+}
+
+function hexVal(c: number): number {
+  if (c >= 0x30 && c <= 0x39) return c - 0x30;
+  if (c >= 0x41 && c <= 0x46) return c - 0x41 + 10;
+  if (c >= 0x61 && c <= 0x66) return c - 0x61 + 10;
+  return -1;
+}
+
+function fail(severity: 'dropped' | 'degraded', detail: string): DecodedImage {
+  return { ok: false, severity, detail };
+}

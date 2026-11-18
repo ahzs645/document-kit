@@ -1,0 +1,784 @@
+// E-PDF EP1/EP7 — the document layer. Takes a whole PDF byte buffer and exposes
+// its objects: the cross-reference table — classic `xref` + `trailer` AND
+// cross-reference STREAMS (/Type /XRef, PDF 1.5+), following the /Prev chain and
+// hybrid /XRefStm pointers — indirect-reference resolution with a cache
+// (including objects packed inside OBJECT STREAMS, /Type /ObjStm), the page tree
+// (walked with attribute inheritance), and stream decoding (FlateDecode +
+// predictors via fflate). A brute-force object scan recovers files whose xref is
+// broken, and itself indexes any object streams it finds.
+
+import { unzlibSync } from 'fflate';
+
+import { buildDecryptor } from './decrypt';
+import { Lexer } from './lexer';
+import { parseIndirectObject, parseObject } from './parser';
+import { reversePredictor } from './predictor';
+import { ascii85Decode, asciiHexDecode, runLengthDecode } from './stream-filters';
+import type { Decryptor } from './decrypt';
+import type { PdfArray, PdfDict, PdfValue } from '../pdf/objects';
+import { PDF_NULL, PdfName, PdfRef, PdfStream } from '../pdf/objects';
+import { lzwDecodeMsb } from '../core/lzw';
+
+/** A PDF rectangle `[llx, lly, urx, ury]` in default user-space units (§7.9.5). */
+export type Rectangle = readonly [number, number, number, number];
+
+/** A resolved leaf page: its dictionary plus its inherited `/MediaBox` and `/Resources`. */
+export interface PdfPage {
+  readonly dict: PdfDict;
+  readonly mediaBox: Rectangle;
+  /**
+   * §14.11.2 `/CropBox` — the region of the page a viewer SHOWS, which is what
+   * a page's size means to anyone looking at it. Defaults to the media box and
+   * is clipped to it; inherited down the page tree like the media box is.
+   */
+  readonly cropBox: Rectangle;
+  /**
+   * §14.11.1 `/Rotate` — how far the page turns CLOCKWISE when it is shown,
+   * normalised to 0, 90, 180 or 270 and inherited down the page tree.
+   */
+  readonly rotate: 0 | 90 | 180 | 270;
+  readonly resources: PdfDict | undefined;
+}
+
+// A cross-reference entry: a byte offset for a normal object, or a (stream, index)
+// pair for an object packed inside an object stream (§7.5.7).
+type XrefEntry =
+  | { readonly kind: 'uncompressed'; readonly offset: number }
+  | { readonly kind: 'compressed'; readonly streamObj: number; readonly index: number };
+
+const DEFAULT_MEDIA_BOX: Rectangle = [0, 0, 612, 792]; // US Letter, the PDF default
+const MAX_PAGES = 50_000; // DoS guard on a pathological page tree
+const MAX_OBJSTM_N = 200_000; // DoS guard on an object stream's object count
+
+/**
+ * The document layer (E-PDF EP1/EP7): wraps a whole PDF byte buffer and exposes
+ * its objects — the cross-reference table (classic `xref` + `trailer` and
+ * cross-reference streams), cached indirect-reference resolution (including
+ * objects packed inside object streams), the page tree (walked with attribute
+ * inheritance), and stream decoding (FlateDecode + predictors). A brute-force
+ * object scan recovers files whose xref is broken. Construct via {@link PdfFile.parse}.
+ */
+export class PdfFile {
+  private readonly cache = new Map<number, PdfValue>();
+  // objStm object number → its decoded members (objNum → value), decoded once.
+  private readonly objStmCache = new Map<number, Map<number, PdfValue>>();
+  // The standard security handler, when the document is encrypted (EP9).
+  private decryptor: Decryptor | undefined;
+  // Why an encrypted document has none: its password was refused, or its handler.
+  private refused: 'password' | 'handler' | undefined;
+  private encryptObjNum = -1;
+
+  private constructor(
+    private readonly buf: Uint8Array,
+    private readonly xref: ReadonlyMap<number, XrefEntry>,
+    readonly trailer: PdfDict,
+    /** Caller-supplied decoders, by `/Filter` name (see {@link StreamFilters}). */
+    readonly filters: StreamFilters = {},
+  ) {}
+
+  /**
+   * Parse a whole PDF byte buffer: read the cross-reference chain (or brute-force
+   * recover a broken one) and initialize decryption from `/Encrypt` (§7.6).
+   *
+   * @param bytes    The complete PDF file bytes.
+   * @param password The user password for an encrypted source (EP14); the empty
+   *                 string opens permissions-only encryption.
+   * @param filters  Decoders for `/Filter` names this reader does not implement.
+   * @returns A ready-to-query {@link PdfFile}.
+   */
+  static parse(bytes: Uint8Array, password = '', filters: StreamFilters = {}): PdfFile {
+    // Filter names met while the cross-reference is being built, before any
+    // PdfFile exists to hold them.
+    const unknownFilters = new Set<string>();
+    let xref = new Map<number, XrefEntry>();
+    let trailer: PdfDict = new Map();
+    try {
+      const start = findStartXref(bytes);
+      if (start >= 0) {
+        const built = readXrefChain(bytes, start, unknownFilters, filters);
+        xref = built.xref;
+        trailer = built.trailer;
+      }
+    } catch {
+      // fall through to the brute-force recovery below
+    }
+    // Recover when the xref was missing/broken or the trailer has no /Root: scan
+    // for every `N G obj` and index any object streams found.
+    if (xref.size === 0 || !(trailer.get('Root') instanceof PdfRef)) {
+      const scanned = bruteForceScan(bytes, unknownFilters, filters);
+      for (const [id, entry] of scanned.xref) if (!xref.has(id)) xref.set(id, entry);
+      if (!(trailer.get('Root') instanceof PdfRef) && scanned.root) {
+        trailer = new Map(trailer);
+        trailer.set('Root', scanned.root);
+      }
+    }
+    const file = new PdfFile(bytes, xref, trailer, filters);
+    for (const name of unknownFilters) file.unknownFilters.add(name);
+    file.initEncryption(password);
+    return file;
+  }
+
+  /**
+   * Build the decryptor from `/Encrypt` (§7.6). Runs before any other object is
+   * resolved, so the `/Encrypt` dictionary itself is read in the clear; its object
+   * is then never decrypted.
+   */
+  private initEncryption(password: string): void {
+    const encVal = this.trailer.get('Encrypt');
+    if (encVal === undefined) return;
+    if (encVal instanceof PdfRef) this.encryptObjNum = encVal.id;
+    const enc = this.resolve(encVal);
+    if (!(enc instanceof Map)) return;
+    const id = this.trailer.get('ID');
+    const built = buildDecryptor(enc, Array.isArray(id) ? id : undefined, password);
+    if ('decryptor' in built) this.decryptor = built.decryptor;
+    else this.refused = built.refused;
+  }
+
+  /** Resolve a stream's `/Length` when it is an indirect reference. */
+  private readonly lengthResolver = (r: PdfRef): number | undefined => {
+    const n = this.resolve(r);
+    return typeof n === 'number' ? n : undefined;
+  };
+
+  /**
+   * Dereference one level: a `PdfRef` becomes the object it points at (parsed and
+   * cached); any other value is returned unchanged. Decrypts each resolved
+   * string/stream (§7.6) except the `/Encrypt` dictionary itself, and guards
+   * against self-referential cycles.
+   */
+  resolve(value: PdfValue): PdfValue {
+    if (!(value instanceof PdfRef)) return value;
+    const cached = this.cache.get(value.id);
+    if (cached !== undefined) return cached;
+    const entry = this.xref.get(value.id);
+    if (entry === undefined) return PDF_NULL;
+    this.cache.set(value.id, PDF_NULL); // guard against a self-referential cycle
+    let result: PdfValue = PDF_NULL;
+    if (entry.kind === 'uncompressed') {
+      if (entry.offset >= 0 && entry.offset < this.buf.length) {
+        const obj = parseIndirectObject(new Lexer(this.buf, entry.offset), this.lengthResolver);
+        result = obj ? obj.value : PDF_NULL;
+        // Decrypt every string/stream (§7.6) — except the /Encrypt dict itself,
+        // whose strings are the keys. Compressed objects are already plaintext
+        // (their object stream was decrypted as a whole).
+        if (this.decryptor && value.id !== this.encryptObjNum) {
+          result = this.decryptor.decrypt(result, value.id, obj?.generation ?? 0);
+        }
+      }
+    } else {
+      result = this.objectFromStream(entry.streamObj).get(value.id) ?? PDF_NULL;
+    }
+    this.cache.set(value.id, result);
+    return result;
+  }
+
+  /** Decode (once) the members of an object stream (§7.5.7) and return objNum → value. */
+  private objectFromStream(streamObj: number): Map<number, PdfValue> {
+    const cached = this.objStmCache.get(streamObj);
+    if (cached) return cached;
+    const out = new Map<number, PdfValue>();
+    this.objStmCache.set(streamObj, out); // cycle guard
+    const entry = this.xref.get(streamObj);
+    if (!entry || entry.kind !== 'uncompressed') return out;
+    const obj = parseIndirectObject(new Lexer(this.buf, entry.offset), this.lengthResolver);
+    if (!obj || !(obj.value instanceof PdfStream)) return out;
+    let stream = obj.value;
+    if (this.decryptor) {
+      const dec = this.decryptor.decrypt(stream, streamObj, obj.generation);
+      if (dec instanceof PdfStream) stream = dec;
+    }
+    const data = inflateStream(stream, this.unknownFilters, this.filters);
+    const first = numOf(this.resolve(stream.dict.get('First') ?? PDF_NULL));
+    for (const member of objStmHeader(
+      data,
+      numOf(this.resolve(stream.dict.get('N') ?? PDF_NULL)),
+    )) {
+      out.set(member.id, parseObject(new Lexer(data, first + member.off), this.lengthResolver));
+    }
+    return out;
+  }
+
+  /** Resolve `dict[key]` in one step (look up then dereference). */
+  get(dict: PdfDict, key: string): PdfValue {
+    return this.resolve(dict.get(key) ?? PDF_NULL);
+  }
+
+  /** The document catalog (`/Root`), or an empty dict when it cannot be resolved. */
+  get catalog(): PdfDict {
+    const root = this.resolve(this.trailer.get('Root') ?? PDF_NULL);
+    return root instanceof Map ? root : new Map();
+  }
+
+  /**
+   * The document is encrypted but no decryptor could be built (an unsupported
+   * handler, or a refused password) — its content is unreadable.
+   */
+  get encryptionUnsupported(): boolean {
+    return this.trailer.get('Encrypt') !== undefined && this.decryptor === undefined;
+  }
+
+  /**
+   * §7.6.3.4 — the document is encrypted and the password it was opened with is
+   * neither its user's nor its owner's, by the verifiers the file itself stores.
+   */
+  get passwordRefused(): boolean {
+    return this.refused === 'password';
+  }
+
+  /** The leaf pages, in document order, each with its inherited `/MediaBox` and `/Resources`. */
+  pages(): Array<PdfPage> {
+    const out: Array<PdfPage> = [];
+    const root = this.get(this.catalog, 'Pages');
+    if (root instanceof Map) this.walkPageTree(root, {}, out, new Set());
+    return out;
+  }
+
+  /**
+   * Recurse the `/Pages` tree, accumulating leaf pages into `out` with inherited
+   * `/MediaBox` and `/Resources`. Bounded by `MAX_PAGES` and a `seen` set (cycle
+   * guard).
+   */
+  private walkPageTree(
+    node: PdfDict,
+    inherited: {
+      mediaBox?: Rectangle | undefined;
+      cropBox?: Rectangle | undefined;
+      resources?: PdfDict | undefined;
+      rotate?: PdfPage['rotate'] | undefined;
+    },
+    out: Array<PdfPage>,
+    seen: Set<PdfDict>,
+  ): void {
+    if (out.length >= MAX_PAGES || seen.has(node)) return;
+    seen.add(node);
+    const mediaBox = readRectangle(this.get(node, 'MediaBox')) ?? inherited.mediaBox;
+    const cropBox = readRectangle(this.get(node, 'CropBox')) ?? inherited.cropBox;
+    const resourcesVal = this.get(node, 'Resources');
+    const resources = resourcesVal instanceof Map ? resourcesVal : inherited.resources;
+    const rotate = readRotate(this.get(node, 'Rotate')) ?? inherited.rotate;
+    const type = node.get('Type');
+    const kids = this.get(node, 'Kids');
+    if (type instanceof PdfName && type.value === 'Pages' && Array.isArray(kids)) {
+      for (const kid of kids) {
+        const kidNode = this.resolve(kid);
+        if (kidNode instanceof Map) {
+          this.walkPageTree(kidNode, { mediaBox, cropBox, resources, rotate }, out, seen);
+        }
+        if (out.length >= MAX_PAGES) break;
+      }
+      return;
+    }
+    // A leaf /Page (or an untyped node with no kids).
+    // §7.7.3.3 — a media box with no area bounds nothing: a viewer shows such a
+    // page at the size a page has when it states none. Taken at its word,
+    // boundingBox_invalid.pdf's first page was a sheet of no size, every word
+    // on it stood outside it, and the page came back blank.
+    const media = mediaBox !== undefined && hasArea(mediaBox) ? mediaBox : DEFAULT_MEDIA_BOX;
+    out.push({
+      dict: node,
+      mediaBox: media,
+      cropBox: shownBox(media, cropBox),
+      rotate: rotate ?? 0,
+      resources,
+    });
+  }
+
+  /**
+   * A page's concatenated, decoded content stream bytes (`/Contents` may be a
+   * single stream or an array of streams joined with a separator, per §7.8.2).
+   */
+  pageContent(page: PdfPage): Uint8Array {
+    const contents = this.get(page.dict, 'Contents');
+    const streams: Array<PdfStream> = [];
+    if (contents instanceof PdfStream) streams.push(contents);
+    else if (Array.isArray(contents)) {
+      for (const c of contents) {
+        const s = this.resolve(c);
+        if (s instanceof PdfStream) streams.push(s);
+      }
+    }
+    const parts = streams.map((s) => this.streamData(s));
+    return concatWithSpaces(parts);
+  }
+
+  /**
+   * Decode a stream's bytes, applying its `/Filter` chain (FlateDecode + any
+   * `/Predictor` supported; unknown filters pass through undecoded).
+   */
+  streamData(stream: PdfStream): Uint8Array {
+    let data = stream.data;
+    const filter = this.resolve(stream.dict.get('Filter') ?? PDF_NULL);
+    const filters: Array<PdfValue> = Array.isArray(filter) ? filter : [filter];
+    let flate = false;
+    for (const f of filters) {
+      if (!(f instanceof PdfName)) continue;
+      if (f.value === 'FlateDecode' || f.value === 'Fl') {
+        try {
+          data = unzlibSync(data);
+          flate = true;
+        } catch {
+          // leave undecoded on a malformed stream
+        }
+      } else if (GENERAL_FILTERS[f.value]) {
+        // §7.4.2–7.4.5 — transport, undone for any stream.
+        data = GENERAL_FILTERS[f.value]!(data);
+        flate = true; // …and a predictor may sit on top of it, as with Flate
+      } else if (f.value === 'LZWDecode' || f.value === 'LZW') {
+        // §7.4.4 — LZW takes one parameter of its own: `/EarlyChange` says
+        // whether the code width grows one code early, and 1 is the default.
+        const parms = this.resolve(stream.dict.get('DecodeParms') ?? PDF_NULL);
+        const p = Array.isArray(parms) ? this.resolve(parms[0] ?? PDF_NULL) : parms;
+        const early = p instanceof Map ? this.resolve(p.get('EarlyChange') ?? PDF_NULL) : undefined;
+        data = lzwDecodeMsb(data, { earlyChange: early === 0 ? 0 : 1, limit: MAX_LZW_OUT });
+        flate = true;
+      } else if (this.filters[f.value]) {
+        const decoded = runFilter(this.filters[f.value], data);
+        if (decoded) data = decoded;
+        else this.unknownFilters.add(f.value);
+      } else if (!PASSTHROUGH_FILTERS.has(f.value)) {
+        // A filter we cannot undo leaves the bytes as they arrived, and what
+        // the caller then reads is not the stream but its ciphertext. Said
+        // nowhere, that is a document which simply comes out empty:
+        // Brotli-Prototype-FileA.pdf compresses its CROSS-REFERENCE stream with
+        // `/BrotliDecode` (PDF 2.0), so its page tree never resolves and all
+        // twenty-five pages go missing without a word.
+        this.unknownFilters.add(f.value);
+      }
+    }
+    return flate ? applyStreamPredictor(this, stream.dict, data) : data;
+  }
+
+  /** Filter names met in this file that nothing here can undo. */
+  readonly unknownFilters = new Set<string>();
+}
+
+/**
+ * A decoder for one `/Filter` name, supplied by the caller.
+ *
+ * §7.4 leaves the filter set open, and a reader is not obliged to implement
+ * every one — but it cannot pretend, either: an undecoded stream is not the
+ * stream. Brotli-Prototype-FileA.pdf compresses all thirty of its streams with
+ * `/BrotliDecode` (PDF 2.0), including the cross-reference, so unread it is a
+ * document with no pages at all.
+ *
+ * Rather than carry a decoder for every filter anyone might write — Brotli
+ * alone is RFC 7932's context-modelled Huffman scheme and a 122 KB static
+ * dictionary, in every bundle, for a filter almost nothing produces — the
+ * reader takes one from whoever needs it:
+ *
+ * ```ts
+ * // browser: any wasm/JS decoder you ship — brotli-dec-wasm is ~200 KB
+ * import brotliPromise from 'brotli-dec-wasm';
+ * const brotli = await brotliPromise;
+ * Ream.parse(pdf, { filters: { BrotliDecode: (b) => brotli.decompress(b) } });
+ * ```
+ *
+ * ```ts
+ * // node, where the runtime already carries one
+ * import { brotliDecompressSync } from 'node:zlib';
+ * Ream.parse(pdf, { filters: { BrotliDecode: (b) => brotliDecompressSync(b) } });
+ * ```
+ *
+ * A decoder that throws is treated as one that was never supplied: the filter
+ * is reported unreadable rather than its failure escaping into the parse.
+ */
+export type StreamFilter = (bytes: Uint8Array) => Uint8Array;
+
+/** Caller-supplied {@link StreamFilter}s, keyed by `/Filter` name (no slash). */
+export type StreamFilters = Readonly<Record<string, StreamFilter | undefined>>;
+
+/** Run a supplied filter, treating a throw as a filter that cannot decode. */
+function runFilter(filter: StreamFilter | undefined, data: Uint8Array): Uint8Array | undefined {
+  if (!filter) return undefined;
+  try {
+    const out = filter(data);
+    return out.length > 0 ? out : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// The image CODECS: undoing one is decoding a picture, which is
+// `./image-decode`'s work and not this. `streamData` leaving them alone is not
+// a failure to report.
+//
+// The general-purpose filters (§7.4.2–7.4.5) are NOT here any more. They say
+// nothing about what the bytes mean — they are transport, and a stream still
+// wearing one has not been read. Passed through on the reasoning that
+// "image-decode undoes them", they left every non-image stream raw:
+// asciihexdecode.pdf writes its whole page as `42540A2F4631…`, which is
+// `BT /F1 30 Tf …`, and the page came back blank.
+/** A decompressed LZW stream larger than this is a bomb, not a document. */
+const MAX_LZW_OUT = 1 << 28;
+
+/** §7.4.2–7.4.5 — the filters that are transport, whatever the stream holds. */
+const GENERAL_FILTERS: Readonly<Record<string, (b: Uint8Array) => Uint8Array>> = {
+  ASCIIHexDecode: asciiHexDecode,
+  AHx: asciiHexDecode,
+  ASCII85Decode: ascii85Decode,
+  A85: ascii85Decode,
+  RunLengthDecode: runLengthDecode,
+  RL: runLengthDecode,
+};
+
+const PASSTHROUGH_FILTERS = new Set([
+  'DCTDecode',
+  'DCT',
+  'JPXDecode',
+  'JBIG2Decode',
+  'CCITTFaxDecode',
+  'CCF',
+  'Crypt',
+]);
+
+// --- cross-reference table -------------------------------------------------
+
+function findStartXref(buf: Uint8Array): number {
+  const tail = lastIndexOfAscii(buf, 'startxref');
+  if (tail < 0) return -1;
+  const lexer = new Lexer(buf, tail + 'startxref'.length);
+  const tok = lexer.nextToken();
+  return tok.kind === 'num' ? tok.value : -1;
+}
+
+interface XrefSection {
+  readonly xref: Map<number, XrefEntry>;
+  readonly trailer: PdfDict;
+}
+
+// Read the section at `offset` (classic table or xref stream), then follow the
+// /Prev chain and any hybrid /XRefStm pointers (newest entries win).
+function readXrefChain(
+  buf: Uint8Array,
+  offset: number,
+  unknown?: Set<string>,
+  filters: StreamFilters = {},
+): XrefSection {
+  const xref = new Map<number, XrefEntry>();
+  let trailer: PdfDict = new Map();
+  const visited = new Set<number>();
+  const queue: Array<number> = [offset];
+  while (queue.length > 0) {
+    const at = queue.shift()!;
+    if (at < 0 || at >= buf.length || visited.has(at)) continue;
+    visited.add(at);
+    const section = readXrefAt(buf, at, unknown, filters);
+    if (!section) continue;
+    for (const [id, entry] of section.xref) if (!xref.has(id)) xref.set(id, entry);
+    if (trailer.size === 0) trailer = section.trailer;
+    const xrefStm = section.trailer.get('XRefStm'); // hybrid-reference file
+    if (typeof xrefStm === 'number') queue.push(xrefStm);
+    const prev = section.trailer.get('Prev');
+    if (typeof prev === 'number') queue.push(prev);
+  }
+  return { xref, trailer };
+}
+
+// Dispatch by what sits at the offset: the `xref` keyword (a classic table) or an
+// `N G obj` definition (a cross-reference stream).
+function readXrefAt(
+  buf: Uint8Array,
+  offset: number,
+  unknown?: Set<string>,
+  filters: StreamFilters = {},
+): XrefSection | undefined {
+  const lexer = new Lexer(buf, offset);
+  const head = lexer.nextToken();
+  if (head.kind === 'keyword' && head.value === 'xref') return readClassicXref(lexer);
+  const obj = parseIndirectObject(new Lexer(buf, offset));
+  if (obj && obj.value instanceof PdfStream) return readXrefStream(obj.value, unknown, filters);
+  return undefined;
+}
+
+// A classic `xref` subsection list followed by `trailer << … >>`.
+function readClassicXref(lexer: Lexer): XrefSection | undefined {
+  const xref = new Map<number, XrefEntry>();
+  for (;;) {
+    const tok = lexer.nextToken();
+    if (tok.kind === 'keyword' && tok.value === 'trailer') break;
+    if (tok.kind !== 'num') return undefined;
+    const first = tok.value;
+    const countTok = lexer.nextToken();
+    if (countTok.kind !== 'num') return undefined;
+    const count = countTok.value;
+    for (let i = 0; i < count; i++) {
+      const off = lexer.nextToken();
+      const gen = lexer.nextToken();
+      const type = lexer.nextToken();
+      if (off.kind !== 'num' || gen.kind !== 'num' || type.kind !== 'keyword') return undefined;
+      if (type.value === 'n' && !xref.has(first + i)) {
+        xref.set(first + i, { kind: 'uncompressed', offset: off.value });
+      }
+    }
+  }
+  const trailerVal = parseObject(lexer);
+  return { xref, trailer: trailerVal instanceof Map ? trailerVal : new Map() };
+}
+
+// A cross-reference stream (§7.5.8): /W field widths, /Index subsections, and
+// fixed-width binary rows of (type, field2, field3).
+function readXrefStream(
+  stream: PdfStream,
+  unknown?: Set<string>,
+  filters: StreamFilters = {},
+): XrefSection | undefined {
+  const dict = stream.dict;
+  const wv = dict.get('W');
+  if (!Array.isArray(wv) || wv.length < 3) return undefined;
+  const w0 = numOf(wv[0]);
+  const w1 = numOf(wv[1]);
+  const w2 = numOf(wv[2]);
+  const rowLen = w0 + w1 + w2;
+  if (rowLen <= 0) return undefined;
+  const data = inflateStream(stream, unknown, filters);
+  const size = numOf(dict.get('Size'));
+  const indexV = dict.get('Index');
+  const index = Array.isArray(indexV) ? indexV.map(numOf) : [0, size];
+
+  const xref = new Map<number, XrefEntry>();
+  let pos = 0;
+  for (let s = 0; s + 1 < index.length; s += 2) {
+    const start = index[s]!;
+    const count = index[s + 1]!;
+    for (let i = 0; i < count && pos + rowLen <= data.length; i++) {
+      const type = w0 === 0 ? 1 : readBE(data, pos, w0); // default type 1 (§7.5.8.2)
+      const f2 = readBE(data, pos + w0, w1);
+      const f3 = readBE(data, pos + w0 + w1, w2);
+      pos += rowLen;
+      const id = start + i;
+      if (xref.has(id)) continue;
+      if (type === 1) xref.set(id, { kind: 'uncompressed', offset: f2 });
+      else if (type === 2) xref.set(id, { kind: 'compressed', streamObj: f2, index: f3 });
+    }
+  }
+  return { xref, trailer: dict };
+}
+
+// --- object streams ---------------------------------------------------------
+
+// The N leading `objNum offset` pairs of an object stream (§7.5.7).
+function objStmHeader(data: Uint8Array, n: number): Array<{ id: number; off: number }> {
+  const out: Array<{ id: number; off: number }> = [];
+  const lexer = new Lexer(data, 0);
+  for (let i = 0; i < Math.min(n, MAX_OBJSTM_N); i++) {
+    const idTok = lexer.nextToken();
+    const offTok = lexer.nextToken();
+    if (idTok.kind !== 'num' || offTok.kind !== 'num') break;
+    out.push({ id: idTok.value, off: offTok.value });
+  }
+  return out;
+}
+
+// FlateDecode + /Predictor, reading the parameters directly from the (directly
+// stored) dict — used while the cross-reference is still being built, so it
+// cannot rely on indirect-reference resolution.
+function inflateStream(
+  stream: PdfStream,
+  unknown?: Set<string>,
+  filters: StreamFilters = {},
+): Uint8Array {
+  let data = stream.data;
+  const filter = stream.dict.get('Filter') ?? PDF_NULL;
+  const chain: Array<PdfValue> = Array.isArray(filter) ? filter : [filter];
+  for (const f of chain) {
+    if (!(f instanceof PdfName)) continue;
+    if (f.value === 'FlateDecode' || f.value === 'Fl') {
+      try {
+        data = unzlibSync(data);
+      } catch {
+        return new Uint8Array(0);
+      }
+    } else if (!PASSTHROUGH_FILTERS.has(f.value)) {
+      // A filter this reader does not implement, and the caller may have
+      // supplied. Nothing here decodes Brotli, and Brotli-Prototype-FileA.pdf
+      // compresses its cross-reference with it: given the decoder the file's
+      // twenty-five pages resolve, and without it there are none.
+      const decoded = runFilter(filters[f.value], data);
+      if (decoded) data = decoded;
+      else unknown?.add(f.value);
+    }
+  }
+  const parmsVal = stream.dict.get('DecodeParms') ?? stream.dict.get('DP');
+  const parms =
+    parmsVal instanceof Map
+      ? parmsVal
+      : Array.isArray(parmsVal)
+        ? parmsVal.find((p): p is PdfDict => p instanceof Map)
+        : undefined;
+  if (parms) {
+    const predictor = numOf(parms.get('Predictor'));
+    if (predictor >= 2) {
+      data = reversePredictor(data, {
+        predictor,
+        colors: numOf(parms.get('Colors')) || 1,
+        bitsPerComponent: numOf(parms.get('BitsPerComponent')) || 8,
+        columns: numOf(parms.get('Columns')) || 1,
+      });
+    }
+  }
+  return data;
+}
+
+// streamData's predictor step (parameters may be indirect here, so resolve them).
+function applyStreamPredictor(file: PdfFile, dict: PdfDict, data: Uint8Array): Uint8Array {
+  const parmsVal = file.get(dict, 'DecodeParms');
+  const parms = parmsVal instanceof Map ? parmsVal : undefined;
+  if (!parms) return data;
+  const predictor = numOf(file.get(parms, 'Predictor'));
+  if (predictor < 2) return data;
+  return reversePredictor(data, {
+    predictor,
+    colors: numOf(file.get(parms, 'Colors')) || 1,
+    bitsPerComponent: numOf(file.get(parms, 'BitsPerComponent')) || 8,
+    columns: numOf(file.get(parms, 'Columns')) || 1,
+  });
+}
+
+// --- brute-force recovery ---------------------------------------------------
+
+// Linear recovery: scan for every `N G obj`, recording the latest offset per
+// object number and the first /Catalog; then index any object streams found, so
+// the objects they pack are reachable too.
+function bruteForceScan(
+  buf: Uint8Array,
+  unknown: Set<string>,
+  filters: StreamFilters = {},
+): {
+  xref: Map<number, XrefEntry>;
+  root: PdfRef | undefined;
+} {
+  const xref = new Map<number, XrefEntry>();
+  const objStmObjs: Array<number> = [];
+  let root: PdfRef | undefined;
+  const lexer = new Lexer(buf);
+  let prev2: { start: number; value: number } | undefined;
+  let prev1: { start: number; value: number } | undefined;
+  for (;;) {
+    lexer.skipWhitespace();
+    const start = lexer.pos;
+    const tok = lexer.nextToken();
+    if (tok.kind === 'eof') break;
+    if (tok.kind === 'keyword' && tok.value === 'obj' && prev2 && prev1) {
+      xref.set(prev2.value, { kind: 'uncompressed', offset: prev2.start });
+      const obj = parseIndirectObject(new Lexer(buf, prev2.start));
+      const value = obj?.value;
+      const dict = value instanceof PdfStream ? value.dict : value;
+      if (dict instanceof Map) {
+        const type = dict.get('Type');
+        if (type instanceof PdfName && type.value === 'Catalog' && root === undefined) {
+          root = new PdfRef(prev2.value, prev1.value);
+        } else if (type instanceof PdfName && type.value === 'ObjStm') {
+          objStmObjs.push(prev2.value);
+        }
+      }
+    }
+    prev2 = prev1;
+    prev1 = tok.kind === 'num' ? { start, value: tok.value } : undefined;
+  }
+  // Index each object stream's members as compressed entries (offsets win), and
+  // recover the /Catalog from inside one if no top-level catalog was found.
+  for (const streamObj of objStmObjs) {
+    const entry = xref.get(streamObj);
+    if (!entry || entry.kind !== 'uncompressed') continue;
+    const obj = parseIndirectObject(new Lexer(buf, entry.offset));
+    if (!obj || !(obj.value instanceof PdfStream)) continue;
+    const data = inflateStream(obj.value, unknown, filters);
+    const first = numOf(obj.value.dict.get('First') ?? PDF_NULL);
+    const n = numOf(obj.value.dict.get('N') ?? PDF_NULL);
+    objStmHeader(data, n).forEach((member, index) => {
+      if (!xref.has(member.id)) xref.set(member.id, { kind: 'compressed', streamObj, index });
+      if (root === undefined) {
+        const v = parseObject(new Lexer(data, first + member.off));
+        if (v instanceof Map) {
+          const t = v.get('Type');
+          if (t instanceof PdfName && t.value === 'Catalog') root = new PdfRef(member.id, 0);
+        }
+      }
+    });
+  }
+  return { xref, root };
+}
+
+// --- small helpers ----------------------------------------------------------
+
+function readBE(data: Uint8Array, offset: number, width: number): number {
+  let v = 0;
+  for (let i = 0; i < width; i++) v = v * 256 + (data[offset + i] ?? 0);
+  return v;
+}
+
+function numOf(v: PdfValue | undefined): number {
+  return typeof v === 'number' ? v : 0;
+}
+
+function readRectangle(value: PdfValue): Rectangle | undefined {
+  if (!Array.isArray(value) || value.length < 4) return undefined;
+  const nums = value.slice(0, 4).map((v) => (typeof v === 'number' ? v : NaN));
+  if (nums.some((n) => !Number.isFinite(n))) return undefined;
+  return [nums[0]!, nums[1]!, nums[2]!, nums[3]!];
+}
+
+/**
+ * §14.11.1 `/Rotate` — a multiple of 90, and the spec says so, but a file is
+ * free to write −90 or 450 and readers take both. Anything that is not a
+ * quarter turn is no turn at all.
+ */
+function readRotate(value: PdfValue): PdfPage['rotate'] | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
+  if (value % 90 !== 0) return undefined;
+  const turns = (((value / 90) % 4) + 4) % 4;
+  return ([0, 90, 180, 270] as const)[turns];
+}
+
+function concatWithSpaces(parts: ReadonlyArray<Uint8Array>): Uint8Array {
+  if (parts.length === 1) return parts[0]!;
+  const total = parts.reduce((n, p) => n + p.length + 1, 0);
+  const out = new Uint8Array(Math.max(0, total - 1));
+  let at = 0;
+  parts.forEach((p, i) => {
+    out.set(p, at);
+    at += p.length;
+    if (i < parts.length - 1) out[at++] = 0x0a;
+  });
+  return out;
+}
+
+function lastIndexOfAscii(buf: Uint8Array, needle: string): number {
+  const n = needle.length;
+  outer: for (let i = buf.length - n; i >= 0; i--) {
+    for (let j = 0; j < n; j++) {
+      if (buf[i + j] !== needle.charCodeAt(j)) continue outer;
+    }
+    return i;
+  }
+  return -1;
+}
+
+/** Re-export for callers that walk a resolved dict's array values. */
+export type { PdfArray };
+
+/**
+ * §14.11.2 — the box a viewer SHOWS: the crop box where there is one, clipped
+ * to the media box, and the media box where there is not.
+ *
+ * A crop box that states nothing usable — zero-sized, or outside the sheet
+ * altogether — is a crop box no viewer honours, and the media box stands.
+ * bug1844576.pdf is 612×792 of paper cropped to 181×53.75, and read as its
+ * media box the form on it arrived a fifth of the way down a letter page.
+ */
+/** Whether a rectangle bounds anything: a point or a line is no page. */
+function hasArea([x0, y0, x1, y1]: Rectangle): boolean {
+  return Math.abs(x1 - x0) > 1 && Math.abs(y1 - y0) > 1;
+}
+
+function shownBox(media: Rectangle, crop: Rectangle | undefined): Rectangle {
+  if (!crop) return media;
+  const [mx0, my0, mx1, my1] = media;
+  const [cx0, cy0, cx1, cy1] = crop;
+  const x0 = Math.max(Math.min(mx0, mx1), Math.min(cx0, cx1));
+  const y0 = Math.max(Math.min(my0, my1), Math.min(cy0, cy1));
+  const x1 = Math.min(Math.max(mx0, mx1), Math.max(cx0, cx1));
+  const y1 = Math.min(Math.max(my0, my1), Math.max(cy0, cy1));
+  return x1 - x0 > 1 && y1 - y0 > 1 ? [x0, y0, x1, y1] : media;
+}

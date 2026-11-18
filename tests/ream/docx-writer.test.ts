@@ -1,0 +1,1499 @@
+import { describe, expect, it } from 'vitest';
+
+import { buildDocxFromBody } from './fixtures/build-docx';
+import { buildTinyPng } from './fixtures/build-png';
+import type { FlowDoc } from '../../src/ream/core/ir/flow';
+import { Ream } from '../../src/ream/core/converter/ream';
+import { OpcPackage } from '../../src/ream/core/opc';
+import { buildStroke } from '../../src/ream/core/drawingml/shape-render';
+import { writeDocx } from '../../src/ream/word/docx-writer';
+import { readDocx } from '../../src/ream/word/docx-reader';
+import { FLOAT_CARRIER, shapeBlock } from '../../src/ream/pdf-reader/flow-build';
+
+const decode = (b: Uint8Array) => new TextDecoder().decode(b);
+
+const BODY =
+  '<w:p><w:r><w:t>first paragraph</w:t></w:r></w:p>' +
+  '<w:p><w:r><w:t xml:space="preserve">spaced  &amp; escaped &lt;text&gt;</w:t></w:r></w:p>' +
+  '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>' +
+  '<w:pgMar w:top="1440" w:right="1080" w:bottom="1440" w:left="1080"/></w:sectPr>';
+
+describe('docx writer (E-DOCX D2 skeleton)', () => {
+  it('round-trips text and page geometry through its own reader', () => {
+    const { doc: flow } = readDocx(buildDocxFromBody(BODY));
+    const { bytes, losses } = writeDocx(flow);
+    expect(losses).toHaveLength(0);
+
+    const { doc: again } = readDocx(bytes);
+    const texts = again.body.flatMap((el) =>
+      el.kind === 'paragraph' ? [el.paragraph.runs.map((r) => r.text).join('')] : [],
+    );
+    expect(texts).toEqual(['first paragraph', 'spaced  & escaped <text>']);
+    // Page geometry survives (A4 portrait, custom margins).
+    const sect = again.sections[0]?.properties ?? again.section;
+    expect(sect?.pageSize?.width).toBeCloseTo(11906 / 20, 1);
+    expect(sect?.margins?.left).toBeCloseTo(54, 1);
+  });
+
+  it('is exposed as the docx target on Ream.convert', async () => {
+    const src = buildDocxFromBody('<w:p><w:r><w:t>via facade</w:t></w:r></w:p>');
+    const out = await Ream.parse(src).convert('docx');
+    const pkg = OpcPackage.open(out);
+    expect(decode(pkg.getMainDocument().data)).toContain('via facade');
+  });
+
+  it('is deterministic', () => {
+    const { doc: flow } = readDocx(buildDocxFromBody(BODY));
+    expect([...writeDocx(flow).bytes]).toEqual([...writeDocx(flow).bytes]);
+  });
+
+  it('round-trips run formatting (bold/italic/size/color/valign) as direct rPr', () => {
+    const body =
+      '<w:p><w:pPr><w:jc w:val="center"/><w:spacing w:before="240" w:after="120"/>' +
+      '<w:ind w:left="720" w:firstLine="360"/></w:pPr>' +
+      '<w:r><w:rPr><w:b/><w:i/><w:sz w:val="28"/><w:color w:val="FF0000"/></w:rPr>' +
+      '<w:t>styled</w:t></w:r>' +
+      '<w:r><w:rPr><w:vertAlign w:val="superscript"/></w:rPr><w:t>sup</w:t></w:r></w:p>';
+    const { doc: flow } = readDocx(buildDocxFromBody(body));
+    const { doc: again } = readDocx(writeDocx(flow).bytes);
+
+    const para = again.body[0];
+    if (para?.kind !== 'paragraph') throw new Error('expected paragraph');
+    const pPr = para.paragraph.properties as Record<string, unknown>;
+    expect(pPr.alignment).toBe('center');
+    expect(pPr.spacingBefore).toBeCloseTo(12, 1); // 240 twips
+    expect(pPr.spacingAfter).toBeCloseTo(6, 1);
+    expect(pPr.indentLeft).toBeCloseTo(36, 1); // 720 twips
+    expect(pPr.indentFirstLine).toBeCloseTo(18, 1);
+
+    const r0 = para.paragraph.runs[0]!.properties as Record<string, unknown>;
+    expect(r0.bold).toBe(true);
+    expect(r0.italic).toBe(true);
+    expect(r0.fontSizePt).toBeCloseTo(14, 1); // sz=28 half-points
+    expect(r0.colorHex).toBe('FF0000');
+    const r1 = para.paragraph.runs[1]!.properties as Record<string, unknown>;
+    expect(r1.verticalAlign).toBe('superscript');
+  });
+
+  it('writes a line spaced in lines back in 240ths of a line, as it was read (§17.3.1.33)', () => {
+    // Word's own Normal sets its lines 1.08 apart (259); written as twelfths
+    // of a point it came back 0.65 of a line (155), each line over the last.
+    for (const [line, rule] of [
+      [259, 'auto'],
+      [360, 'auto'],
+      [300, 'exact'],
+    ] as const) {
+      const body = `<w:p><w:pPr><w:spacing w:line="${line}" w:lineRule="${rule}"/></w:pPr><w:r><w:t>x</w:t></w:r></w:p>`;
+      const written = writeDocx(readDocx(buildDocxFromBody(body)).doc).bytes;
+      expect(decode(OpcPackage.open(written).getMainDocument().data)).toContain(
+        `<w:spacing w:line="${line}" w:lineRule="${rule}"/>`,
+      );
+    }
+  });
+
+  it('writes a line break back as w:br, not as a newline inside w:t (§17.3.3.1)', () => {
+    // Inside `w:t` a newline is whitespace: read and written again, an
+    // address's lines ran together.
+    const body =
+      '<w:p><w:r><w:t>One street</w:t><w:br/><w:t>Two town</w:t></w:r></w:p>' +
+      '<w:p><w:r><w:t>Left</w:t></w:r><w:r><w:br w:type="column"/></w:r><w:r><w:t>Right</w:t></w:r></w:p>';
+    const written = writeDocx(readDocx(buildDocxFromBody(body)).doc).bytes;
+    const xml = decode(OpcPackage.open(written).getMainDocument().data);
+    expect(xml).toContain(
+      '<w:t xml:space="preserve">One street</w:t><w:br/><w:t xml:space="preserve">Two town</w:t>',
+    );
+    expect(xml).toContain('<w:br w:type="column"/>');
+    expect(xml).not.toMatch(/<w:t[^>]*>[^<]*\n/u);
+    const again = readDocx(written).doc.body[0];
+    if (again?.kind !== 'paragraph') throw new Error('a paragraph');
+    expect(again.paragraph.runs.map((r) => r.text).join('')).toBe('One street\nTwo town');
+  });
+
+  it('omits default-valued properties (no rPr/pPr noise for plain text)', () => {
+    const { doc: flow } = readDocx(buildDocxFromBody('<w:p><w:r><w:t>plain</w:t></w:r></w:p>'));
+    const xml = new TextDecoder().decode(
+      OpcPackage.open(writeDocx(flow).bytes).getMainDocument().data,
+    );
+    expect(xml).toContain('<w:p><w:r><w:t xml:space="preserve">plain</w:t></w:r></w:p>');
+    expect(xml).not.toContain('<w:rPr>');
+    expect(xml).not.toContain('<w:pPr>');
+  });
+
+  it('round-trips a numbered list: numPr + numbering.xml, markers regenerated', () => {
+    const numberingXml =
+      '<w:abstractNum w:abstractNumId="0">' +
+      '<w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/>' +
+      '<w:lvlText w:val="%1."/><w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr></w:lvl>' +
+      '<w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="lowerLetter"/>' +
+      '<w:lvlText w:val="%2)"/></w:lvl>' +
+      '</w:abstractNum>' +
+      '<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>';
+    const li = (ilvl: number, t: string) =>
+      `<w:p><w:pPr><w:numPr><w:ilvl w:val="${ilvl}"/><w:numId w:val="1"/></w:numPr></w:pPr>` +
+      `<w:r><w:t>${t}</w:t></w:r></w:p>`;
+    const body = li(0, 'first') + li(0, 'second') + li(1, 'nested');
+    const { doc: flow } = readDocx(buildDocxFromBody(body, { numberingXml }));
+    const { bytes } = writeDocx(flow);
+
+    // The package carries numbering.xml.
+    const pkg = OpcPackage.open(bytes);
+    expect(pkg.getPart('word/numbering.xml')).toBeDefined();
+
+    const { doc: again } = readDocx(bytes);
+    const paras = again.body.flatMap((el) => (el.kind === 'paragraph' ? [el.paragraph] : []));
+    // Each paragraph keeps its list reference (numId/ilvl).
+    expect(paras[0]!.properties.numbering).toMatchObject({ numId: '1', ilvl: 0 });
+    expect(paras[2]!.properties.numbering).toMatchObject({ numId: '1', ilvl: 1 });
+    // Markers regenerate identically — and exactly once (no doubling).
+    expect(paras[0]!.runs.map((r) => r.text).join('')).toBe('1.\tfirst');
+    expect(paras[2]!.runs.map((r) => r.text).join('')).toBe('a)\tnested');
+  });
+
+  it('round-trips what follows each marker (§17.9.29)', () => {
+    // Left out of numbering.xml, a level's space or nothing re-read as a tab.
+    const lvl = (suff: string) =>
+      '<w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/>' +
+      `<w:suff w:val="${suff}"/><w:lvlText w:val="%1."/></w:lvl>`;
+    const numberingXml =
+      `<w:abstractNum w:abstractNumId="0">${lvl('space')}</w:abstractNum>` +
+      `<w:abstractNum w:abstractNumId="1">${lvl('nothing')}</w:abstractNum>` +
+      '<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>' +
+      '<w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>';
+    const li = (numId: number, t: string) =>
+      `<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="${numId}"/></w:numPr></w:pPr>` +
+      `<w:r><w:t>${t}</w:t></w:r></w:p>`;
+    const { doc: flow } = readDocx(
+      buildDocxFromBody(li(1, 'spaced') + li(2, 'tight'), { numberingXml }),
+    );
+    const { doc: again } = readDocx(writeDocx(flow).bytes);
+    const texts = again.body.flatMap((el) =>
+      el.kind === 'paragraph' ? [el.paragraph.runs.map((r) => r.text).join('')] : [],
+    );
+    expect(texts).toEqual(['1. spaced', '1.tight']);
+  });
+
+  it('omits numbering.xml when the document has no lists', () => {
+    const { doc: flow } = readDocx(buildDocxFromBody('<w:p><w:r><w:t>plain</w:t></w:r></w:p>'));
+    const pkg = OpcPackage.open(writeDocx(flow).bytes);
+    expect(pkg.getPart('word/numbering.xml')).toBeUndefined();
+  });
+
+  it('round-trips an external hyperlink: w:hyperlink r:id + external rel', () => {
+    const body =
+      '<w:p><w:r><w:t>see </w:t></w:r>' +
+      '<w:hyperlink r:id="rId50"><w:r><w:t>the site</w:t></w:r></w:hyperlink>' +
+      '<w:r><w:t> now</w:t></w:r></w:p>';
+    const { doc: flow } = readDocx(
+      buildDocxFromBody(body, { hyperlinks: { rId50: 'https://reamkit.dev' } }),
+    );
+    const { bytes } = writeDocx(flow);
+    const { doc: again } = readDocx(bytes);
+
+    const para = again.body[0];
+    if (para?.kind !== 'paragraph') throw new Error('expected paragraph');
+    const linked = para.paragraph.runs.find((r) => r.text === 'the site');
+    expect(linked?.href).toBe('https://reamkit.dev');
+    // The surrounding runs are not linked.
+    expect(para.paragraph.runs.find((r) => r.text === 'see ')?.href).toBeUndefined();
+  });
+
+  it('round-trips an internal anchor link: w:hyperlink w:anchor (no rel)', () => {
+    const body =
+      '<w:p><w:hyperlink w:anchor="target"><w:r><w:t>jump</w:t></w:r></w:hyperlink></w:p>' +
+      '<w:p><w:bookmarkStart w:id="1" w:name="target"/><w:r><w:t>here</w:t></w:r>' +
+      '<w:bookmarkEnd w:id="1"/></w:p>';
+    const { doc: flow } = readDocx(buildDocxFromBody(body));
+    const { doc: again } = readDocx(writeDocx(flow).bytes);
+
+    const linkPara = again.body[0];
+    if (linkPara?.kind !== 'paragraph') throw new Error('expected paragraph');
+    expect(linkPara.paragraph.runs[0]!.anchor).toBe('target');
+    expect(linkPara.paragraph.runs[0]!.href).toBeUndefined();
+    // The bookmark survives onto its paragraph.
+    const targetPara = again.body[1];
+    if (targetPara?.kind !== 'paragraph') throw new Error('expected paragraph');
+    expect(targetPara.paragraph.bookmarks).toContain('target');
+  });
+
+  it('numbering and hyperlink relationships share one rId space', () => {
+    const numberingXml =
+      '<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/>' +
+      '<w:lvlText w:val="%1."/></w:lvl></w:abstractNum>' +
+      '<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>';
+    const body =
+      '<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr>' +
+      '<w:r><w:t>item</w:t></w:r></w:p>' +
+      '<w:p><w:hyperlink r:id="rId50"><w:r><w:t>link</w:t></w:r></w:hyperlink></w:p>';
+    const { doc: flow } = readDocx(
+      buildDocxFromBody(body, { numberingXml, hyperlinks: { rId50: 'https://x.test' } }),
+    );
+    const { doc: again } = readDocx(writeDocx(flow).bytes);
+    // Both survive — distinct rIds in document.xml.rels.
+    const linkPara = again.body[1];
+    expect(linkPara?.kind === 'paragraph' && linkPara.paragraph.runs[0]!.href).toBe(
+      'https://x.test',
+    );
+    const listPara = again.body[0];
+    expect(listPara?.kind === 'paragraph' && listPara.paragraph.properties.numbering?.numId).toBe(
+      '1',
+    );
+  });
+
+  it('states a table’s properties even when it has none — Word requires them', () => {
+    // §17.4 CT_Tbl declares w:tblPr minOccurs="1". A table read from a real
+    // document always carries SOMETHING, so this went unseen until one was
+    // reconstructed from a PDF's glyph positions and carried nothing at all:
+    // Word turned the file away, and nothing in the report said why.
+    const bare =
+      '<w:tbl><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid>' +
+      '<w:tr><w:tc><w:p><w:r><w:t>only text</w:t></w:r></w:p></w:tc></w:tr></w:tbl>';
+    const { doc } = readDocx(buildDocxFromBody(bare));
+    const xml = decode(OpcPackage.open(writeDocx(doc).bytes).getPart('word/document.xml')!);
+    expect(xml).toContain('<w:tbl><w:tblPr>');
+    // Every table in the output, without exception.
+    expect(/<w:tbl>(?!<w:tblPr>)/.test(xml)).toBe(false);
+  });
+
+  it('round-trips a table: grid, borders, shading, header row', () => {
+    const body =
+      '<w:tbl><w:tblPr>' +
+      '<w:tblBorders><w:top w:val="single" w:sz="8" w:color="FF0000"/>' +
+      '<w:insideH w:val="single" w:sz="4"/></w:tblBorders>' +
+      '</w:tblPr>' +
+      '<w:tblGrid><w:gridCol w:w="2000"/><w:gridCol w:w="3000"/></w:tblGrid>' +
+      '<w:tr><w:trPr><w:tblHeader/></w:trPr>' +
+      '<w:tc><w:tcPr><w:shd w:val="clear" w:fill="4472C4"/></w:tcPr><w:p><w:r><w:t>H1</w:t></w:r></w:p></w:tc>' +
+      '<w:tc><w:p><w:r><w:t>H2</w:t></w:r></w:p></w:tc></w:tr>' +
+      '<w:tr><w:tc><w:p><w:r><w:t>a</w:t></w:r></w:p></w:tc>' +
+      '<w:tc><w:p><w:r><w:t>b</w:t></w:r></w:p></w:tc></w:tr>' +
+      '</w:tbl>';
+    const { doc: flow } = readDocx(buildDocxFromBody(body));
+    const { doc: again } = readDocx(writeDocx(flow).bytes);
+
+    const tbl = again.body.find((el) => el.kind === 'table');
+    if (tbl?.kind !== 'table') throw new Error('expected table');
+    const t = tbl.table;
+    expect(t.grid.map((w) => Math.round(w))).toEqual([100, 150]); // 2000/3000 twips
+    expect(t.properties.borders?.top).toMatchObject({ style: 'single', colorHex: 'FF0000' });
+    expect(t.properties.borders?.top?.width).toBeCloseTo(1, 1); // sz=8 eighths
+    expect(t.rows[0]!.properties.isHeader).toBe(true);
+    expect(t.rows[0]!.cells[0]!.properties.shading?.colorHex).toBe('4472C4');
+    const cellText = (r: number, c: number) => {
+      const cell = t.rows[r]!.cells[c]!.content[0]!;
+      return cell.kind === 'paragraph' ? cell.paragraph.runs.map((x) => x.text).join('') : '';
+    };
+    expect(cellText(0, 0)).toBe('H1');
+    expect(cellText(1, 1)).toBe('b');
+  });
+
+  it('round-trips column/row spans (gridSpan + vMerge)', () => {
+    const body =
+      '<w:tbl><w:tblGrid><w:gridCol w:w="2000"/><w:gridCol w:w="2000"/></w:tblGrid>' +
+      '<w:tr><w:tc><w:tcPr><w:gridSpan w:val="2"/></w:tcPr><w:p><w:r><w:t>wide</w:t></w:r></w:p></w:tc></w:tr>' +
+      '<w:tr><w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr><w:p><w:r><w:t>tall</w:t></w:r></w:p></w:tc>' +
+      '<w:tc><w:p><w:r><w:t>x</w:t></w:r></w:p></w:tc></w:tr>' +
+      '<w:tr><w:tc><w:tcPr><w:vMerge w:val="continue"/></w:tcPr><w:p/></w:tc>' +
+      '<w:tc><w:p><w:r><w:t>y</w:t></w:r></w:p></w:tc></w:tr>' +
+      '</w:tbl>';
+    const { doc: flow } = readDocx(buildDocxFromBody(body));
+    const { doc: again } = readDocx(writeDocx(flow).bytes);
+    const tbl = again.body.find((el) => el.kind === 'table');
+    if (tbl?.kind !== 'table') throw new Error('expected table');
+    const t = tbl.table;
+    expect(t.rows[0]!.cells[0]!.properties.colSpan).toBe(2);
+    expect(t.rows[1]!.cells[0]!.properties.merge).toBe('start');
+    expect(t.rows[2]!.cells[0]!.properties.merge).toBe('end');
+  });
+
+  it('round-trips a nested table (table inside a cell)', () => {
+    const inner =
+      '<w:tbl><w:tblGrid><w:gridCol w:w="1000"/></w:tblGrid>' +
+      '<w:tr><w:tc><w:p><w:r><w:t>inner</w:t></w:r></w:p></w:tc></w:tr></w:tbl>';
+    const body =
+      '<w:tbl><w:tblGrid><w:gridCol w:w="3000"/></w:tblGrid>' +
+      `<w:tr><w:tc>${inner}<w:p/></w:tc></w:tr></w:tbl>`;
+    const { doc: flow } = readDocx(buildDocxFromBody(body));
+    const { doc: again } = readDocx(writeDocx(flow).bytes);
+    const outer = again.body.find((el) => el.kind === 'table');
+    if (outer?.kind !== 'table') throw new Error('expected table');
+    const nested = outer.table.rows[0]!.cells[0]!.content.find((el) => el.kind === 'table');
+    expect(nested?.kind).toBe('table');
+    if (nested?.kind !== 'table') throw new Error('expected nested table');
+    const innerCell = nested.table.rows[0]!.cells[0]!.content[0]!;
+    expect(innerCell.kind === 'paragraph' && innerCell.paragraph.runs[0]!.text).toBe('inner');
+  });
+
+  it('draws a line part-way through as the colour it comes to over white', () => {
+    // A stroke has no opacity in the PDF this renders, and the line is kept as
+    // its own colour and opacity now: drawn at full strength, black at 45%
+    // would print black.
+    expect(buildStroke({ colorHex: '000000', alpha: 0.45 })?.colorHex).toBe('8C8C8C');
+    expect(buildStroke({ colorHex: '000000' })?.colorHex).toBe('000000');
+  });
+
+  it('writes back how a picture is drawn: crop, turn, flip and opacity', () => {
+    // Read and never written, a cropped picture came back whole and squeezed
+    // into the frame its crop was sized for — the most common edit a picture
+    // in a document gets. A PDF's turned and clipped pictures went the same way.
+    const png = buildTinyPng(2, 2, [255, 0, 0, 255]);
+    const drawing =
+      '<w:r><w:drawing><wp:inline ' +
+      'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">' +
+      '<wp:extent cx="914400" cy="685800"/><wp:docPr id="1" name="Pic"/>' +
+      '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">' +
+      '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">' +
+      '<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">' +
+      '<pic:blipFill><a:blip r:embed="rId20"/><a:srcRect l="25000" b="50000"/>' +
+      '<a:stretch><a:fillRect/></a:stretch></pic:blipFill>' +
+      '<pic:spPr><a:xfrm rot="5400000" flipV="1"><a:off x="0" y="0"/>' +
+      '<a:ext cx="914400" cy="685800"/></a:xfrm></pic:spPr>' +
+      '</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>';
+    const { doc: flow } = readDocx(
+      buildDocxFromBody(`<w:p>${drawing}</w:p>`, {
+        images: { rId20: { contentType: 'image/png', bytes: png, extension: 'png' } },
+      }),
+    );
+    const xml = new TextDecoder().decode(
+      OpcPackage.open(writeDocx(flow).bytes).getMainDocument().data,
+    );
+    expect(xml).toContain('<a:srcRect l="25000" b="50000"/><a:stretch>');
+    expect(xml).toContain('<a:xfrm rot="5400000" flipV="1">');
+  });
+
+  it('writes a picture drawn part-way through (§20.1.8.4 a:alphaModFix)', () => {
+    // alphatrans.pdf lays a photograph in at half strength over three squares.
+    const png = buildTinyPng(1, 1, [0, 0, 255, 255]);
+    const drawing =
+      '<w:r><w:drawing><wp:inline ' +
+      'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">' +
+      '<wp:extent cx="254000" cy="254000"/><wp:docPr id="1" name="Pic"/>' +
+      '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">' +
+      '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">' +
+      '<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">' +
+      '<pic:blipFill><a:blip r:embed="rId20"/></pic:blipFill>' +
+      '<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="254000" cy="254000"/></a:xfrm></pic:spPr>' +
+      '</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>';
+    const { doc: flow } = readDocx(
+      buildDocxFromBody(`<w:p>${drawing}</w:p>`, {
+        images: { rId20: { contentType: 'image/png', bytes: png, extension: 'png' } },
+      }),
+    );
+    const faded = {
+      ...flow,
+      body: flow.body.map((b) =>
+        b.kind === 'image' ? { ...b, image: { ...b.image, alpha: 0.52 } } : b,
+      ),
+    };
+    const xml = new TextDecoder().decode(
+      OpcPackage.open(writeDocx(faded).bytes).getMainDocument().data,
+    );
+    expect(xml).toMatch(/<a:blip r:embed="rId\d+"><a:alphaModFix amt="52000"\/><\/a:blip>/u);
+  });
+
+  it('round-trips an image: media part + blip rel, dimensions and alt text', () => {
+    const png = buildTinyPng(2, 2, [255, 0, 0, 255]);
+    const drawing =
+      '<w:r><w:drawing><wp:inline ' +
+      'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">' +
+      '<wp:extent cx="914400" cy="685800"/><wp:docPr id="1" name="Pic" descr="a red square"/>' +
+      '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">' +
+      '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">' +
+      '<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">' +
+      '<pic:blipFill><a:blip r:embed="rId20"/></pic:blipFill>' +
+      '<pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="685800"/></a:xfrm></pic:spPr>' +
+      '</pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>';
+    const { doc: flow } = readDocx(
+      buildDocxFromBody(`<w:p>${drawing}</w:p>`, {
+        images: { rId20: { contentType: 'image/png', bytes: png, extension: 'png' } },
+      }),
+    );
+    const { bytes, losses } = writeDocx(flow);
+    expect(losses).toHaveLength(0);
+
+    const pkg = OpcPackage.open(bytes);
+    // The media part is present and the bytes survive verbatim.
+    expect(pkg.getPart('word/media/image1.png')).toBeDefined();
+    expect([...pkg.getPart('word/media/image1.png')!]).toEqual([...png]);
+
+    const { doc: again } = readDocx(bytes);
+    const el = again.body.find((b) => b.kind === 'image');
+    if (el?.kind !== 'image') throw new Error('expected image block');
+    expect(el.image.resource).toBeDefined(); // resolved to a stored resource
+    expect(el.image.width).toBeCloseTo(72, 1); // 914400 EMU = 72pt
+    expect(el.image.height).toBeCloseTo(54, 1); // 685800 EMU
+    expect(el.image.altText).toBe('a red square');
+  });
+
+  it('round-trips GIF and EMF media by magic number, not extension', () => {
+    // The reader stores any blip bytes verbatim; the writer must recognise the
+    // format from the magic number and pick the right media extension and
+    // content type. A GIF89a header and an EMF EMR_HEADER (" EMF" at byte 40)
+    // exercise the two detection paths beyond the raster set detectImageFormat
+    // knows. The bytes need not be a full valid image — only the signature.
+    // A whole 2×2 GIF89a: since the reader decodes GIF, a header alone is a
+    // corrupt picture rather than an opaque blob.
+    const gif = new Uint8Array([
+      0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x02, 0x00, 0x02, 0x00, 0xf0, 0x00, 0x00, 0xff, 0x00,
+      0x00, 0x00, 0xff, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x02,
+      0x03, 0x44, 0x02, 0x05, 0x00, 0x3b,
+    ]);
+    const emf = new Uint8Array(88);
+    emf.set([0x01, 0x00, 0x00, 0x00], 0); // iType = EMR_HEADER
+    emf.set([0x20, 0x45, 0x4d, 0x46], 40); // " EMF" signature
+    const drawing = (rId: string) =>
+      `<w:r><w:drawing><wp:inline ` +
+      `xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">` +
+      `<wp:extent cx="914400" cy="914400"/><wp:docPr id="1" name="P"/>` +
+      `<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">` +
+      `<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">` +
+      `<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">` +
+      `<pic:blipFill><a:blip r:embed="${rId}"/></pic:blipFill>` +
+      `<pic:spPr/></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>`;
+
+    for (const [bytes, ext, contentType] of [
+      [gif, 'gif', 'image/gif'],
+      [emf, 'emf', 'image/x-emf'],
+    ] as const) {
+      const { doc: flow } = readDocx(
+        buildDocxFromBody(`<w:p>${drawing('rId20')}</w:p>`, {
+          images: { rId20: { contentType, bytes, extension: ext } },
+        }),
+      );
+      const { bytes: written, losses } = writeDocx(flow);
+      expect(losses).toHaveLength(0);
+
+      const pkg = OpcPackage.open(written);
+      // The format-correct media part is present and the bytes survive verbatim.
+      expect(pkg.getPart(`word/media/image1.${ext}`)).toBeDefined();
+      expect([...pkg.getPart(`word/media/image1.${ext}`)!]).toEqual([...bytes]);
+
+      // The image is not lost on re-read: it round-trips to a stored resource.
+      const { doc: again } = readDocx(written);
+      const el = again.body.find((b) => b.kind === 'image');
+      if (el?.kind !== 'image') throw new Error(`expected ${ext} image block`);
+      expect(el.image.resource).toBeDefined();
+    }
+  });
+
+  it('deduplicates a resource used twice into one media part', () => {
+    const png = buildTinyPng(1, 1, [0, 255, 0, 255]);
+    const d = (rId: string) =>
+      `<w:r><w:drawing><wp:inline ` +
+      `xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">` +
+      `<wp:extent cx="914400" cy="914400"/><wp:docPr id="1" name="P"/>` +
+      `<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">` +
+      `<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">` +
+      `<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">` +
+      `<pic:blipFill><a:blip r:embed="${rId}"/></pic:blipFill>` +
+      `<pic:spPr/></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>`;
+    const { doc: flow } = readDocx(
+      buildDocxFromBody(`<w:p>${d('rId20')}</w:p><w:p>${d('rId21')}</w:p>`, {
+        images: {
+          rId20: { contentType: 'image/png', bytes: png, extension: 'png' },
+          rId21: { contentType: 'image/png', bytes: png, extension: 'png' },
+        },
+      }),
+    );
+    const pkg = OpcPackage.open(writeDocx(flow).bytes);
+    // Same bytes ⇒ one content-addressed resource ⇒ a single media part.
+    expect(pkg.getPart('word/media/image1.png')).toBeDefined();
+    expect(pkg.getPart('word/media/image2.png')).toBeUndefined();
+  });
+
+  it('round-trips a composite document (heading, list, link, bookmark, table, image)', () => {
+    const png = buildTinyPng(2, 2, [0, 0, 255, 255]);
+    const numberingXml =
+      '<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/>' +
+      '<w:lvlText w:val="%1."/></w:lvl></w:abstractNum>' +
+      '<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>';
+    const body =
+      '<w:p><w:pPr><w:outlineLvl w:val="0"/></w:pPr><w:r><w:rPr><w:b/></w:rPr>' +
+      '<w:t>Title</w:t></w:r></w:p>' +
+      '<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr>' +
+      '<w:r><w:t>item one</w:t></w:r></w:p>' +
+      '<w:p><w:bookmarkStart w:id="1" w:name="mark"/><w:r><w:t>See </w:t></w:r>' +
+      '<w:hyperlink r:id="rId30"><w:r><w:t>link</w:t></w:r></w:hyperlink>' +
+      '<w:bookmarkEnd w:id="1"/></w:p>' +
+      '<w:tbl><w:tblGrid><w:gridCol w:w="2000"/></w:tblGrid>' +
+      '<w:tr><w:tc><w:p><w:r><w:t>cell</w:t></w:r></w:p></w:tc></w:tr></w:tbl>';
+    const { doc: flow } = readDocx(
+      buildDocxFromBody(body, {
+        numberingXml,
+        hyperlinks: { rId30: 'https://reamkit.dev' },
+      }),
+    );
+    const { doc: again } = readDocx(writeDocx(flow).bytes);
+
+    // Heading bold + outline survive.
+    const heading = again.body[0];
+    expect(heading?.kind === 'paragraph' && heading.paragraph.runs[0]!.text).toBe('Title');
+    // List reference survives.
+    const item = again.body[1];
+    expect(item?.kind === 'paragraph' && item.paragraph.properties.numbering?.numId).toBe('1');
+    // Bookmark + hyperlink survive on the third paragraph.
+    const linkPara = again.body[2];
+    if (linkPara?.kind !== 'paragraph') throw new Error('expected paragraph');
+    expect(linkPara.paragraph.bookmarks).toContain('mark');
+    expect(linkPara.paragraph.runs.find((r) => r.text === 'link')?.href).toBe(
+      'https://reamkit.dev',
+    );
+    // Table survives.
+    expect(again.body.some((el) => el.kind === 'table')).toBe(true);
+  });
+
+  it('round-trips a header and footer through their parts', () => {
+    const body =
+      '<w:p><w:r><w:t>body</w:t></w:r></w:p>' +
+      '<w:sectPr>' +
+      '<w:headerReference w:type="default" r:id="rId10"/>' +
+      '<w:footerReference w:type="default" r:id="rId11"/>' +
+      '<w:pgSz w:w="11906" w:h="16838"/></w:sectPr>';
+    const { doc: flow } = readDocx(
+      buildDocxFromBody(body, {
+        headerXml: '<w:p><w:r><w:t>page header</w:t></w:r></w:p>',
+        footerXml: '<w:p><w:r><w:t>page footer</w:t></w:r></w:p>',
+      }),
+    );
+    const { bytes } = writeDocx(flow);
+    const pkg = OpcPackage.open(bytes);
+    expect(decode(pkg.requirePart('word/header1.xml'))).toContain('page header');
+    expect(decode(pkg.requirePart('word/footer1.xml'))).toContain('page footer');
+
+    // Re-read resolves the parts through their relationships.
+    const { doc: again } = readDocx(bytes);
+    const sect = again.sections[0]?.properties ?? again.section;
+    const headerRel = sect?.headers.find((h) => h.type === 'default')?.relationshipId;
+    expect(headerRel).toBeDefined();
+    const headerContent = again.headersFooters?.get(headerRel!);
+    const headerText =
+      headerContent?.[0]?.kind === 'paragraph'
+        ? headerContent[0].paragraph.runs.map((r) => r.text).join('')
+        : '';
+    expect(headerText).toBe('page header');
+  });
+
+  it('round-trips a multi-section document (per-section page geometry)', () => {
+    // Section 1 closes on its last paragraph (sectPr in pPr); section 2 is the
+    // final body-level sectPr — different page sizes prove they stay distinct.
+    const body =
+      '<w:p><w:pPr><w:sectPr><w:pgSz w:w="11906" w:h="16838"/></w:sectPr></w:pPr>' +
+      '<w:r><w:t>section one</w:t></w:r></w:p>' +
+      '<w:p><w:r><w:t>section two</w:t></w:r></w:p>' +
+      '<w:sectPr><w:pgSz w:w="16838" w:h="11906" w:orient="landscape"/></w:sectPr>';
+    const { doc: flow } = readDocx(buildDocxFromBody(body));
+    expect(flow.sections.length).toBe(2);
+    const { doc: again } = readDocx(writeDocx(flow).bytes);
+
+    // Both sections survive with their own geometry.
+    expect(again.sections.length).toBe(2);
+    expect(again.sections[0]!.properties.pageSize?.width).toBeCloseTo(11906 / 20, 1); // portrait
+    expect(again.sections[1]!.properties.pageSize?.width).toBeCloseTo(16838 / 20, 1); // landscape
+    expect(again.sections[1]!.properties.pageSize?.orientation).toBe('landscape');
+    // No paragraph added or lost — the section break rides the carrier.
+    const texts = again.body.flatMap((el) =>
+      el.kind === 'paragraph' ? [el.paragraph.runs.map((r) => r.text).join('')] : [],
+    );
+    expect(texts).toEqual(['section one', 'section two']);
+  });
+
+  it('round-trips multi-column geometry (w:cols) and titlePg', () => {
+    const body =
+      '<w:p><w:r><w:t>x</w:t></w:r></w:p>' +
+      '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/>' +
+      '<w:cols w:num="2" w:space="708"/><w:titlePg/></w:sectPr>';
+    const { doc: flow } = readDocx(buildDocxFromBody(body));
+    const { doc: again } = readDocx(writeDocx(flow).bytes);
+    const sect = again.sections[0]?.properties ?? again.section;
+    expect(sect?.columns?.count).toBe(2);
+    expect(sect?.columns?.spacePt).toBeCloseTo(708 / 20, 1);
+    expect(sect?.titlePg).toBe(true);
+  });
+
+  // An inline picture with no bytes: still a clean dropped loss to assert on.
+  const IMAGE_BODY =
+    '<w:p><w:r><w:drawing><wp:inline ' +
+    'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">' +
+    '<wp:extent cx="914400" cy="914400"/><wp:docPr id="1" name="Pic"/>' +
+    '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">' +
+    '<a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">' +
+    '<pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">' +
+    '<pic:blipFill><a:blip r:embed="rIdImg"/></pic:blipFill></pic:pic>' +
+    '</a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>';
+
+  it('writes a line’s own dash pattern and opacity back (§20.1.8.21 a:custDash)', () => {
+    // Read and never written, a custom pattern came back solid — from a .docx
+    // read and saved again, and from every dashed line a PDF draws.
+    const shape =
+      '<w:p><w:r><w:drawing>' +
+      '<wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">' +
+      '<wp:extent cx="914400" cy="12700"/><wp:docPr id="1" name="Rule"/>' +
+      '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">' +
+      '<a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">' +
+      '<wps:wsp xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">' +
+      '<wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="12700"/></a:xfrm>' +
+      '<a:prstGeom prst="line"><a:avLst/></a:prstGeom>' +
+      '<a:ln w="12700" cap="flat"><a:solidFill><a:srgbClr val="000000"><a:alpha val="45000"/>' +
+      '</a:srgbClr></a:solidFill>' +
+      '<a:custDash><a:ds d="300000" sp="100000"/><a:ds d="100000" sp="100000"/></a:custDash></a:ln>' +
+      '</wps:spPr><wps:bodyPr/></wps:wsp>' +
+      '</a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>';
+    const { doc: flow } = readDocx(buildDocxFromBody(shape));
+    const xml = new TextDecoder().decode(
+      OpcPackage.open(writeDocx(flow).bytes).getMainDocument().data,
+    );
+    // …and its opacity, which went the same way.
+    expect(xml).toContain(
+      '<a:ln w="12700" cap="flat"><a:solidFill><a:srgbClr val="000000"><a:alpha val="45000"/>' +
+        '</a:srgbClr></a:solidFill>' +
+        '<a:custDash><a:ds d="300000" sp="100000"/><a:ds d="100000" sp="100000"/></a:custDash></a:ln>',
+    );
+  });
+
+  it('round-trips a DrawingML shape (preset geometry, fill, line)', () => {
+    // A lone shape paragraph: the reader collapses it to a ShapeBlock, the
+    // writer re-emits wps:wsp, and a re-read recovers the same geometry/fill —
+    // so no empty carrier paragraph drifts the block count.
+    const shape =
+      '<w:p><w:r><w:drawing>' +
+      '<wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">' +
+      '<wp:extent cx="914400" cy="457200"/><wp:docPr id="1" name="Rounded"/>' +
+      '<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">' +
+      '<a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">' +
+      '<wps:wsp xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">' +
+      '<wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="457200"/></a:xfrm>' +
+      '<a:prstGeom prst="roundRect"><a:avLst><a:gd name="adj" fmla="val 16667"/></a:avLst></a:prstGeom>' +
+      '<a:solidFill><a:srgbClr val="4472C4"/></a:solidFill>' +
+      '<a:ln w="12700"><a:solidFill><a:srgbClr val="2F5496"/></a:solidFill></a:ln>' +
+      '</wps:spPr><wps:bodyPr/></wps:wsp>' +
+      '</a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>';
+    const { doc: flow } = readDocx(buildDocxFromBody(shape));
+    const { bytes, losses } = writeDocx(flow);
+    expect(losses).toHaveLength(0); // shapes are written, not dropped
+    const xml = new TextDecoder().decode(OpcPackage.open(bytes).getMainDocument().data);
+    expect(xml).toContain('<wps:wsp');
+    expect(xml).toContain('prst="roundRect"');
+
+    const { doc: again } = readDocx(bytes);
+    const el = again.body.find((b) => b.kind === 'shape');
+    if (el?.kind !== 'shape') throw new Error('expected a shape block');
+    expect(el.shape.geometry.kind).toBe('preset');
+    expect(el.shape.geometry.preset).toBe('roundRect');
+    expect(el.shape.geometry.adjust?.get('adj')).toBe(16667);
+    expect(el.shape.fill).toEqual({ kind: 'solid', colorHex: '4472C4' });
+    expect(el.shape.line?.colorHex).toBe('2F5496');
+    expect(el.shape.width).toBeCloseTo(72, 1); // 914400 EMU
+  });
+
+  it('round-trips an empty hyperlink (link target survives without visible content)', () => {
+    // A bookmark hyperlink whose only run is empty (e.g. a TOC page-ref field a
+    // tracked change deleted) must keep its anchor — the writer gives the link a
+    // single empty run instead of dropping it.
+    const body =
+      '<w:p><w:r><w:t>see </w:t></w:r>' +
+      '<w:hyperlink w:anchor="_Toc1"><w:r><w:t></w:t></w:r></w:hyperlink></w:p>';
+    const { doc: flow } = readDocx(buildDocxFromBody(body));
+    const { doc: again } = readDocx(writeDocx(flow).bytes);
+    const para = again.body.find((b) => b.kind === 'paragraph');
+    if (para?.kind !== 'paragraph') throw new Error('expected a paragraph');
+    expect(para.paragraph.runs.some((r) => r.anchor === '_Toc1')).toBe(true);
+  });
+
+  it('round-trips an in-paragraph page break (w:br type=page)', () => {
+    // §17.3.3.1 — a run carrying only a page break must survive: it is emitted
+    // as <w:br w:type="page"/>, not dropped for having empty text.
+    const body =
+      '<w:p><w:r><w:t>before</w:t></w:r>' +
+      '<w:r><w:br w:type="page"/></w:r>' +
+      '<w:r><w:t>after</w:t></w:r></w:p>';
+    const { doc: flow } = readDocx(buildDocxFromBody(body));
+    const bytes = writeDocx(flow).bytes;
+    const xml = new TextDecoder().decode(OpcPackage.open(bytes).getMainDocument().data);
+    expect(xml).toContain('<w:br w:type="page"/>');
+    // The break is preserved on re-read (the run keeps its pageBreak flag).
+    const { doc: again } = readDocx(bytes);
+    const para = again.body.find((b) => b.kind === 'paragraph');
+    if (para?.kind !== 'paragraph') throw new Error('expected a paragraph');
+    expect(para.paragraph.runs.some((r) => r.pageBreak === true)).toBe(true);
+  });
+
+  it('keeps a page break where it stands in a run it shares with text', () => {
+    // §17.3.3.1 — read as a flag on the run, the break was written after all of
+    // its text, and "before" and "after" came back as one word on one page.
+    const body = '<w:p><w:r><w:t>before</w:t><w:br w:type="page"/><w:t>after</w:t></w:r></w:p>';
+    const { doc: flow } = readDocx(buildDocxFromBody(body));
+    const { doc: again } = readDocx(writeDocx(flow).bytes);
+    const para = again.body.find((b) => b.kind === 'paragraph');
+    if (para?.kind !== 'paragraph') throw new Error('expected a paragraph');
+    expect(para.paragraph.runs.map((r) => [r.text, r.pageBreak === true])).toEqual([
+      ['before', false],
+      ['', true],
+      ['after', false],
+    ]);
+  });
+
+  it('reports unwritten block kinds as losses (v0)', () => {
+    const { doc: flow } = readDocx(buildDocxFromBody(IMAGE_BODY));
+    const { losses } = writeDocx(flow);
+    expect(losses.some((l) => l.feature === 'images' && l.severity === 'dropped')).toBe(true);
+  });
+
+  it('strict mode surfaces writer losses', async () => {
+    await expect(
+      Ream.parse(buildDocxFromBody(IMAGE_BODY)).convert('docx', { strict: true }),
+    ).rejects.toThrow();
+  });
+});
+
+describe('the package is a document XML can carry', () => {
+  it('drops the characters XML forbids instead of writing a file nothing opens', () => {
+    // XML 1.0 §2.2 — everything under U+0020 but tab, newline and return is
+    // forbidden, and no escape exists: `&#2;` is as ill-formed as the byte.
+    // They arrive from a subset font that states neither /ToUnicode nor
+    // /Encoding /Differences: a subset's codes start at 1, 2, 3, and the
+    // last-resort Latin-1 reading turns a page of prose into control
+    // characters. TAMReview.pdf did exactly that, and LibreOffice answered
+    // "source file could not be loaded" — the whole conversion lost over it.
+    const { doc: flow } = readDocx(buildDocxFromBody('<w:p><w:r><w:t>x</w:t></w:r></w:p>'));
+    const para = flow.body.find((b) => b.kind === 'paragraph');
+    if (para?.kind !== 'paragraph') throw new Error('expected a paragraph');
+    const run = para.paragraph.runs[0]!;
+    const dirty = {
+      ...flow,
+      body: [
+        {
+          ...para,
+          paragraph: {
+            ...para.paragraph,
+            runs: [{ ...run, text: 'a\u0002b\u0003c\td\u001fe' }],
+          },
+        },
+      ],
+    } as unknown as FlowDoc;
+    const bytes = writeDocx(dirty).bytes;
+    const xml = decode(OpcPackage.open(bytes).getMainDocument().data);
+    expect(xml).toContain('ab');
+    // Checked by code point rather than a pattern: a regular expression that
+    // matches control characters has to contain them.
+    expect(
+      [...xml].some((ch) => {
+        const cp = ch.codePointAt(0)!;
+        return cp < 0x20 && cp !== 0x9 && cp !== 0xa && cp !== 0xd;
+      }),
+    ).toBe(false);
+    // A tab survives, as the ELEMENT §17.3.3.30 spells it with: written inside
+    // `w:t` Word draws it as nothing at all.
+    expect(xml).toContain('<w:t xml:space="preserve">abc</w:t><w:tab/>');
+    expect(xml).toContain('<w:t xml:space="preserve">de</w:t>');
+    // And the package parses as XML, which is the whole point.
+    expect(() => readDocx(bytes)).not.toThrow();
+  });
+});
+
+describe('the package carries no picture the format cannot show', () => {
+  it('drops a JPEG 2000 picture and says why, rather than writing a hole', () => {
+    // §15.2.14 lists the image parts a WordprocessingML package may carry, and
+    // JPEG 2000 is not among them. S2.pdf put six of them in a .docx and both
+    // of its plates came back blank — in Word and in LibreOffice alike — with
+    // the loss report saying only "image bytes missing", which they were not.
+    const jp2 = new Uint8Array([
+      0, 0, 0, 0x0c, 0x6a, 0x50, 0x20, 0x20, 0x0d, 0x0a, 0x87, 0x0a, 0, 0, 0, 0,
+    ]);
+    const { doc: flow } = readDocx(buildDocxFromBody('<w:p><w:r><w:t>x</w:t></w:r></w:p>'));
+    const withJp2 = {
+      ...flow,
+      resources: new Map([['r1', jp2]]),
+      body: [
+        {
+          kind: 'image' as const,
+          image: { resource: 'r1', width: 40, height: 20, paragraphProperties: {} },
+        },
+      ],
+    } as unknown as FlowDoc;
+    const { bytes, losses } = writeDocx(withJp2);
+    const pkg = OpcPackage.open(bytes);
+    expect(pkg.listParts().some((path) => path.endsWith('.jp2'))).toBe(false);
+    const dropped = losses.find((l) => l.detail.includes('JPEG 2000'));
+    expect(dropped?.severity).toBe('dropped');
+  });
+});
+
+describe('a drawing that states where it goes is placed there (§20.4.2.3)', () => {
+  const floatingShape = (offsetXPt: number, offsetYPt: number) => ({
+    width: 40,
+    height: 20,
+    fill: { kind: 'solid' as const, colorHex: '336699' },
+    geometry: { kind: 'preset' as const, preset: 'rect' },
+    paragraphProperties: {},
+    float: {
+      wrap: 'none' as const,
+      posH: { relativeFrom: 'page' as const, offsetPt: offsetXPt },
+      posV: { relativeFrom: 'page' as const, offsetPt: offsetYPt },
+    },
+  });
+  const docWith = (body: ReadonlyArray<unknown>) => {
+    const { doc: flow } = readDocx(buildDocxFromBody('<w:p><w:r><w:t>x</w:t></w:r></w:p>'));
+    return { ...flow, body } as unknown as FlowDoc;
+  };
+  const xmlOf = (body: ReadonlyArray<unknown>) =>
+    decode(OpcPackage.open(writeDocx(docWith(body)).bytes).getMainDocument().data);
+
+  it('writes a wp:anchor, with everything CT_Anchor requires on it', () => {
+    // The model has carried the anchor since the reader learned to read one,
+    // and the writer threw it away: every drawing went out inline, so a page
+    // of placed artwork came back as a column of it in document order.
+    const xml = xmlOf([{ kind: 'shape' as const, shape: floatingShape(72, 144) }]);
+    expect(xml).toContain('<wp:anchor');
+    expect(xml).not.toContain('<wp:inline');
+    // Required attributes — Word refuses the document without them.
+    for (const attr of [
+      'simplePos=',
+      'relativeHeight=',
+      'behindDoc=',
+      'locked=',
+      'layoutInCell=',
+      'allowOverlap=',
+    ]) {
+      expect(xml).toContain(attr);
+    }
+    // And the placement itself, in EMU: 72pt is an inch is 914400.
+    expect(xml).toContain('<wp:positionH relativeFrom="page"><wp:posOffset>914400</wp:posOffset>');
+    expect(xml).toContain('<wp:positionV relativeFrom="page"><wp:posOffset>1828800</wp:posOffset>');
+    expect(xml).toContain('<wp:wrapNone/>');
+  });
+
+  it('reads its own anchor back', () => {
+    const bytes = writeDocx(
+      docWith([{ kind: 'shape' as const, shape: floatingShape(72, 144) }]),
+    ).bytes;
+    const { doc: again } = readDocx(bytes);
+    const shape = again.body.find((b) => b.kind === 'shape');
+    if (shape?.kind !== 'shape') throw new Error('expected a shape');
+    expect(shape.shape.float?.posH?.relativeFrom).toBe('page');
+    expect(shape.shape.float?.posH?.offsetPt).toBeCloseTo(72, 1);
+    expect(shape.shape.float?.posV?.offsetPt).toBeCloseTo(144, 1);
+  });
+
+  it('gathers consecutive placed drawings into one carrier paragraph', () => {
+    // A floating drawing is placed by its anchor, not by where its paragraph
+    // lands — so a paragraph each is a paragraph of FLOW each. 160F-2019.pdf is
+    // one page of 355 placed rules, and one paragraph apiece ran it to sixteen.
+    const xml = xmlOf(
+      Array.from({ length: 5 }, (_, i) => ({
+        kind: 'shape' as const,
+        shape: floatingShape(10 * i, 10 * i),
+      })),
+    );
+    expect((xml.match(/<wp:anchor/gu) ?? []).length).toBe(5);
+    expect((xml.match(/<w:p>/gu) ?? []).length).toBe(1);
+  });
+
+  it('reserves the area a turned drawing actually reaches (§20.4.2.3)', () => {
+    // `wp:extent` is the shape's own size, unrotated — fdo75722-dml.docx states
+    // it there and repeats it in `a:ext` — and the turn's overhang goes in
+    // `wp:effectExtent`. Written as zeroes, a renderer reserves the flat box
+    // for a shape that draws across the turned one.
+    const turned = {
+      ...floatingShape(0, 0),
+      transform: { rotation60k: 16200000 }, // a quarter turn, 270°
+    };
+    const xml = xmlOf([{ kind: 'shape' as const, shape: turned }]);
+    // 40 × 20 pt turned upright spans 20 × 40: it hangs 10pt off top and bottom
+    // and nothing off the sides.
+    expect(xml).toContain('<wp:effectExtent l="0" t="127000" r="0" b="127000"/>');
+    // The extent itself stays the shape's own size.
+    expect(xml).toContain(`<wp:extent cx="${String(40 * 12700)}" cy="${String(20 * 12700)}"/>`);
+  });
+
+  it('draws a fill that is seen through as that transparent (§20.1.2.3.1)', () => {
+    // bug1755507.pdf lays a card on a shadow painted at a fifth of full
+    // strength: the model carried the alpha and the writer dropped it, and
+    // the shadow came back as a solid black slab around the card.
+    const shadow = {
+      ...floatingShape(0, 0),
+      fill: { kind: 'solid' as const, colorHex: '000000', alpha: 0.2 },
+    };
+    const bytes = writeDocx(docWith([{ kind: 'shape' as const, shape: shadow }])).bytes;
+    const xml = decode(OpcPackage.open(bytes).getMainDocument().data);
+    expect(xml).toContain('<a:srgbClr val="000000"><a:alpha val="20000"/></a:srgbClr>');
+    // …and reads back as the same colour at the same strength.
+    const again = readDocx(bytes).doc.body.find((b) => b.kind === 'shape');
+    if (again?.kind !== 'shape') throw new Error('expected a shape');
+    expect(again.shape.fill).toMatchObject({ kind: 'solid', colorHex: '000000' });
+    expect(again.shape.fill.alpha).toBeCloseTo(0.2, 3);
+  });
+
+  it('leaves a drawing that states no placement inline', () => {
+    const { float: _drop, ...flowing } = floatingShape(0, 0);
+    const xml = xmlOf([{ kind: 'shape' as const, shape: flowing }]);
+    expect(xml).toContain('<wp:inline');
+    expect(xml).not.toContain('<wp:anchor');
+  });
+});
+
+describe('an attribute is written only where the schema admits its value', () => {
+  // Word does not ignore an attribute it cannot read and does not round one it
+  // could: it refuses the whole document, saying only that it "experienced an
+  // error trying to open the file". Both of these shipped in output Ream wrote.
+
+  it('leaves out a measurement that is no number', () => {
+    // A property that was COMPUTED rather than read can come out `NaN`, and
+    // `NaN` is not a value ST_SignedTwipsMeasure admits.
+    // `Ream.parse(pdf).convert('docx')` wrote 355 of them on one form, and
+    // `w:jc w:val="undefined"` beside each.
+    const { doc: flow } = readDocx(buildDocxFromBody('<w:p><w:r><w:t>x</w:t></w:r></w:p>'));
+    const para = flow.body.find((b) => b.kind === 'paragraph');
+    if (para?.kind !== 'paragraph') throw new Error('expected a paragraph');
+    const broken = {
+      ...flow,
+      body: [
+        {
+          ...para,
+          paragraph: {
+            ...para.paragraph,
+            properties: {
+              ...para.paragraph.properties,
+              indentLeft: NaN,
+              indentRight: NaN,
+              indentFirstLine: NaN,
+              spacingBefore: NaN,
+              spacingAfter: NaN,
+              alignment: undefined,
+            },
+          },
+        },
+      ],
+    };
+    // The type forbids these values. The point of the test is that a runtime
+    // object carries them anyway, out of arithmetic that had nothing to work on.
+    const xml = decode(
+      OpcPackage.open(writeDocx(broken as unknown as FlowDoc).bytes).getMainDocument().data,
+    );
+    expect(xml).not.toMatch(/NaN/u);
+    expect(xml).not.toMatch(/"undefined"/u);
+  });
+
+  it('states a path in whole units, however finely it was measured', () => {
+    // §20.1.10.16 — ST_Coordinate is a long. A path lifted off a PDF is in
+    // points and lands between them; 160F-2019.pdf carried 1777 fractional
+    // coordinates. A path space is arbitrary, so the path is restated in a
+    // finer one rather than rounded where it stands.
+    const { doc: flow } = readDocx(buildDocxFromBody('<w:p><w:r><w:t>x</w:t></w:r></w:p>'));
+    const para = flow.body.find((b) => b.kind === 'paragraph');
+    if (para?.kind !== 'paragraph') throw new Error('expected a paragraph');
+    const withShape = {
+      ...flow,
+      body: [
+        {
+          kind: 'shape' as const,
+          shape: {
+            width: 100,
+            height: 20,
+            fill: { kind: 'solid' as const, colorHex: '000000' },
+            paragraphProperties: para.paragraph.properties,
+            geometry: {
+              kind: 'custom' as const,
+              custom: {
+                pathWidth: 246.478,
+                pathHeight: 15.024000000000001,
+                commands: [
+                  { cmd: 'move' as const, x: 0, y: 15.024000000000001 },
+                  { cmd: 'line' as const, x: 246.478, y: 15.024000000000001 },
+                  { cmd: 'close' as const },
+                ],
+              },
+            },
+          },
+        },
+      ],
+    };
+    const xml = decode(
+      OpcPackage.open(writeDocx(withShape as unknown as FlowDoc).bytes).getMainDocument().data,
+    );
+    expect(xml).toContain('<a:custGeom>');
+    // No coordinate attribute carries a fraction.
+    expect(xml).not.toMatch(/(?:x|y|w|h|l|t|r|b|cx|cy)="-?\d+\.\d+"/u);
+    // And the shape it describes is still the one measured, to a part in 1e6.
+    const path = /<a:path w="(\d+)" h="(\d+)"/u.exec(xml);
+    expect(path).not.toBeNull();
+    expect(Number(path![1]) / Number(path![2])).toBeCloseTo(246.478 / 15.024, 3);
+  });
+});
+
+describe('what a reader can actually draw', () => {
+  const shapeDoc = (
+    pathWidth: number,
+    pathHeight: number,
+    commands: ReadonlyArray<{ cmd: string; x: number; y: number }> = [
+      { cmd: 'move', x: 0, y: 0 },
+      { cmd: 'line', x: pathWidth, y: pathHeight },
+    ],
+  ): FlowDoc =>
+    ({
+      body: [
+        {
+          kind: 'shape',
+          shape: {
+            width: 300,
+            height: 1,
+            geometry: {
+              kind: 'custom',
+              custom: { pathWidth, pathHeight, commands },
+            },
+            fill: { kind: 'none' },
+            line: { width: 1, colorHex: 'FF0000', fill: 'solid' },
+            paragraphProperties: {},
+          },
+        },
+      ],
+      sections: [],
+      resources: { images: new Map() },
+    }) as unknown as FlowDoc;
+
+  it('never states a path space with no size in it (§20.1.9.15)', () => {
+    // `a:path @w/@h` is the coordinate space the shape's extent is mapped
+    // onto, so a zero is a space nothing can be mapped into: a horizontal rule
+    // written `h="0"` is in the package and on no page.
+    const flat = decode(OpcPackage.open(writeDocx(shapeDoc(570, 0)).bytes).getMainDocument().data);
+    expect(flat).toContain('<a:path w="570" h="1">');
+    const upright = decode(
+      OpcPackage.open(writeDocx(shapeDoc(0, 570)).bytes).getMainDocument().data,
+    );
+    expect(upright).toContain('<a:path w="1" h="570">');
+  });
+
+  it('states a path however many points it runs through', () => {
+    // comments.pdf's chart labels are drawn in the glyphs traced for them, a
+    // chart's letters one path of twenty thousand curves: its coordinates,
+    // spread into one call to find the largest, overran the stack.
+    const commands = Array.from({ length: 200_000 }, (_, k) => ({
+      cmd: k === 0 ? 'move' : 'line',
+      x: (k % 1000) / 7,
+      y: Math.floor(k / 1000) / 7,
+    }));
+    const xml = decode(
+      OpcPackage.open(writeDocx(shapeDoc(1000 / 7, 200 / 7, commands)).bytes).getMainDocument()
+        .data,
+    );
+    expect(xml.match(/<a:lnTo>/gu)).toHaveLength(199_999);
+  });
+
+  it('writes run properties in the order CT_RPr states them (§17.3.2.28)', () => {
+    // The element is a SEQUENCE and a reader may drop what arrives out of it:
+    // with `w:u` ahead of `w:rFonts`, LibreOffice ignored the underline.
+    const src = buildDocxFromBody(
+      '<w:p><w:r><w:rPr><w:rFonts w:ascii="Arial"/><w:b/><w:u w:val="wave" w:color="4B99FF"/>' +
+        '<w:sz w:val="20"/></w:rPr><w:t>marked</w:t></w:r></w:p>',
+    );
+    const { doc } = readDocx(src);
+    const xml = decode(OpcPackage.open(writeDocx(doc).bytes).getMainDocument().data);
+    const rPr = /<w:rPr>.*?<\/w:rPr>/u.exec(xml)?.[0] ?? '';
+    const order = ['w:rFonts', 'w:b', 'w:sz', 'w:u'];
+    const at = order.map((tag) => rPr.indexOf(`<${tag}`));
+    expect(at.every((i) => i >= 0)).toBe(true);
+    expect([...at].sort((a, b) => a - b)).toEqual(at);
+    // And the underline keeps the colour it was given.
+    expect(rPr).toContain('w:color="4B99FF"');
+  });
+
+  it('writes every property block in the ORDER the schema states (§17.3.1.26)', () => {
+    // Word enforces the sequence CT_PPrBase declares and LibreOffice does not:
+    // a child out of order is a file Word refuses or a property it drops. The
+    // rules and the stops a reconstructed PDF carries were appended after
+    // `w:jc`, which is exactly the mistake this checks for — on the writer's
+    // own output, so no reader is needed to catch it.
+    const source =
+      '<w:p><w:pPr><w:pageBreakBefore/><w:pBdr><w:top w:val="single"/></w:pBdr>' +
+      '<w:tabs><w:tab w:val="left" w:pos="2000"/></w:tabs>' +
+      '<w:spacing w:before="120"/><w:ind w:left="240"/><w:jc w:val="center"/>' +
+      '<w:outlineLvl w:val="1"/></w:pPr>' +
+      '<w:r><w:rPr><w:b/><w:color w:val="FF0000"/><w:sz w:val="28"/></w:rPr>' +
+      '<w:t>a line the page set out</w:t></w:r></w:p>' +
+      '<w:tbl><w:tblPr><w:tblW w:w="5000" w:type="dxa"/><w:tblInd w:w="360" w:type="dxa"/>' +
+      '<w:tblLayout w:type="fixed"/>' +
+      '<w:tblCellMar><w:left w:w="0" w:type="dxa"/></w:tblCellMar></w:tblPr>' +
+      '<w:tblGrid><w:gridCol w:w="2500"/><w:gridCol w:w="2500"/></w:tblGrid>' +
+      '<w:tr><w:trPr><w:trHeight w:val="300"/></w:trPr>' +
+      '<w:tc><w:tcPr><w:tcW w:w="2500" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>a</w:t></w:r></w:p></w:tc>' +
+      '<w:tc><w:tcPr><w:tcW w:w="2500" w:type="dxa"/></w:tcPr><w:p><w:r><w:t>b</w:t></w:r></w:p></w:tc>' +
+      '</w:tr></w:tbl>' +
+      '<w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:pgNumType w:fmt="lowerRoman" w:start="3"/>' +
+      '<w:titlePg/>' +
+      '<w:textDirection w:val="tbRl"/></w:sectPr>';
+    const { doc: flow } = readDocx(buildDocxFromBody(source));
+    const xml = decode(OpcPackage.open(writeDocx(flow).bytes).getMainDocument().data);
+    // §17.3.1.26, §17.3.2.28, §17.6.17, §17.4.60, §17.4.82, §17.4.70 — the
+    // children each of these may hold, in the order they may hold them.
+    const SEQUENCES: Readonly<Record<string, ReadonlyArray<string>>> = {
+      'w:pPr': [
+        'w:pStyle',
+        'w:keepNext',
+        'w:keepLines',
+        'w:pageBreakBefore',
+        'w:numPr',
+        'w:pBdr',
+        'w:shd',
+        'w:tabs',
+        'w:bidi',
+        'w:spacing',
+        'w:ind',
+        'w:contextualSpacing',
+        'w:jc',
+        'w:outlineLvl',
+        'w:rPr',
+        'w:sectPr',
+      ],
+      'w:rPr': [
+        'w:rStyle',
+        'w:rFonts',
+        'w:b',
+        'w:bCs',
+        'w:i',
+        'w:iCs',
+        'w:strike',
+        'w:color',
+        'w:spacing',
+        'w:sz',
+        'w:szCs',
+        'w:highlight',
+        'w:u',
+        'w:shd',
+        'w:vertAlign',
+        'w:rtl',
+        'w:lang',
+      ],
+      'w:sectPr': [
+        'w:headerReference',
+        'w:footerReference',
+        'w:type',
+        'w:pgSz',
+        'w:pgMar',
+        'w:pgNumType',
+        'w:cols',
+        'w:titlePg',
+        'w:textDirection',
+        'w:bidi',
+        'w:docGrid',
+      ],
+      'w:tblPr': [
+        'w:tblStyle',
+        'w:tblW',
+        'w:jc',
+        'w:tblInd',
+        'w:tblBorders',
+        'w:shd',
+        'w:tblLayout',
+        'w:tblCellMar',
+        'w:tblLook',
+      ],
+      'w:trPr': ['w:gridBefore', 'w:gridAfter', 'w:cantSplit', 'w:trHeight', 'w:tblHeader', 'w:jc'],
+      'w:tcPr': [
+        'w:tcW',
+        'w:gridSpan',
+        'w:hMerge',
+        'w:vMerge',
+        'w:tcBorders',
+        'w:shd',
+        'w:noWrap',
+        'w:tcMar',
+        'w:textDirection',
+        'w:vAlign',
+      ],
+    };
+    for (const [parent, order] of Object.entries(SEQUENCES)) {
+      const rank = new Map(order.map((tag, i) => [tag, i]));
+      const blocks = xml.match(new RegExp(`<${parent}>.*?</${parent}>`, 'gsu')) ?? [];
+      for (const block of blocks) {
+        const kids: Array<string> = [];
+        let depth = 0;
+        for (const m of block
+          .slice(parent.length + 2)
+          .matchAll(/<(\/?)(w:[A-Za-z]+)[^>]*?(\/?)>/gu)) {
+          const [, closing, tag, selfClose] = m;
+          if (closing === '/') {
+            depth--;
+            continue;
+          }
+          if (depth === 0) kids.push(tag!);
+          if (selfClose !== '/') depth++;
+        }
+        const ranks = kids.flatMap((tag) => (rank.has(tag) ? [rank.get(tag)!] : []));
+        expect(ranks, `${parent}: ${kids.join(' ')}`).toEqual([...ranks].sort((a, b) => a - b));
+      }
+    }
+    // §17.4.65 — the table's indent, which the model read and the writer
+    // dropped: a table set in from its margin came back against it.
+    expect(xml).toContain('<w:tblInd w:w="360" w:type="dxa"/>');
+  });
+});
+
+describe('the defaults a property stated nowhere takes (§17.7.5)', () => {
+  it("are stated in a styles part, so a reader does not take its own template's", () => {
+    // Without one, Word set every paragraph in its template's Normal: 8pt
+    // after each, lines 1.08 apart, and the model's own 11pt runs in 12.
+    const written = writeDocx(
+      readDocx(buildDocxFromBody('<w:p><w:r><w:t>Body</w:t></w:r></w:p>')).doc,
+    ).bytes;
+    const pkg = OpcPackage.open(written);
+    const styles = decode(pkg.getPart('word/styles.xml')!);
+    expect(styles).toContain(
+      '<w:rPrDefault><w:rPr><w:sz w:val="22"/><w:szCs w:val="22"/></w:rPr></w:rPrDefault>',
+    );
+    expect(styles).toContain(
+      '<w:pPrDefault><w:pPr><w:widowControl/><w:spacing w:before="0" w:after="0" w:line="240" w:lineRule="auto"/></w:pPr></w:pPrDefault>',
+    );
+    expect(styles).toContain('<w:style w:type="paragraph" w:default="1" w:styleId="Normal">');
+    expect(decode(pkg.getPart('word/_rels/document.xml.rels')!)).toContain(
+      'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles"',
+    );
+  });
+});
+
+describe('widow control (§17.3.1.44)', () => {
+  it('is on where nothing says otherwise, and stays off where a paragraph or its style says so', () => {
+    const source = buildDocxFromBody(
+      '<w:p><w:r><w:t>Plain</w:t></w:r></w:p>' +
+        '<w:p><w:pPr><w:widowControl w:val="0"/></w:pPr><w:r><w:t>Off</w:t></w:r></w:p>' +
+        '<w:p><w:pPr><w:pStyle w:val="Loose"/></w:pPr><w:r><w:t>Styled</w:t></w:r></w:p>',
+      {
+        stylesXml:
+          '<w:style w:type="paragraph" w:styleId="Loose"><w:name w:val="Loose"/>' +
+          '<w:pPr><w:widowControl w:val="0"/></w:pPr></w:style>',
+      },
+    );
+    const widows = (doc: FlowDoc): Array<boolean | undefined> =>
+      doc.body.map((el) =>
+        el.kind === 'paragraph' ? el.paragraph.properties.widowControl : undefined,
+      );
+    const flow = readDocx(source).doc;
+    expect(widows(flow)).toEqual([true, false, false]);
+    const written = writeDocx(flow).bytes;
+    const body = decode(OpcPackage.open(written).getMainDocument().data);
+    expect(body.match(/<w:widowControl w:val="0"\/>/gu)).toHaveLength(2);
+    expect(widows(readDocx(written).doc)).toEqual([true, false, false]);
+  });
+});
+
+describe('the settings a document is set by (§17.15.1)', () => {
+  it('writes them back, so a round trip keeps them', () => {
+    // 20 of the corpus's .docx turn on headers of their own for the even
+    // pages; written without a settings part, every page printed the odd
+    // pages' header once saved.
+    const source = buildDocxFromBody(
+      '<w:p><w:r><w:t>Body</w:t></w:r></w:p><w:sectPr><w:pgSz w:w="11906" w:h="16838"/></w:sectPr>',
+      {
+        settingsXml:
+          '<w:gutterAtTop/><w:evenAndOddHeaders/><w:compat><w:doNotExpandShiftReturn/></w:compat>',
+      },
+    );
+    const written = writeDocx(readDocx(source).doc).bytes;
+    const settings = OpcPackage.open(written).getPart('word/settings.xml');
+    expect(settings).toBeDefined();
+    expect(decode(settings!)).toMatch(
+      /<w:gutterAtTop\/><w:evenAndOddHeaders\/><w:compat><w:doNotExpandShiftReturn\/><\/w:compat>/u,
+    );
+    const again = readDocx(written).doc;
+    expect(again.sections.every((s) => s.properties.evenAndOddHeaders === true)).toBe(true);
+    expect(again.gutterAtTop).toBe(true);
+    expect(again.doNotExpandShiftReturn).toBe(true);
+  });
+
+  it('keeps the version of Word the document is laid out for, last in w:compat', () => {
+    // [MS-DOCX] compatibilityMode — written without it, a Word 2013 document
+    // opened again in Compatibility Mode: laid out as Word 2007 laid it out.
+    const mode =
+      '<w:compatSetting w:name="compatibilityMode" w:uri="http://schemas.microsoft.com/office/word" w:val="15"/>';
+    const source = buildDocxFromBody('<w:p><w:r><w:t>Body</w:t></w:r></w:p>', {
+      settingsXml: `<w:compat><w:doNotExpandShiftReturn/>${mode}</w:compat>`,
+    });
+    const written = writeDocx(readDocx(source).doc).bytes;
+    const settings = OpcPackage.open(written).getPart('word/settings.xml');
+    expect(decode(settings!)).toContain(`<w:compat><w:doNotExpandShiftReturn/>${mode}</w:compat>`);
+    expect(readDocx(written).doc.compatibilityMode).toBe(15);
+  });
+
+  it('writes no settings part where the document states none', () => {
+    const written = writeDocx(
+      readDocx(buildDocxFromBody('<w:p><w:r><w:t>Body</w:t></w:r></w:p>')).doc,
+    ).bytes;
+    expect(OpcPackage.open(written).getPart('word/settings.xml')).toBeUndefined();
+  });
+});
+
+describe('a document written for another program to read', () => {
+  const bodyOf = (bytes: Uint8Array): string =>
+    decode(OpcPackage.open(bytes).getMainDocument().data);
+
+  it('names the FAMILY a face belongs to, and lists it in the font table (§17.8.3)', () => {
+    // A PDF names a face — `Inter-SemiBold` — and a reader looks a font up by
+    // the family it was installed under. Written as the face, an invoice set in
+    // Inter came back in LibreOffice's default serif.
+    const { doc } = readDocx(
+      buildDocxFromBody(
+        '<w:p><w:r><w:rPr><w:rFonts w:ascii="inter-semibold" w:hAnsi="inter-semibold"/><w:b/></w:rPr>' +
+          '<w:t>Invoice</w:t></w:r></w:p>',
+      ),
+    );
+    const flow: FlowDoc = {
+      ...doc,
+      faceFamilies: new Map([['inter-semibold', { family: 'Inter', generic: 'swiss' as const }]]),
+    };
+    const bytes = writeDocx(flow).bytes;
+    expect(bodyOf(bytes)).toContain(
+      '<w:rFonts w:ascii="Inter" w:hAnsi="Inter" w:eastAsia="Inter" w:cs="Inter"/>',
+    );
+    const table = OpcPackage.open(bytes).getPart('word/fontTable.xml');
+    expect(table).toBeDefined();
+    expect(decode(table!)).toContain(
+      '<w:font w:name="Inter"><w:family w:val="swiss"/><w:pitch w:val="variable"/></w:font>',
+    );
+  });
+
+  it('writes a page number as a COMPLEX field, in the run’s own properties (§17.16.18)', () => {
+    // Inside `w:fldSimple` LibreOffice sets the result in the paragraph's
+    // default size: a receipt's "Page 1 of 2" came back with both numbers half
+    // as large again as the words around them.
+    const { doc } = readDocx(
+      buildDocxFromBody(
+        '<w:p><w:r><w:rPr><w:sz w:val="15"/></w:rPr><w:t xml:space="preserve">Page </w:t></w:r>' +
+          '<w:fldSimple w:instr=" PAGE "><w:r><w:rPr><w:sz w:val="15"/></w:rPr><w:t>1</w:t></w:r></w:fldSimple></w:p>',
+      ),
+    );
+    const bytes = writeDocx(doc).bytes;
+    const xml = bodyOf(bytes);
+    expect(xml).not.toContain('w:fldSimple');
+    for (const piece of [
+      '<w:fldChar w:fldCharType="begin"/>',
+      '<w:instrText xml:space="preserve"> PAGE </w:instrText>',
+      '<w:fldChar w:fldCharType="separate"/>',
+      '<w:fldChar w:fldCharType="end"/>',
+    ]) {
+      expect(xml).toContain(`<w:rPr><w:sz w:val="15"/><w:szCs w:val="15"/></w:rPr>${piece}`);
+    }
+    // …and it reads back as the page number it is.
+    const runs = readDocx(bytes).doc.body.flatMap((b) =>
+      b.kind === 'paragraph' ? b.paragraph.runs : [],
+    );
+    expect(runs.some((r) => r.field === 'PAGE')).toBe(true);
+  });
+
+  it('writes the rule between two ruled paragraphs as `w:between` (§17.3.1.5)', () => {
+    // §17.3.1.24 CT_PBdr has no inside edges; the rule between two members of
+    // a bordered set is `w:between`, and `w:insideH` there is a file Word turns
+    // away.
+    const para =
+      '<w:p><w:pPr><w:pBdr><w:top w:val="single" w:sz="6" w:color="EBEBEB"/>' +
+      '<w:between w:val="single" w:sz="6" w:color="EBEBEB"/></w:pBdr></w:pPr>' +
+      '<w:r><w:t>Subtotal</w:t></w:r></w:p>';
+    const { doc } = readDocx(buildDocxFromBody(para + para));
+    const first = doc.body[0];
+    expect(
+      first?.kind === 'paragraph' && first.paragraph.properties.borders?.insideH,
+    ).toMatchObject({ style: 'single', colorHex: 'EBEBEB' });
+    const xml = bodyOf(writeDocx(doc).bytes);
+    expect(xml).toContain('<w:between w:val="single" w:sz="6" w:color="EBEBEB"/>');
+    expect(xml).not.toContain('w:insideH');
+  });
+
+  it("writes a paragraph's shading, and how far its rules stand off it (§17.3.1.31)", () => {
+    const para =
+      '<w:p><w:pPr><w:pBdr><w:top w:val="single" w:sz="4" w:space="6" w:color="404040"/></w:pBdr>' +
+      '<w:shd w:val="clear" w:color="auto" w:fill="404040"/></w:pPr>' +
+      '<w:r><w:rPr><w:color w:val="FFFFFF"/></w:rPr><w:t>Canvas element</w:t></w:r></w:p>';
+    const { doc } = readDocx(buildDocxFromBody(para));
+    const xml = bodyOf(writeDocx(doc).bytes);
+    expect(xml).toContain('<w:shd w:val="clear" w:color="auto" w:fill="404040"/>');
+    expect(xml).toContain('<w:top w:val="single" w:sz="4" w:space="6" w:color="404040"/>');
+    // …and it reads back as it was written.
+    const back = readDocx(writeDocx(doc).bytes).doc.body[0];
+    expect(back?.kind === 'paragraph' && back.paragraph.properties.shading).toEqual({
+      colorHex: '404040',
+    });
+  });
+
+  it('writes a foot whose run names no face at all', () => {
+    // A band's runs come with RAW properties, and a run the page set in a face
+    // with no name has no font map: ZapfDingbats.pdf's foot threw, and the
+    // whole package with it.
+    const { doc } = readDocx(buildDocxFromBody('<w:p><w:r><w:t>body</w:t></w:r></w:p>'));
+    const foot = {
+      kind: 'paragraph' as const,
+      paragraph: { properties: {}, runs: [{ text: 'Page 1', properties: {} }] },
+    };
+    const flow = {
+      ...doc,
+      sections: doc.sections.map((s) => ({
+        ...s,
+        properties: {
+          ...s.properties,
+          footers: [{ type: 'default' as const, relationshipId: 'rIdFoot' }],
+        },
+      })),
+      headersFooters: new Map([['rIdFoot', [foot]]]),
+    } as unknown as FlowDoc;
+    expect(() => writeDocx(flow)).not.toThrow();
+  });
+
+  it('writes z-orders the way Word reads them (§20.4.2.3)', () => {
+    // Word reads a relativeHeight of 0 or 1 as ABOVE everything, and a
+    // negative one is no value the attribute admits: a PDF's first two marks
+    // came back over everything drawn after them, and a tagged reading, which
+    // counts up from minus a million, wrote numbers no reader should accept.
+    const mark = (z: number) =>
+      shapeBlock(
+        {
+          orderKey: [z],
+          segs: [
+            { op: 'move', x: 10, y: 10 },
+            { op: 'line', x: 20, y: 10 },
+            { op: 'line', x: 20, y: 20 },
+            { op: 'close' },
+          ],
+          minX: 10,
+          minY: 10,
+          maxX: 20,
+          maxY: 20,
+          fillHex: '2E6DAD',
+        },
+        { left: 0, top: 100 },
+        z,
+      );
+    const { doc } = readDocx(buildDocxFromBody('<w:p><w:r><w:t>after</w:t></w:r></w:p>'));
+    const xml = bodyOf(writeDocx({ ...doc, body: [mark(-1_000_000), mark(0), mark(1)] }).bytes);
+    const heights = [...xml.matchAll(/relativeHeight="(\d+)"/gu)].map((m) => Number(m[1]));
+    expect(heights).toHaveLength(3);
+    expect(heights.every((h) => h >= 2)).toBe(true);
+    expect([...heights].sort((a, b) => a - b)).toEqual(heights);
+  });
+
+  it('anchors a floating mark in a paragraph that takes no room (§17.3.1.33)', () => {
+    // Every rule and fill a page draws is anchored where it was drawn. The
+    // paragraph carrying it is on no page, and written bare it took a reader's
+    // default line: a blank line in the flow for each.
+    const rule = shapeBlock(
+      {
+        orderKey: [0],
+        segs: [
+          { op: 'move', x: 30, y: 700 },
+          { op: 'line', x: 582, y: 700 },
+          { op: 'line', x: 582, y: 701 },
+          { op: 'line', x: 30, y: 701 },
+          { op: 'close' },
+        ],
+        minX: 30,
+        minY: 700,
+        maxX: 582,
+        maxY: 701,
+        fillHex: 'EBEBEB',
+      },
+      { left: 0, top: 792 },
+      0,
+      true,
+    );
+    const { doc } = readDocx(buildDocxFromBody('<w:p><w:r><w:t>after</w:t></w:r></w:p>'));
+    const xml = bodyOf(writeDocx({ ...doc, body: [rule, ...doc.body] }).bytes);
+    expect(xml).toMatch(
+      /<w:p><w:pPr><w:spacing w:line="1" w:lineRule="exact"\/><\/w:pPr><w:r><w:drawing>/u,
+    );
+    expect(FLOAT_CARRIER.spacingLineRule).toBe('exact');
+  });
+});

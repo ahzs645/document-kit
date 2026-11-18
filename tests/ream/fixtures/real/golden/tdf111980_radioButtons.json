@@ -1,0 +1,32 @@
+{
+  "file": "tdf111980_radioButtons.xlsx",
+  "paperDeclared": false,
+  "libreOffice": {
+    "pages": 2,
+    "pageSizes": [
+      {
+        "widthPt": 595,
+        "heightPt": 842
+      }
+    ],
+    "chars": 158,
+    "firstLines": [
+      "Group Box",
+      "7"
+    ]
+  },
+  "ream": {
+    "pages": 2,
+    "pageSizes": [
+      {
+        "widthPt": 595,
+        "heightPt": 842
+      }
+    ],
+    "chars": 154,
+    "firstLines": [
+      "Group Box 7",
+      "ActiveX 3"
+    ]
+  }
+}

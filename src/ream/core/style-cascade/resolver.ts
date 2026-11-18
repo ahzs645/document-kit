@@ -1,0 +1,554 @@
+// Style cascade resolver.
+//
+// ECMA-376 Part 1 §17.7.2 — order of resolution (lowest priority first):
+//   1. Document defaults (docDefaults.rPrDefault / pPrDefault)
+//   2. Paragraph style chain (resolved via basedOn) — runProperties become
+//      the implicit default for runs in that paragraph; paragraphProperties
+//      apply to the paragraph itself.
+//   3. Character (run) style chain (basedOn) — runProperties only.
+//   4. Direct properties on the paragraph / run.
+//
+// Higher priority overrides lower; an `undefined` field at the higher tier
+// inherits from the lower one.
+
+import type {
+  BodyElement,
+  FontFamilyMap,
+  Paragraph,
+  ParagraphProperties,
+  RunProperties,
+  ShapeBlock,
+  StyleSheet,
+} from '../document-model';
+
+import type {
+  ResolvedParagraphProperties,
+  ResolvedRunProperties,
+} from './types';
+import { DEFAULT_RESOLVED_PARAGRAPH, DEFAULT_RESOLVED_RUN } from './types';
+
+interface StyleChainResult {
+  readonly rPr: RunProperties;
+  readonly pPr: ParagraphProperties;
+}
+
+/**
+ * Null Object for {@link StyleSheet} — parsers fall back to it when a package has
+ * no styles part, and grid-based formats (xlsx) render with it outright.
+ */
+export const EMPTY_STYLE_SHEET: StyleSheet = {
+  defaultRunProperties: {},
+  defaultParagraphProperties: {},
+  styles: new Map(),
+};
+
+// The renderer resolves the same (run, paragraph) pair in several phases
+// (font collection, tokenization, table measuring) — memoize by identity.
+// Model objects are readonly and rebuilt per parse, and the outer key is the
+// sheet itself, so entries can never leak across documents (oop-design §4.2).
+const runCascadeCache = new WeakMap<
+  StyleSheet,
+  WeakMap<RunProperties, WeakMap<ParagraphProperties, ResolvedRunProperties>>
+>();
+
+/**
+ * Resolve a run's effective properties (ECMA-376 §17.7.2): document defaults →
+ * paragraph-style run layer → run-style layer → direct run properties.
+ * Memoized by the identity of `(sheet, runDirect, paragraphDirect)`.
+ *
+ * @param runDirect       The run's direct properties (its `styleId` drives the run-style layer).
+ * @param paragraphDirect The owning paragraph's direct properties (its `styleId` drives the paragraph-style layer).
+ * @param sheet           The stylesheet supplying defaults and style chains.
+ */
+export function resolveRunProperties(
+  runDirect: RunProperties,
+  paragraphDirect: ParagraphProperties,
+  sheet: StyleSheet,
+): ResolvedRunProperties {
+  let bySheet = runCascadeCache.get(sheet);
+  if (!bySheet) {
+    bySheet = new WeakMap();
+    runCascadeCache.set(sheet, bySheet);
+  }
+  let byRun = bySheet.get(runDirect);
+  if (!byRun) {
+    byRun = new WeakMap();
+    bySheet.set(runDirect, byRun);
+  }
+  const hit = byRun.get(paragraphDirect);
+  if (hit) return hit;
+  const resolved = computeRunProperties(runDirect, paragraphDirect, sheet);
+  byRun.set(paragraphDirect, resolved);
+  return resolved;
+}
+
+function computeRunProperties(
+  runDirect: RunProperties,
+  paragraphDirect: ParagraphProperties,
+  sheet: StyleSheet,
+): ResolvedRunProperties {
+  let acc = mergeRun(DEFAULT_RESOLVED_RUN, sheet.defaultRunProperties);
+  // §17.7.2 — the table style sits between the document defaults and the
+  // paragraph's own style, on the run side as on the paragraph side.
+  if (paragraphDirect.inheritedRun) acc = mergeRun(acc, paragraphDirect.inheritedRun);
+
+  // §17.7.4.17 — a paragraph that names no style is written in the DEFAULT
+  // one, and its runs inherit that style's rPr exactly as the paragraph
+  // inherits its pPr. Read as "no style at all", defaultStyle.docx set its
+  // unstyled paragraph in 12pt body text where every reader uses the 28pt bold
+  // of the Title style the file marks default.
+  const styleId = paragraphDirect.styleId ?? defaultParagraphStyleId(sheet);
+  if (styleId) {
+    const chain = resolveStyleChain(styleId, sheet);
+    acc = mergeRun(acc, chain.rPr);
+  }
+  if (runDirect.styleId) {
+    const chain = resolveStyleChain(runDirect.styleId, sheet);
+    acc = mergeRun(acc, chain.rPr);
+  }
+  return mergeRun(acc, runDirect);
+}
+
+// Paragraph-side memo, the symmetric half of runCascadeCache: keyed by the
+// direct-properties object identity. Producers that share properties objects
+// across paragraphs (the xlsx grid mapper) collapse to one resolved object
+// per distinct input instead of one per paragraph.
+const paragraphCascadeCache = new WeakMap<
+  StyleSheet,
+  WeakMap<ParagraphProperties, ResolvedParagraphProperties>
+>();
+
+/**
+ * Resolve a paragraph's effective properties (ECMA-376 §17.7.2): document
+ * defaults → paragraph-style chain → direct properties. Memoized by the
+ * identity of `(sheet, paragraphDirect)`.
+ *
+ * @param paragraphDirect The paragraph's direct properties (its `styleId` drives the style chain).
+ * @param sheet           The stylesheet supplying defaults and style chains.
+ */
+export function resolveParagraphProperties(
+  paragraphDirect: ParagraphProperties,
+  sheet: StyleSheet,
+): ResolvedParagraphProperties {
+  let bySheet = paragraphCascadeCache.get(sheet);
+  if (!bySheet) {
+    bySheet = new WeakMap();
+    paragraphCascadeCache.set(sheet, bySheet);
+  }
+  const hit = bySheet.get(paragraphDirect);
+  if (hit) return hit;
+  const resolved = computeParagraphProperties(paragraphDirect, sheet);
+  bySheet.set(paragraphDirect, resolved);
+  return resolved;
+}
+
+function computeParagraphProperties(
+  paragraphDirect: ParagraphProperties,
+  sheet: StyleSheet,
+): ResolvedParagraphProperties {
+  let acc = mergePar(DEFAULT_RESOLVED_PARAGRAPH, sheet.defaultParagraphProperties);
+  // §17.7.2 — the table style ranks between the document defaults and the
+  // paragraph's own style. Applied over the style instead, a table style's
+  // `w:spacing` overruled the heading the cell is written in: tdf119054.docx
+  // sets 18pt after every Heading 2 and its table style sets none, and we
+  // packed the headings together.
+  // The mark's own formatting comes from the same layer: an empty cell has
+  // nothing but its mark, and the row is as tall as the mark is
+  // (conditionalstyles-tbllook.docx sets its first column in 36pt).
+  if (paragraphDirect.tableStyle ?? paragraphDirect.inheritedRun) {
+    acc = mergePar(acc, {
+      ...paragraphDirect.tableStyle,
+      ...(paragraphDirect.inheritedRun ? { runProperties: paragraphDirect.inheritedRun } : {}),
+    });
+  }
+  // §17.7.4.17 `w:default="1"` — the style a paragraph that names none is
+  // written in. Skipping it left such a paragraph with the document defaults
+  // alone: Bug51170.docx sets ten points after every paragraph in its Normal
+  // style, and reading none of it packed a seven-page deed into four.
+  const styleId = paragraphDirect.styleId ?? defaultParagraphStyleId(sheet);
+  if (styleId) {
+    const chain = resolveStyleChain(styleId, sheet);
+    acc = mergePar(acc, chain.pPr);
+  }
+  return mergePar(acc, paragraphDirect);
+}
+
+/** The id of the `w:default="1"` paragraph style, cached per sheet. */
+const defaultParagraphStyleCache = new WeakMap<StyleSheet, string | null>();
+
+function defaultParagraphStyleId(sheet: StyleSheet): string | undefined {
+  const hit = defaultParagraphStyleCache.get(sheet);
+  if (hit !== undefined) return hit ?? undefined;
+  // §17.7.4.17 — a document may mark several styles default, and the LAST one
+  // wins. defaultStyle.docx marks both Normal and Title, and taking the first
+  // set its unstyled paragraph in body text where every reader sets it in the
+  // title's 28pt bold.
+  let found: string | null = null;
+  for (const style of sheet.styles.values()) {
+    if (style.type === 'paragraph' && style.isDefault) found = style.id;
+  }
+  defaultParagraphStyleCache.set(sheet, found);
+  return found ?? undefined;
+}
+
+function resolveStyleChain(styleId: string, sheet: StyleSheet): StyleChainResult {
+  const chain: Array<{ rPr: RunProperties; pPr: ParagraphProperties }> = [];
+  const visited = new Set<string>();
+  let cursor: string | undefined = styleId;
+  while (cursor && !visited.has(cursor)) {
+    visited.add(cursor);
+    const style = sheet.styles.get(cursor);
+    if (!style) break;
+    chain.unshift({ rPr: style.runProperties, pPr: style.paragraphProperties });
+    cursor = style.basedOn;
+  }
+  let rPr: RunProperties = {};
+  let pPr: ParagraphProperties = {};
+  for (const link of chain) {
+    rPr = mergeRunPartial(rPr, link.rPr);
+    pPr = mergeParPartial(pPr, link.pPr);
+  }
+  return { rPr, pPr };
+}
+
+function mergeRun(base: ResolvedRunProperties, override: RunProperties): ResolvedRunProperties {
+  const lang = override.lang ?? base.lang;
+  return {
+    bold: override.bold ?? base.bold,
+    italic: override.italic ?? base.italic,
+    underline: override.underline ?? base.underline,
+    ...((override.underlineColorHex ?? base.underlineColorHex)
+      ? { underlineColorHex: override.underlineColorHex ?? base.underlineColorHex }
+      : {}),
+    strike: override.strike ?? base.strike,
+    caps: override.caps ?? base.caps,
+    smallCaps: override.smallCaps ?? base.smallCaps,
+    fontSizePt: override.fontSizePt ?? base.fontSizePt,
+    colorHex: override.colorHex ?? base.colorHex,
+    fontFamily: mergeFontFamily(base.fontFamily, override.fontFamily),
+    verticalAlign: override.verticalAlign ?? base.verticalAlign,
+    rtl: override.rtl ?? base.rtl,
+    ...(lang !== undefined ? { lang } : {}),
+    ...((override.shadingColorHex ?? base.shadingColorHex) !== undefined
+      ? { shadingColorHex: override.shadingColorHex ?? base.shadingColorHex }
+      : {}),
+    ...((override.textOutline ?? base.textOutline) !== undefined
+      ? { textOutline: override.textOutline ?? base.textOutline }
+      : {}),
+    ...((override.letterSpacingPt ?? base.letterSpacingPt) !== undefined
+      ? { letterSpacingPt: override.letterSpacingPt ?? base.letterSpacingPt }
+      : {}),
+    ...((override.widthScale ?? base.widthScale) !== undefined
+      ? { widthScale: override.widthScale ?? base.widthScale }
+      : {}),
+    ...((override.kerningMinPt ?? base.kerningMinPt) !== undefined
+      ? { kerningMinPt: override.kerningMinPt ?? base.kerningMinPt }
+      : {}),
+    ...((override.ligatures ?? base.ligatures) !== undefined
+      ? { ligatures: override.ligatures ?? base.ligatures }
+      : {}),
+  };
+}
+
+function mergePar(
+  base: ResolvedParagraphProperties,
+  override: ParagraphProperties,
+): ResolvedParagraphProperties {
+  // outlineLevel / styleId are optional (most paragraphs have neither); carry
+  // the higher-priority one through, omitting the key entirely when undefined
+  // (exactOptionalPropertyTypes).
+  const outlineLevel = override.outlineLevel ?? base.outlineLevel;
+  const styleId = override.styleId ?? base.styleId;
+  // §17.9.4 — a `w:numPr` naming only a LEVEL keeps the instance it inherits
+  // and changes the level alone (Word's Heading 2 is based on Heading 1 and
+  // says exactly that).
+  const numbering =
+    override.numbering ??
+    (override.numberingLevel !== undefined && base.numbering !== undefined
+      ? { ...base.numbering, ilvl: override.numberingLevel }
+      : base.numbering);
+  // The paragraph mark's own formatting: the higher-priority one wins whole,
+  // the way a paragraph's tabs do.
+  const runProperties = override.runProperties ?? base.runProperties;
+  const frame = override.frame ?? base.frame;
+  const sectionBreak = override.sectionBreak ?? base.sectionBreak;
+  const textDirection = override.textDirection ?? base.textDirection;
+  const snapToGrid = override.snapToGrid ?? base.snapToGrid;
+  // Whether the space before is the automatic one: the layer that decides it
+  // asked for it.
+  const beforeAuto =
+    override.spacingBeforeAuto ??
+    (override.spacingBefore === undefined ? base.spacingBeforeAuto : undefined);
+  return {
+    alignment: override.alignment ?? base.alignment,
+    // §17.3.1.1/§17.3.1.3 — an autospacing flag at this layer beats the length
+    // beside it and anything inherited.
+    spacingBefore: override.spacingBeforeAuto ?? override.spacingBefore ?? base.spacingBefore,
+    spacingAfter: override.spacingAfterAuto ?? override.spacingAfter ?? base.spacingAfter,
+    spacingLine: override.spacingLine ?? base.spacingLine,
+    spacingLineRule: override.spacingLineRule ?? base.spacingLineRule,
+    indentLeft: override.indentLeft ?? base.indentLeft,
+    indentRight: override.indentRight ?? base.indentRight,
+    indentFirstLine: override.indentFirstLine ?? base.indentFirstLine,
+    pageBreakBefore: override.pageBreakBefore ?? base.pageBreakBefore,
+    keepNext: override.keepNext ?? base.keepNext,
+    keepLines: override.keepLines ?? base.keepLines,
+    widowControl: override.widowControl ?? base.widowControl,
+    contextualSpacing: override.contextualSpacing ?? base.contextualSpacing,
+    // A paragraph's own stops REPLACE the style's — they are not merged.
+    tabs: override.tabs ?? base.tabs,
+    bidi: override.bidi ?? base.bidi,
+    // …and so does a paragraph's own border set (§17.3.1.24).
+    ...((override.borders ?? base.borders) ? { borders: override.borders ?? base.borders } : {}),
+    ...((override.shading ?? base.shading) ? { shading: override.shading ?? base.shading } : {}),
+    ...(outlineLevel !== undefined ? { outlineLevel } : {}),
+    ...(styleId !== undefined ? { styleId } : {}),
+    ...(numbering !== undefined ? { numbering } : {}),
+    ...(runProperties !== undefined ? { runProperties } : {}),
+    ...(frame !== undefined ? { frame } : {}),
+    ...(sectionBreak !== undefined ? { sectionBreak } : {}),
+    ...(textDirection !== undefined ? { textDirection } : {}),
+    ...(snapToGrid !== undefined ? { snapToGrid } : {}),
+    ...(beforeAuto !== undefined ? { spacingBeforeAuto: beforeAuto } : {}),
+  };
+}
+
+/**
+ * Lay one layer of run properties over another (§17.7.2): each property the
+ * higher layer states wins, and each slot of its `w:rFonts` on its own.
+ *
+ * @param base     The lower layer.
+ * @param override The higher layer.
+ * @returns The two as one layer.
+ */
+export function mergeRunPartial(base: RunProperties, override: RunProperties): RunProperties {
+  const out = copyDefined(base, override);
+  const fontFamily = mergeFontFamily(base.fontFamily, override.fontFamily);
+  return fontFamily === undefined || fontFamily === out.fontFamily ? out : { ...out, fontFamily };
+}
+
+// §17.3.2.26 — the four slots of `w:rFonts` are four properties, and a layer
+// that states one leaves the other three to the layers under it; Word's binary
+// format says so outright, with a sprm per slot (sprmCRgFtc0/1/2, sprmCFtcBi).
+// Replaced as a whole, a run that says only `w:ascii="Verdana"` over defaults
+// naming the theme's body font had its Cyrillic set in Verdana, where Word
+// sets it in the body font.
+function mergeFontFamily(base: FontFamilyMap, override: FontFamilyMap | undefined): FontFamilyMap;
+function mergeFontFamily(
+  base: FontFamilyMap | undefined,
+  override: FontFamilyMap | undefined,
+): FontFamilyMap | undefined;
+function mergeFontFamily(
+  base: FontFamilyMap | undefined,
+  override: FontFamilyMap | undefined,
+): FontFamilyMap | undefined {
+  if (override === undefined) return base;
+  if (base === undefined) return override;
+  const ascii = override.ascii ?? base.ascii;
+  const hAnsi = override.hAnsi ?? base.hAnsi;
+  const eastAsia = override.eastAsia ?? base.eastAsia;
+  const cs = override.cs ?? base.cs;
+  // Nothing taken from below: the higher layer's own map, so a resolved run
+  // re-resolved over the empty sheet keeps the object it had.
+  if (
+    ascii === override.ascii &&
+    hAnsi === override.hAnsi &&
+    eastAsia === override.eastAsia &&
+    cs === override.cs
+  ) {
+    return override;
+  }
+  return {
+    ...(ascii !== undefined ? { ascii } : {}),
+    ...(hAnsi !== undefined ? { hAnsi } : {}),
+    ...(eastAsia !== undefined ? { eastAsia } : {}),
+    ...(cs !== undefined ? { cs } : {}),
+  };
+}
+
+function mergeParPartial(
+  base: ParagraphProperties,
+  override: ParagraphProperties,
+): ParagraphProperties {
+  const out = copyDefined(base, override);
+  // §17.9.4 — the derived style states a LEVEL and no instance, so it takes the
+  // one it is based on and moves down a level. Word's Heading 2 is written this
+  // way; without it num-parent-style.docx numbered every heading at level 0.
+  if (override.numbering === undefined && override.numberingLevel !== undefined) {
+    if (base.numbering !== undefined) {
+      return { ...out, numbering: { ...base.numbering, ilvl: override.numberingLevel } };
+    }
+  }
+  return out;
+}
+
+function copyDefined<T extends object>(base: T, override: T): T {
+  const out = { ...base };
+  for (const key of Object.keys(override) as Array<keyof T>) {
+    const v = override[key];
+    if (v !== undefined) out[key] = v;
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// FlowDoc transform (ir-design stage 6, variant A): resolve the cascade for an
+// entire body so the tree carries final effective properties. Readers run this
+// after numbering; writers and the layout see resolved values. Resolving again
+// over EMPTY_STYLE_SHEET is the identity (defaults are fully overwritten and
+// style chains are empty), which keeps direct raw-body callers working.
+//
+// The transform mutates the tree IN PLACE and returns it. Readers own the
+// freshly-parsed trees they pass in (nothing else holds a reference), and
+// rebuilding the tree immutably doubles peak memory — a real 874 KB workbook
+// with a huge grid (POI bug62181.xlsx) OOMed a 512 MB heap on the rebuild
+// version. Only the `properties` fields are overwritten; the resolved objects
+// themselves stay memo-shared via the resolveRunProperties WeakMap cache.
+// ---------------------------------------------------------------------------
+
+// Pre-seed the cascade cache with a resolved pair's fixpoint. Resolving an
+// already-resolved (run, paragraph) pair over the empty sheet is the identity
+// by value (the stage-6 contract) — registering it here makes the renderer's
+// idempotent re-resolve a cache HIT returning the very same object, instead
+// of allocating an equal copy per unique pair (on grid-shaped documents those
+// copies double the resolved-property population).
+function primeResolvedFixpoint(run: RunProperties, para: ParagraphProperties): void {
+  let bySheet = runCascadeCache.get(EMPTY_STYLE_SHEET);
+  if (!bySheet) {
+    bySheet = new WeakMap();
+    runCascadeCache.set(EMPTY_STYLE_SHEET, bySheet);
+  }
+  let byRun = bySheet.get(run);
+  if (!byRun) {
+    byRun = new WeakMap();
+    bySheet.set(run, byRun);
+  }
+  if (!byRun.has(para)) byRun.set(para, run as ResolvedRunProperties);
+}
+
+// The paragraph-side fixpoint: same idea as primeResolvedFixpoint, for the
+// renderer's re-resolve of an already-resolved paragraph over the empty sheet.
+function primeParagraphFixpoint(para: ParagraphProperties): void {
+  let bySheet = paragraphCascadeCache.get(EMPTY_STYLE_SHEET);
+  if (!bySheet) {
+    bySheet = new WeakMap();
+    paragraphCascadeCache.set(EMPTY_STYLE_SHEET, bySheet);
+  }
+  if (!bySheet.has(para)) bySheet.set(para, para as ResolvedParagraphProperties);
+}
+
+// The mark-resolving half of resolveBodyStyles, keyed like paragraphCascadeCache.
+const markCascadeCache = new WeakMap<
+  StyleSheet,
+  WeakMap<ParagraphProperties, ParagraphProperties>
+>();
+
+/**
+ * Resolve the style cascade across an entire body so the tree carries final
+ * effective run/paragraph properties (FlowDoc transform, ir-design stage 6).
+ * Recurses into tables and shape text. Mutates the tree IN PLACE and returns it;
+ * resolving again over {@link EMPTY_STYLE_SHEET} is the identity.
+ */
+export function resolveBodyStyles(
+  body: ReadonlyArray<BodyElement>,
+  sheet: StyleSheet,
+): ReadonlyArray<BodyElement> {
+  // §17.3.1.29 — the paragraph MARK is a run as well, formatted by the same
+  // cascade, and it is what an empty paragraph stands as tall as and what the
+  // extra lines of a spaced-out picture are lines of. Left as the bare `w:rPr`
+  // the paragraph states, a document that sets 12pt Calibri in its defaults
+  // stood every blank paragraph on Word's empty-document 11pt, in no family.
+  // One result per distinct input, as the paragraph cascade keeps: the grid
+  // mapper shares a properties object across a sheet's cells.
+  let bySheet = markCascadeCache.get(sheet);
+  if (!bySheet) {
+    bySheet = new WeakMap();
+    markCascadeCache.set(sheet, bySheet);
+  }
+  const marks = bySheet;
+  const withResolvedMark = (pp: ParagraphProperties): ParagraphProperties => {
+    const hit = marks.get(pp);
+    if (hit) return hit;
+    const resolved: ParagraphProperties = {
+      ...resolveParagraphProperties(pp, sheet),
+      runProperties: resolveRunProperties(pp.runProperties ?? {}, pp, sheet),
+    };
+    marks.set(pp, resolved);
+    return resolved;
+  };
+
+  const visitParagraph = (p: Paragraph): void => {
+    // Run resolution sees the RAW paragraph properties (its styleId drives
+    // the paragraph-style rPr layer) — so resolve every run first, then
+    // overwrite the paragraph's own properties. Same order the renderer used.
+    for (const r of p.runs) {
+      (r as { properties: RunProperties }).properties = resolveRunProperties(
+        r.properties,
+        p.properties,
+        sheet,
+      );
+    }
+    (p as { properties: ParagraphProperties }).properties = withResolvedMark(p.properties);
+    primeParagraphFixpoint(p.properties);
+    for (const r of p.runs) primeResolvedFixpoint(r.properties, p.properties);
+  };
+
+  const visit = (el: BodyElement): void => {
+    if (el.kind === 'paragraph') {
+      visitParagraph(el.paragraph);
+    } else if (el.kind === 'table') {
+      for (const row of el.table.rows) {
+        for (const cell of row.cells) {
+          for (const child of cell.content) visit(child);
+        }
+      }
+      // The drawings over a spreadsheet grid carry text of their own.
+      for (const drawing of el.table.overlay?.drawings ?? []) visit(drawing);
+    } else if (el.kind === 'shape') {
+      // §20.5.2.17 — a group's MEMBERS carry text of their own, and theirs
+      // needs the cascade exactly as much: the caption of every grouped shape
+      // in dml-groupshape-capitalization.docx kept the document's raw defaults,
+      // so its paragraphs lost the 10pt they are spaced by.
+      const shapeText = (sh: ShapeBlock): void => {
+        for (const child of sh.text?.content ?? []) visit(child);
+        for (const member of sh.children ?? []) shapeText(member.shape);
+      };
+      shapeText(el.shape);
+      standsOn(el.shape);
+    } else if (el.kind === 'image') {
+      standsOn(el.image);
+    } else {
+      standsOn(el.chart);
+    }
+  };
+
+  // §17.3.1 — a picture, chart or shape of its own in the flow stands on the
+  // paragraph that held it, spaced and aligned by that paragraph's style as
+  // much as by what it states itself: Bug51170.docx's header logo is a
+  // paragraph of the Header style, 10pt after it from Normal, and read raw it
+  // stood the body 10pt higher up the page than Word does. An anchored one
+  // stands on no paragraph of its own and takes no room: resolved, the four
+  // text boxes of tdf117843.docx's header took the document's 8pt each.
+  const standsOn = (block: {
+    paragraphProperties: ParagraphProperties;
+    readonly float?: unknown;
+  }): void => {
+    if (block.float !== undefined) return;
+    block.paragraphProperties = withResolvedMark(block.paragraphProperties);
+  };
+
+  for (const el of body) visit(el);
+  return body;
+}
+
+/**
+ * Run {@link resolveBodyStyles} over every header/footer body in the map.
+ * Mutates each body in place and returns the same map.
+ */
+export function resolveHeadersFootersStyles(
+  hf: ReadonlyMap<string, ReadonlyArray<BodyElement>>,
+  sheet: StyleSheet,
+): ReadonlyMap<string, ReadonlyArray<BodyElement>> {
+  for (const value of hf.values()) resolveBodyStyles(value, sheet);
+  return hf;
+}

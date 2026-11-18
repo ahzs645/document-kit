@@ -1,0 +1,822 @@
+// E-SHEET SC1 — conditional formatting (cellIs). The first Excel feature the
+// flat table projection could not express: a value-driven per-cell fill/font.
+
+import { readFileSync } from 'node:fs';
+
+import { describe, expect, it } from 'vitest';
+
+import { buildXlsx } from './fixtures/build-xlsx';
+import { readXlsxToSheetDoc } from '../../src/ream/excel/xlsx-reader';
+import { Ream } from '../../src/ream/core/converter/ream';
+import { convertXlsxToPdfSync } from '../../src/ream/core/converter';
+import { FontRegistry } from '../../src/ream/core/font';
+import { flowRenderOptions } from '../../src/ream/core/converter/project';
+import { layoutStyledDocument } from '../../src/ream/layout/styled-layout';
+
+const STYLES_WITH_DXF = `
+  <fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>
+  <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+  <borders count="1"><border/></borders>
+  <cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellXfs>
+  <dxfs count="2">
+    <dxf><fill><patternFill patternType="solid"><bgColor rgb="FFFF0000"/></patternFill></fill></dxf>
+    <dxf><font><b/><color rgb="FF0000FF"/></font></dxf>
+  </dxfs>`;
+
+const cfRule = (operator: string, dxfId: number, ...formulas: Array<number>): string =>
+  `<cfRule type="cellIs" dxfId="${dxfId}" priority="${dxfId + 1}" operator="${operator}">` +
+  formulas.map((f) => `<formula>${f}</formula>`).join('') +
+  '</cfRule>';
+
+describe('conditional formatting — cellIs (E-SHEET SC1)', () => {
+  it('shows the bar and not the number when the rule says bar only', () => {
+    // §18.3.1.28 `<dataBar showValue="0">` — Excel's "Show Bar Only". The bar
+    // IS the cell's rendering; simple-monthly-budget.xlsx printed 2336 across
+    // the gauge the reference draws bare.
+    const stylesXml = `
+      <fonts count="1"><font><sz val="11"/></font></fonts>
+      <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+      <borders count="1"><border/></borders>
+      <cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellXfs>
+      <dxfs count="0"/>`;
+    const bar = (showValue: string) =>
+      `<conditionalFormatting sqref="A1:A2"><cfRule type="dataBar" priority="1">` +
+      `<dataBar${showValue}><cfvo type="num" val="0"/><cfvo type="num" val="100"/>` +
+      `<color rgb="FF638EC6"/></dataBar></cfRule></conditionalFormatting>`;
+    const textOf = (cf: string): Array<string> => {
+      const flow = Ream.parse(
+        buildXlsx({ rows: [[40], [80]], stylesXml, conditionalFormattingXml: cf }),
+      ).flow;
+      const table = flow.body.find((el) => el.kind === 'table');
+      if (table?.kind !== 'table') throw new Error('expected a table');
+      return table.table.rows.map((r) =>
+        (r.cells[0]?.content ?? [])
+          .map((b) => (b.kind === 'paragraph' ? b.paragraph.runs.map((x) => x.text).join('') : ''))
+          .join(''),
+      );
+    };
+    // The bar itself is drawn either way; only the number goes.
+    expect(textOf(bar(''))).toEqual(['40', '80']);
+    expect(textOf(bar(' showValue="0"'))).toEqual(['', '']);
+  });
+
+  it('tops a bar at the number a defined name holds', () => {
+    // §18.3.1.11 — a `num` stop's val may be a formula as well as a number, a
+    // defined name among them. With no number for the stop the whole bar was
+    // dropped, its "bar only" with it, and the figure was printed where the
+    // gauge belongs.
+    const stylesXml = `
+      <fonts count="1"><font><sz val="11"/></font></fonts>
+      <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+      <borders count="1"><border/></borders>
+      <cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellXfs>
+      <dxfs count="0"/>`;
+    const cf =
+      `<conditionalFormatting sqref="A1"><cfRule type="dataBar" priority="1">` +
+      `<dataBar showValue="0"><cfvo type="num" val="0"/><cfvo type="num" val="Income"/>` +
+      `<color rgb="FF638EC6"/></dataBar></cfRule></conditionalFormatting>`;
+    const flow = Ream.parse(
+      buildXlsx({
+        rows: [[25], [100]],
+        stylesXml,
+        conditionalFormattingXml: cf,
+        definedNames: [{ name: 'Income', value: 'Sheet1!$A$2' }],
+      }),
+    ).flow;
+    const table = flow.body.find((el) => el.kind === 'table');
+    if (table?.kind !== 'table') throw new Error('expected a table');
+    const cell = table.table.rows[0]!.cells[0]!;
+    // A quarter of the way up the bar's range, and §18.3.1.28's bar runs from
+    // 10% of the cell to 90%: 30%, as Excel draws it.
+    expect(cell.properties.dataBar?.fraction).toBeCloseTo(0.3);
+    expect(cell.content).toEqual([]);
+  });
+
+  it('draws a gauge as Excel does: a theme colour, solid, topped at a table total', () => {
+    // simple-monthly-budget.xlsx's "percentage of income spent": a bar over a
+    // merged E4:G5, `<color theme="4"/>`, solid by its 2009 half, topped at a
+    // name that sums a table column. Each part of it dropped the whole rule.
+    const stylesXml = `
+      <fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>
+      <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+      <borders count="1"><border/></borders>
+      <cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellXfs>`;
+    const id = '{11111111-2222-3333-4444-555555555555}';
+    const flow = Ream.parse(
+      buildXlsx({
+        rows: [
+          ['Item', 'Amount', null, 2336],
+          ['Salary', 2500],
+          ['Other', 1250],
+        ],
+        stylesXml,
+        mergeRefs: ['D1:E2'],
+        tables: [{ ref: 'A1:B3', name: 'tblIncome', columns: ['Item', 'Amount'] }],
+        definedNames: [{ name: 'TotalIncome', value: 'SUM(tblIncome[Amount])' }],
+        conditionalFormattingXml:
+          `<conditionalFormatting sqref="D1"><cfRule type="dataBar" priority="1"><dataBar showValue="0">` +
+          `<cfvo type="num" val="0"/><cfvo type="num" val="TotalIncome"/><color theme="4"/></dataBar>` +
+          `<extLst><ext uri="{B025F937-C7B1-47D3-B67F-A62EFF666E3E}"><x14:id>${id}</x14:id></ext></extLst>` +
+          `</cfRule></conditionalFormatting>`,
+        extLstXml:
+          `<extLst><ext uri="{78C0D931-6437-407d-A8EE-F0AAD7539E65}"><x14:conditionalFormattings><x14:conditionalFormatting>` +
+          `<x14:cfRule type="dataBar" id="${id}"><x14:dataBar minLength="0" maxLength="100" gradient="0">` +
+          `<x14:cfvo type="num"><xm:f>0</xm:f></x14:cfvo><x14:cfvo type="num"><xm:f>TotalIncome</xm:f></x14:cfvo>` +
+          `</x14:dataBar></x14:cfRule><xm:sqref>D1</xm:sqref></x14:conditionalFormatting></x14:conditionalFormattings></ext></extLst>`,
+      }),
+    ).flow;
+    const table = flow.body.find((el) => el.kind === 'table');
+    if (table?.kind !== 'table') throw new Error('expected a table');
+    const bar = table.table.rows[0]!.cells.find((c) => c.properties.dataBar)?.properties.dataBar;
+    // 2336 of the 3750 the table's Amount column sums to, on a 0…100% bar.
+    expect(bar?.fraction).toBeCloseTo(2336 / 3750, 3);
+    expect(bar?.solid).toBe(true);
+    expect(bar?.colorHex).toMatch(/^[0-9A-F]{6}$/);
+  });
+
+  it('paints a bar 2px inside its cell, down the whole of a merge', () => {
+    // Excel's own PDF: a bar over a two-row merge stands 2px clear of the box
+    // on every side and runs the length of what is left.
+    const flow = Ream.parse(
+      buildXlsx({
+        rows: [[50], [null]],
+        mergeRefs: ['A1:B2'],
+        conditionalFormattingXml:
+          `<conditionalFormatting sqref="A1"><cfRule type="dataBar" priority="1"><dataBar>` +
+          `<cfvo type="num" val="0"/><cfvo type="num" val="100"/><color rgb="FF638EC6"/></dataBar>` +
+          `</cfRule></conditionalFormatting>`,
+      }),
+    ).flow;
+    const laid = layoutStyledDocument(flow.body, {
+      registry: FontRegistry.fromBytes({
+        regular: new Uint8Array(readFileSync('tests/ream/fixtures/fonts/Roboto-Regular.ttf')),
+      }),
+      ...flowRenderOptions(flow),
+    });
+    const bar = laid.pages[0]!.commands.find(
+      (c) => c.type === 'shape' && c.shape.fillColorHex === '638EC6',
+    );
+    if (bar?.type !== 'shape') throw new Error('no bar drawn');
+    const ys = bar.shape.paths[0]!.segments.flatMap((sg) => ('y' in sg ? [sg.y] : []));
+    const xs = bar.shape.paths[0]!.segments.flatMap((sg) => ('x' in sg ? [sg.x] : []));
+    // Two 15pt rows, less 1.5pt above and below.
+    expect(Math.max(...ys) - Math.min(...ys)).toBeCloseTo(30 - 3, 1);
+    // Halfway along 10%…90% of two 48pt columns less the insets.
+    expect(Math.max(...xs) - Math.min(...xs)).toBeCloseTo((96 - 3) * 0.5, 1);
+  });
+
+  it("renders the value in the rule's own number format", () => {
+    // §18.8.9 — a dxf may carry a `<numFmt>`, which changes what the cell SAYS
+    // and not just how it looks. Every one of new_cond_format_test.xlsx's
+    // fourteen dxfs is a number format and nothing else, so every rule in it
+    // was a no-op: 1 where the reference shows 1.00.
+    const stylesXml = `
+      <fonts count="1"><font><sz val="11"/></font></fonts>
+      <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+      <borders count="1"><border/></borders>
+      <cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellXfs>
+      <dxfs count="1"><dxf><numFmt numFmtId="2" formatCode="0.00"/></dxf></dxfs>`;
+    const cf = `<conditionalFormatting sqref="A1:A3">${cfRule('greaterThan', 0, 5)}</conditionalFormatting>`;
+    const sheet = readXlsxToSheetDoc(
+      buildXlsx({ rows: [[2], [6], [9]], stylesXml, conditionalFormattingXml: cf }),
+    );
+    expect(sheet.styles.dxfs?.[0]?.numberFormat).toBe('0.00');
+
+    const flow = Ream.parse(
+      buildXlsx({ rows: [[2], [6], [9]], stylesXml, conditionalFormattingXml: cf }),
+    ).flow;
+    const table = flow.body.find((el) => el.kind === 'table');
+    if (table?.kind !== 'table') throw new Error('expected a table');
+    const textOf = (row: number): string =>
+      (table.table.rows[row]?.cells[0]?.content ?? [])
+        .map((b) => (b.kind === 'paragraph' ? b.paragraph.runs.map((r) => r.text).join('') : ''))
+        .join('');
+    // 2 does not match the rule and keeps General; 6 and 9 take the rule's format.
+    expect(textOf(0)).toBe('2');
+    expect(textOf(1)).toBe('6.00');
+    expect(textOf(2)).toBe('9.00');
+  });
+
+  it('applies a dxf that formats with nothing but an edge', () => {
+    // §18.8.9. A rule may carry only a border, and reading dxfs for font and
+    // fill alone made such a rule a no-op — tdf171828.xlsx rules the boundary
+    // under every year that way, and seven of its twelve dxfs are like this.
+    const stylesXml = `
+      <fonts count="1"><font><sz val="11"/></font></fonts>
+      <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+      <borders count="1"><border/></borders>
+      <cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellXfs>
+      <dxfs count="1"><dxf><border>
+        <bottom style="thin"><color rgb="FF00B050"/></bottom>
+      </border></dxf></dxfs>`;
+    const cf = `<conditionalFormatting sqref="A1:A3">${cfRule('greaterThan', 0, 5)}</conditionalFormatting>`;
+    const sheet = readXlsxToSheetDoc(
+      buildXlsx({ rows: [[2], [6], [9]], stylesXml, conditionalFormattingXml: cf }),
+    );
+    expect(sheet.styles.dxfs?.[0]?.border?.bottom?.style).toBe('thin');
+
+    const flow = Ream.parse(
+      buildXlsx({ rows: [[2], [6], [9]], stylesXml, conditionalFormattingXml: cf }),
+    ).flow;
+    const table = flow.body.find((el) => el.kind === 'table');
+    if (table?.kind !== 'table') throw new Error('expected a table');
+    const bottomOf = (row: number) => table.table.rows[row]?.cells[0]?.properties.borders?.bottom;
+    // 2 does not match the rule; 6 and 9 do.
+    expect(bottomOf(0)).toBeUndefined();
+    expect(bottomOf(1)).toMatchObject({ style: 'single', colorHex: '00B050' });
+    expect(bottomOf(2)).toMatchObject({ style: 'single', colorHex: '00B050' });
+  });
+
+  it('applies a dxf highlight fill to cells matching a greaterThan rule', () => {
+    const cf = `<conditionalFormatting sqref="A1:A3">${cfRule('greaterThan', 0, 5)}</conditionalFormatting>`;
+    const flow = Ream.parse(
+      buildXlsx({
+        rows: [[2], [6], [9]],
+        stylesXml: STYLES_WITH_DXF,
+        conditionalFormattingXml: cf,
+      }),
+    ).flow;
+    const table = flow.body.find((el) => el.kind === 'table');
+    if (table?.kind !== 'table') throw new Error('expected a table');
+    const shadingOf = (row: number): string | undefined =>
+      table.table.rows[row]?.cells[0]?.properties.shading?.colorHex;
+
+    expect(shadingOf(0)).toBeUndefined(); // A1 = 2, not > 5
+    expect(shadingOf(1)).toBe('FF0000'); // A2 = 6 → red highlight (dxf bgColor)
+    expect(shadingOf(2)).toBe('FF0000'); // A3 = 9 → red highlight
+  });
+
+  it('the highest-priority (lowest number) matching rule wins', () => {
+    // Two overlapping rules on A1=8: rule dxf 0 (priority 1, red fill) beats
+    // rule dxf 1 (priority 2, blue bold font) because its priority is lower.
+    const cf =
+      '<conditionalFormatting sqref="A1">' +
+      cfRule('greaterThan', 0, 5) +
+      cfRule('greaterThan', 1, 5) +
+      '</conditionalFormatting>';
+    const flow = Ream.parse(
+      buildXlsx({ rows: [[8]], stylesXml: STYLES_WITH_DXF, conditionalFormattingXml: cf }),
+    ).flow;
+    const table = flow.body.find((el) => el.kind === 'table');
+    if (table?.kind !== 'table') throw new Error('expected a table');
+    expect(table.table.rows[0]?.cells[0]?.properties.shading?.colorHex).toBe('FF0000');
+  });
+
+  it('a between rule highlights only the in-range cell', () => {
+    const cf = `<conditionalFormatting sqref="A1:A3">${cfRule('between', 0, 3, 7)}</conditionalFormatting>`;
+    const flow = Ream.parse(
+      buildXlsx({
+        rows: [[1], [5], [9]],
+        stylesXml: STYLES_WITH_DXF,
+        conditionalFormattingXml: cf,
+      }),
+    ).flow;
+    const table = flow.body.find((el) => el.kind === 'table');
+    if (table?.kind !== 'table') throw new Error('expected a table');
+    const shadingOf = (row: number): string | undefined =>
+      table.table.rows[row]?.cells[0]?.properties.shading?.colorHex;
+    expect(shadingOf(0)).toBeUndefined(); // 1 — below
+    expect(shadingOf(1)).toBe('FF0000'); // 5 — between 3 and 7
+    expect(shadingOf(2)).toBeUndefined(); // 9 — above
+  });
+
+  it('parses cellIs rules onto the sheet and dxfs onto the styles', () => {
+    const cf = `<conditionalFormatting sqref="A1:A3">${cfRule('greaterThan', 0, 5)}</conditionalFormatting>`;
+    const sheet = readXlsxToSheetDoc(
+      buildXlsx({ rows: [[10]], stylesXml: STYLES_WITH_DXF, conditionalFormattingXml: cf }),
+    );
+    const cfs = sheet.sheets[0]!.grid.conditionalFormats;
+    expect(cfs).toHaveLength(1);
+    const rule = cfs![0]!.rules[0]!;
+    expect(rule.type).toBe('cellIs');
+    if (rule.type !== 'cellIs') throw new Error('unreachable');
+    expect(rule.operator).toBe('greaterThan');
+    expect(rule.formulas).toEqual(['5']);
+    expect(sheet.styles.dxfs).toHaveLength(2);
+  });
+});
+
+// E-SHEET SC1b — colorScale: a gradient fill interpolated across the range's
+// value extent. The cross-cell feature cellIs (compare-to-constant) cannot do.
+const PLAIN_STYLES = `
+  <fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>
+  <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+  <borders count="1"><border/></borders>
+  <cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellXfs>`;
+
+// stops/colors length must match; each color is given as 6 hex (ARGB alpha FF
+// is prepended). `cfvos` is a list of `type[:val]` stop descriptors.
+const colorScale = (priority: number, cfvos: Array<string>, ...colors6: Array<string>): string => {
+  const cfvoXml = cfvos
+    .map((s) => {
+      const [type, val] = s.split(':');
+      return val !== undefined ? `<cfvo type="${type}" val="${val}"/>` : `<cfvo type="${type}"/>`;
+    })
+    .join('');
+  const colorXml = colors6.map((c) => `<color rgb="FF${c}"/>`).join('');
+  return `<cfRule type="colorScale" priority="${priority}"><colorScale>${cfvoXml}${colorXml}</colorScale></cfRule>`;
+};
+
+const shadingAt = (
+  flow: ReturnType<typeof Ream.parse>['flow'],
+  row: number,
+): string | undefined => {
+  const table = flow.body.find((el) => el.kind === 'table');
+  if (table?.kind !== 'table') throw new Error('expected a table');
+  return table.table.rows[row]?.cells[0]?.properties.shading?.colorHex;
+};
+
+describe('conditional formatting — colorScale (E-SHEET SC1b)', () => {
+  it('interpolates a 2-stop min→max gradient over the range', () => {
+    const cf = `<conditionalFormatting sqref="A1:A3">${colorScale(1, ['min', 'max'], 'FF0000', '00FF00')}</conditionalFormatting>`;
+    const flow = Ream.parse(
+      buildXlsx({ rows: [[0], [5], [10]], stylesXml: PLAIN_STYLES, conditionalFormattingXml: cf }),
+    ).flow;
+    expect(shadingAt(flow, 0)).toBe('FF0000'); // 0 = min → red endpoint
+    expect(shadingAt(flow, 1)).toBe('808000'); // 5 = midpoint → halfway red↔green
+    expect(shadingAt(flow, 2)).toBe('00FF00'); // 10 = max → green endpoint
+  });
+
+  it('keeps the scale when a stop is a formula it cannot evaluate', () => {
+    // §18.3.1.11 — colorscale.xlsx sets its third scale's top stop to
+    // `2*A1+2`. Dropped as unresolvable, the whole rule went with it and the
+    // column printed with no colour where both references paint the gradient.
+    // That one is evaluated now; a function nobody knows still is not.
+    const cf = `<conditionalFormatting sqref="A1:A3">${colorScale(1, ['num:0', 'formula:NOSUCH(A1)'], 'FF0000', '00FF00')}</conditionalFormatting>`;
+    const flow = Ream.parse(
+      buildXlsx({ rows: [[0], [5], [10]], stylesXml: PLAIN_STYLES, conditionalFormattingXml: cf }),
+    ).flow;
+    // The unreadable top stop falls back to the range's own maximum.
+    expect(shadingAt(flow, 0)).toBe('FF0000');
+    expect(shadingAt(flow, 1)).toBe('808000');
+    expect(shadingAt(flow, 2)).toBe('00FF00');
+  });
+
+  it('evaluates a stop that is a formula', () => {
+    // `2*A1+2` over A1 = 4 tops the scale at 10, the range's own maximum
+    // being only 5.
+    const cf = `<conditionalFormatting sqref="A1:A3">${colorScale(1, ['num:0', 'formula:2*A1+2'], 'FF0000', '00FF00')}</conditionalFormatting>`;
+    const flow = Ream.parse(
+      buildXlsx({ rows: [[4], [5], [0]], stylesXml: PLAIN_STYLES, conditionalFormattingXml: cf }),
+    ).flow;
+    expect(shadingAt(flow, 1)).toBe('808000'); // 5 of 10
+    expect(shadingAt(flow, 2)).toBe('FF0000');
+  });
+
+  it('interpolates a 3-stop min/percentile/max gradient', () => {
+    const cf = `<conditionalFormatting sqref="A1:A5">${colorScale(1, ['min', 'percentile:50', 'max'], 'FF0000', '00FF00', '0000FF')}</conditionalFormatting>`;
+    const flow = Ream.parse(
+      buildXlsx({
+        rows: [[1], [2], [3], [4], [5]],
+        stylesXml: PLAIN_STYLES,
+        conditionalFormattingXml: cf,
+      }),
+    ).flow;
+    expect(shadingAt(flow, 0)).toBe('FF0000'); // 1 = min
+    expect(shadingAt(flow, 1)).toBe('808000'); // 2 = halfway min↔median
+    expect(shadingAt(flow, 2)).toBe('00FF00'); // 3 = median (percentile 50)
+    expect(shadingAt(flow, 3)).toBe('008080'); // 4 = halfway median↔max
+    expect(shadingAt(flow, 4)).toBe('0000FF'); // 5 = max
+  });
+
+  it('a higher-priority cellIs rule wins over a colorScale on the same cell', () => {
+    const cellIsYellow = `
+      <fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>
+      <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+      <borders count="1"><border/></borders>
+      <cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellXfs>
+      <dxfs count="1"><dxf><fill><patternFill patternType="solid"><bgColor rgb="FFFFFF00"/></patternFill></fill></dxf></dxfs>`;
+    const cf =
+      '<conditionalFormatting sqref="A1:A2">' +
+      '<cfRule type="cellIs" dxfId="0" priority="1" operator="equal"><formula>10</formula></cfRule>' +
+      colorScale(2, ['min', 'max'], 'FF0000', '0000FF') +
+      '</conditionalFormatting>';
+    const flow = Ream.parse(
+      buildXlsx({ rows: [[1], [10]], stylesXml: cellIsYellow, conditionalFormattingXml: cf }),
+    ).flow;
+    expect(shadingAt(flow, 0)).toBe('FF0000'); // A1=1: cellIs misses → colorScale min (red)
+    expect(shadingAt(flow, 1)).toBe('FFFF00'); // A2=10: cellIs (prio 1) wins over scale max
+  });
+
+  it('parses a colorScale rule onto the sheet (cfvos + colors)', () => {
+    const cf = `<conditionalFormatting sqref="A1:A3">${colorScale(1, ['min', 'max'], 'FF0000', '00FF00')}</conditionalFormatting>`;
+    const sheet = readXlsxToSheetDoc(
+      buildXlsx({ rows: [[1], [2], [3]], stylesXml: PLAIN_STYLES, conditionalFormattingXml: cf }),
+    );
+    const rule = sheet.sheets[0]!.grid.conditionalFormats![0]!.rules[0]!;
+    expect(rule.type).toBe('colorScale');
+    if (rule.type !== 'colorScale') throw new Error('unreachable');
+    expect(rule.cfvos.map((c) => c.type)).toEqual(['min', 'max']);
+    expect(rule.colorsHex).toEqual(['FF0000', '00FF00']);
+  });
+});
+
+// E-SHEET SC1c — dataBar: an in-cell bar whose length encodes the value within
+// the range extent (the cell carries CellProperties.dataBar { fraction, color }).
+const dataBar = (
+  priority: number,
+  color6: string,
+  bounds?: { min?: number; max?: number },
+): string => {
+  const lens =
+    `${bounds?.min !== undefined ? ` minLength="${bounds.min}"` : ''}` +
+    `${bounds?.max !== undefined ? ` maxLength="${bounds.max}"` : ''}`;
+  return (
+    `<cfRule type="dataBar" priority="${priority}"><dataBar${lens}>` +
+    `<cfvo type="min"/><cfvo type="max"/><color rgb="FF${color6}"/></dataBar></cfRule>`
+  );
+};
+
+const barAt = (
+  flow: ReturnType<typeof Ream.parse>['flow'],
+  row: number,
+):
+  | { fraction: number; colorHex: string; startFraction?: number; negative?: boolean }
+  | undefined => {
+  const table = flow.body.find((el) => el.kind === 'table');
+  if (table?.kind !== 'table') throw new Error('expected a table');
+  return table.table.rows[row]?.cells[0]?.properties.dataBar;
+};
+
+describe('conditional formatting — dataBar (E-SHEET SC1c)', () => {
+  it('sets a bar fraction from the value position in the range extent', () => {
+    const cf = `<conditionalFormatting sqref="A1:A3">${dataBar(1, '638EC6', { min: 0, max: 100 })}</conditionalFormatting>`;
+    const flow = Ream.parse(
+      buildXlsx({ rows: [[0], [5], [10]], stylesXml: PLAIN_STYLES, conditionalFormattingXml: cf }),
+    ).flow;
+    expect(barAt(flow, 0)?.colorHex).toBe('638EC6');
+    expect(barAt(flow, 0)?.fraction).toBeCloseTo(0); // 0 = min → empty bar
+    expect(barAt(flow, 1)?.fraction).toBeCloseTo(0.5); // 5 = midpoint
+    expect(barAt(flow, 2)?.fraction).toBeCloseTo(1); // 10 = max → full bar
+  });
+
+  it('clamps the bar between minLength and maxLength', () => {
+    const cf = `<conditionalFormatting sqref="A1:A3">${dataBar(1, '638EC6', { min: 20, max: 80 })}</conditionalFormatting>`;
+    const flow = Ream.parse(
+      buildXlsx({ rows: [[0], [5], [10]], stylesXml: PLAIN_STYLES, conditionalFormattingXml: cf }),
+    ).flow;
+    expect(barAt(flow, 0)?.fraction).toBeCloseTo(0.2); // min value → minLength
+    expect(barAt(flow, 1)?.fraction).toBeCloseTo(0.5); // 0.2 + 0.5·0.6
+    expect(barAt(flow, 2)?.fraction).toBeCloseTo(0.8); // max value → maxLength
+  });
+
+  it('a data bar coexists with a cellIs highlight on the same cell', () => {
+    const cf =
+      '<conditionalFormatting sqref="A1:A2">' +
+      cfRule('greaterThan', 0, 5) + // cellIs >5 → red fill (dxf 0), priority 1
+      dataBar(2, '638EC6', { min: 0, max: 100 }) +
+      '</conditionalFormatting>';
+    const flow = Ream.parse(
+      buildXlsx({ rows: [[1], [10]], stylesXml: STYLES_WITH_DXF, conditionalFormattingXml: cf }),
+    ).flow;
+    const table = flow.body.find((el) => el.kind === 'table');
+    if (table?.kind !== 'table') throw new Error('expected a table');
+    const cell = (row: number) => table.table.rows[row]?.cells[0]?.properties;
+    // A1=1: cellIs misses (no fill); bar empty.
+    expect(cell(0)?.shading).toBeUndefined();
+    expect(barAt(flow, 0)?.fraction).toBeCloseTo(0);
+    // A2=10: cellIs red fill AND a full bar — both apply.
+    expect(cell(1)?.shading?.colorHex).toBe('FF0000');
+    expect(barAt(flow, 1)?.fraction).toBeCloseTo(1);
+    expect(barAt(flow, 1)?.colorHex).toBe('638EC6');
+  });
+
+  it('parses a dataBar rule onto the sheet', () => {
+    const cf = `<conditionalFormatting sqref="A1:A3">${dataBar(1, '638EC6', { min: 0, max: 100 })}</conditionalFormatting>`;
+    const sheet = readXlsxToSheetDoc(
+      buildXlsx({ rows: [[1], [2], [3]], stylesXml: PLAIN_STYLES, conditionalFormattingXml: cf }),
+    );
+    const rule = sheet.sheets[0]!.grid.conditionalFormats![0]!.rules[0]!;
+    expect(rule.type).toBe('dataBar');
+    if (rule.type !== 'dataBar') throw new Error('unreachable');
+    expect(rule.colorHex).toBe('638EC6');
+    expect(rule.cfvos.map((c) => c.type)).toEqual(['min', 'max']);
+    expect(rule.minLength).toBe(0);
+    expect(rule.maxLength).toBe(100);
+  });
+
+  it('draws a mixed-sign data bar around a zero axis (Tail TC4)', () => {
+    // Extent [-10, 10] → the axis sits at 0.5; negatives run left in red.
+    const cf = `<conditionalFormatting sqref="A1:A3">${dataBar(1, '638EC6')}</conditionalFormatting>`;
+    const flow = Ream.parse(
+      buildXlsx({
+        rows: [[-10], [0], [10]],
+        stylesXml: PLAIN_STYLES,
+        conditionalFormattingXml: cf,
+      }),
+    ).flow;
+    const neg = barAt(flow, 0);
+    expect(neg?.colorHex).toBe('FF0000'); // negative → Excel's default red
+    expect(neg?.fraction).toBeCloseTo(0.5);
+    expect(neg?.startFraction).toBeCloseTo(0); // runs from the left up to the axis
+    const pos = barAt(flow, 2);
+    expect(pos?.colorHex).toBe('638EC6'); // positive → series colour
+    expect(pos?.fraction).toBeCloseTo(0.5);
+    expect(pos?.startFraction).toBeCloseTo(0.5); // runs from the axis to the right
+    // …and each is flagged with the direction it grows in, because Excel fades
+    // a bar AWAY from the axis and which way that is depends on the sign.
+    expect(neg?.negative).toBe(true);
+    expect(pos?.negative).toBeUndefined();
+  });
+
+  it('keeps an all-positive data bar left-anchored (no axis)', () => {
+    const cf = `<conditionalFormatting sqref="A1:A2">${dataBar(1, '638EC6', { min: 0, max: 100 })}</conditionalFormatting>`;
+    const flow = Ream.parse(
+      buildXlsx({ rows: [[5], [10]], stylesXml: PLAIN_STYLES, conditionalFormattingXml: cf }),
+    ).flow;
+    expect(barAt(flow, 1)?.startFraction).toBeUndefined();
+  });
+});
+
+// E-SHEET SC1c — iconSet: a glyph per cell from a named family, chosen by the
+// value's bucket among the cfvo thresholds (the cell carries CellProperties.icon
+// { shape, colorHex }; the xlsx layer maps families → format-neutral shapes).
+const iconSet = (name: string, cfvos: Array<string>, reverse = false): string => {
+  const cfvoXml = cfvos
+    .map((s) => {
+      const [type, val] = s.split(':');
+      return `<cfvo type="${type}" val="${val}"/>`;
+    })
+    .join('');
+  return (
+    `<cfRule type="iconSet" priority="1"><iconSet iconSet="${name}"${reverse ? ' reverse="1"' : ''}>` +
+    `${cfvoXml}</iconSet></cfRule>`
+  );
+};
+
+const iconAt = (
+  flow: ReturnType<typeof Ream.parse>['flow'],
+  row: number,
+): { shape: string; colorHex: string; fill?: { filled: number; levels: number } } | undefined => {
+  const table = flow.body.find((el) => el.kind === 'table');
+  if (table?.kind !== 'table') throw new Error('expected a table');
+  return table.table.rows[row]?.cells[0]?.properties.icon;
+};
+
+describe('conditional formatting — iconSet (E-SHEET SC1c)', () => {
+  it('picks a traffic-light icon by the value bucket', () => {
+    // percent 0/33/67 over [10,90] → thresholds 10, 36.4, 63.6.
+    const cf = `<conditionalFormatting sqref="A1:A3">${iconSet('3TrafficLights1', ['percent:0', 'percent:33', 'percent:67'])}</conditionalFormatting>`;
+    const flow = Ream.parse(
+      buildXlsx({
+        rows: [[10], [50], [90]],
+        stylesXml: PLAIN_STYLES,
+        conditionalFormattingXml: cf,
+      }),
+    ).flow;
+    expect(iconAt(flow, 0)).toEqual({ shape: 'circle', colorHex: 'FF0000' }); // bucket 0
+    expect(iconAt(flow, 1)).toEqual({ shape: 'circle', colorHex: 'FFC000' }); // bucket 1
+    expect(iconAt(flow, 2)).toEqual({ shape: 'circle', colorHex: '00B050' }); // bucket 2
+  });
+
+  it('shows the icon and not the number when the rule says icon only', () => {
+    // §18.3.1.49 `<iconSet showValue="0">` — Excel's "Show Icon Only", which is
+    // what a column of status ticks is: ConditionalFormattingSamples.xlsx sets
+    // it on every Status and Trend column, and we printed each number beside
+    // the icon that already says it.
+    const rule = iconSet('3Arrows', ['percent:0', 'percent:33', 'percent:67']).replace(
+      '<iconSet ',
+      '<iconSet showValue="0" ',
+    );
+    const flow = Ream.parse(
+      buildXlsx({
+        rows: [[10], [90]],
+        stylesXml: PLAIN_STYLES,
+        conditionalFormattingXml: `<conditionalFormatting sqref="A1:A2">${rule}</conditionalFormatting>`,
+      }),
+    ).flow;
+    const table = flow.body.find((el) => el.kind === 'table');
+    if (table?.kind !== 'table') throw new Error('expected a table');
+    const text = (row: number): string =>
+      (table.table.rows[row]?.cells[0]?.content ?? [])
+        .map((b) => (b.kind === 'paragraph' ? b.paragraph.runs.map((r) => r.text).join('') : ''))
+        .join('');
+    expect([text(0), text(1)]).toEqual(['', '']);
+    expect(iconAt(flow, 1)?.shape).toBe('triangleUp');
+  });
+
+  it('maps 3Arrows to down/right/up triangles', () => {
+    const cf = `<conditionalFormatting sqref="A1:A3">${iconSet('3Arrows', ['percent:0', 'percent:33', 'percent:67'])}</conditionalFormatting>`;
+    const flow = Ream.parse(
+      buildXlsx({
+        rows: [[10], [50], [90]],
+        stylesXml: PLAIN_STYLES,
+        conditionalFormattingXml: cf,
+      }),
+    ).flow;
+    expect(iconAt(flow, 0)?.shape).toBe('triangleDown'); // lowest bucket
+    expect(iconAt(flow, 1)?.shape).toBe('triangleRight');
+    expect(iconAt(flow, 2)?.shape).toBe('triangleUp'); // highest bucket
+  });
+
+  it('reverse flips the icon order (low value → top icon)', () => {
+    const cf = `<conditionalFormatting sqref="A1:A2">${iconSet('3TrafficLights1', ['percent:0', 'percent:33', 'percent:67'], true)}</conditionalFormatting>`;
+    const flow = Ream.parse(
+      buildXlsx({ rows: [[10], [90]], stylesXml: PLAIN_STYLES, conditionalFormattingXml: cf }),
+    ).flow;
+    expect(iconAt(flow, 0)?.colorHex).toBe('00B050'); // value 10, reversed → green
+    expect(iconAt(flow, 1)?.colorHex).toBe('FF0000'); // value 90, reversed → red
+  });
+
+  it('maps 3Signs to diamond / triangle / circle by bucket (Tail TC2)', () => {
+    const cf = `<conditionalFormatting sqref="A1:A3">${iconSet('3Signs', ['percent:0', 'percent:33', 'percent:67'])}</conditionalFormatting>`;
+    const flow = Ream.parse(
+      buildXlsx({
+        rows: [[10], [50], [90]],
+        stylesXml: PLAIN_STYLES,
+        conditionalFormattingXml: cf,
+      }),
+    ).flow;
+    expect(iconAt(flow, 0)?.shape).toBe('diamond'); // low
+    expect(iconAt(flow, 1)?.shape).toBe('triangleUp');
+    expect(iconAt(flow, 2)?.shape).toBe('circle'); // high
+  });
+
+  it('renders a *Gray family monochrome (Tail TC2)', () => {
+    const cf = `<conditionalFormatting sqref="A1:A3">${iconSet('3ArrowsGray', ['percent:0', 'percent:33', 'percent:67'])}</conditionalFormatting>`;
+    const flow = Ream.parse(
+      buildXlsx({
+        rows: [[10], [50], [90]],
+        stylesXml: PLAIN_STYLES,
+        conditionalFormattingXml: cf,
+      }),
+    ).flow;
+    // All three arrows are grey; only the direction differs.
+    expect(iconAt(flow, 0)).toEqual({ shape: 'triangleDown', colorHex: '808080' });
+    expect(iconAt(flow, 1)).toEqual({ shape: 'triangleRight', colorHex: '808080' });
+    expect(iconAt(flow, 2)).toEqual({ shape: 'triangleUp', colorHex: '808080' });
+  });
+
+  it('parses an iconSet rule onto the sheet', () => {
+    const cf = `<conditionalFormatting sqref="A1:A4">${iconSet('4Rating', ['percent:0', 'percent:25', 'percent:50', 'percent:75'])}</conditionalFormatting>`;
+    const sheet = readXlsxToSheetDoc(
+      buildXlsx({
+        rows: [[1], [2], [3], [4]],
+        stylesXml: PLAIN_STYLES,
+        conditionalFormattingXml: cf,
+      }),
+    );
+    const rule = sheet.sheets[0]!.grid.conditionalFormats![0]!.rules[0]!;
+    expect(rule.type).toBe('iconSet');
+    if (rule.type !== 'iconSet') throw new Error('unreachable');
+    expect(rule.iconSet).toBe('4Rating');
+    expect(rule.cfvos).toHaveLength(4);
+  });
+
+  it('maps 3Symbols to cross / exclamation / check on the ramp (Tail TC5)', () => {
+    const cf = `<conditionalFormatting sqref="A1:A3">${iconSet('3Symbols', ['percent:0', 'percent:33', 'percent:67'])}</conditionalFormatting>`;
+    const flow = Ream.parse(
+      buildXlsx({
+        rows: [[10], [50], [90]],
+        stylesXml: PLAIN_STYLES,
+        conditionalFormattingXml: cf,
+      }),
+    ).flow;
+    expect(iconAt(flow, 0)).toEqual({ shape: 'cross', colorHex: 'FF0000' }); // low
+    expect(iconAt(flow, 1)).toEqual({ shape: 'exclamation', colorHex: 'FFC000' }); // mid
+    expect(iconAt(flow, 2)).toEqual({ shape: 'check', colorHex: '00B050' }); // high
+  });
+
+  it('maps 4Rating to a monochrome bars meter, filling bucket+1 of 4 (Tail TC5)', () => {
+    const cf = `<conditionalFormatting sqref="A1:A4">${iconSet('4Rating', ['percent:0', 'percent:25', 'percent:50', 'percent:75'])}</conditionalFormatting>`;
+    const flow = Ream.parse(
+      buildXlsx({
+        rows: [[1], [2], [3], [4]],
+        stylesXml: PLAIN_STYLES,
+        conditionalFormattingXml: cf,
+      }),
+    ).flow;
+    expect(iconAt(flow, 0)).toEqual({
+      shape: 'bars',
+      colorHex: '595959',
+      fill: { filled: 1, levels: 4 },
+    });
+    expect(iconAt(flow, 3)).toEqual({
+      shape: 'bars',
+      colorHex: '595959',
+      fill: { filled: 4, levels: 4 },
+    });
+  });
+
+  it('maps 5Quarters to a clock pie, filling bucket of 4 slices (Tail TC5)', () => {
+    const cf = `<conditionalFormatting sqref="A1:A5">${iconSet('5Quarters', ['percent:0', 'percent:20', 'percent:40', 'percent:60', 'percent:80'])}</conditionalFormatting>`;
+    const flow = Ream.parse(
+      buildXlsx({
+        rows: [[1], [2], [3], [4], [5]],
+        stylesXml: PLAIN_STYLES,
+        conditionalFormattingXml: cf,
+      }),
+    ).flow;
+    expect(iconAt(flow, 0)).toEqual({
+      shape: 'pie',
+      colorHex: '595959',
+      fill: { filled: 0, levels: 4 },
+    }); // empty
+    expect(iconAt(flow, 4)).toEqual({
+      shape: 'pie',
+      colorHex: '595959',
+      fill: { filled: 4, levels: 4 },
+    }); // full
+  });
+});
+
+// A sheet carrying both decorations must survive the full layout + PDF emit
+// path (the bar FillItem and the icon ShapeItem), not just reach the FlowDoc.
+const FONTS = {
+  regular: new Uint8Array(readFileSync('tests/ream/fixtures/fonts/Roboto-Regular.ttf')),
+  bold: new Uint8Array(readFileSync('tests/ream/fixtures/fonts/Roboto-Bold.ttf')),
+  italic: new Uint8Array(readFileSync('tests/ream/fixtures/fonts/Roboto-Italic.ttf')),
+  boldItalic: new Uint8Array(readFileSync('tests/ream/fixtures/fonts/Roboto-BoldItalic.ttf')),
+};
+
+describe('conditional formatting — render smoke (E-SHEET SC1c)', () => {
+  it('renders a sheet with a data bar and an icon set to a valid PDF', () => {
+    const cf =
+      `<conditionalFormatting sqref="A1:A3">${dataBar(2, '638EC6', { min: 0, max: 100 })}</conditionalFormatting>` +
+      `<conditionalFormatting sqref="B1:B3">${iconSet('3TrafficLights1', ['percent:0', 'percent:33', 'percent:67'])}</conditionalFormatting>`;
+    const xlsx = buildXlsx({
+      rows: [
+        [1, 10],
+        [5, 50],
+        [10, 90],
+      ],
+      stylesXml: PLAIN_STYLES,
+      conditionalFormattingXml: cf,
+    });
+    const pdf = convertXlsxToPdfSync(xlsx, { fonts: FONTS });
+    expect(pdf.length).toBeGreaterThan(1000);
+    expect(new TextDecoder().decode(pdf.subarray(0, 5))).toBe('%PDF-');
+  });
+
+  it('renders the rating bars and quarter pie as inline SVG in HTML (Tail TC5)', async () => {
+    const cf =
+      `<conditionalFormatting sqref="A1:A5">${iconSet('4Rating', ['percent:0', 'percent:25', 'percent:50', 'percent:75'])}</conditionalFormatting>` +
+      `<conditionalFormatting sqref="B1:B5">${iconSet('5Quarters', ['percent:0', 'percent:20', 'percent:40', 'percent:60', 'percent:80'])}</conditionalFormatting>`;
+    const xlsx = buildXlsx({
+      rows: [
+        [1, 1],
+        [2, 2],
+        [3, 3],
+        [4, 4],
+        [5, 5],
+      ],
+      stylesXml: PLAIN_STYLES,
+      conditionalFormattingXml: cf,
+    });
+    const html = new TextDecoder().decode(await Ream.parse(xlsx).convert('html'));
+    expect(html).toContain('#595959'); // meter colour (bars + pie)
+    expect(html).toContain('#BFBFBF'); // unfilled bars / base circle
+    expect(html).toContain('A4.4 4.4 0'); // a quarter-pie arc
+  });
+});
+
+// §18.3.1.11 — a `cellIs` rule's operands are not always numbers.
+describe('cellIs against text', () => {
+  const STYLES = `
+    <fonts count="1"><font><sz val="11"/></font></fonts>
+    <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+    <borders count="1"><border/></borders>
+    <cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellXfs>
+    <dxfs count="1"><dxf><fill><patternFill><bgColor rgb="FFFFCC99"/></patternFill></fill></dxf></dxfs>`;
+
+  /** The shading each cell of the first row resolves to. */
+  function shadings(
+    operator: string,
+    operand: string,
+    values: Array<string | number>,
+  ): Array<unknown> {
+    const { flow } = Ream.parse(
+      buildXlsx({
+        rows: [values],
+        stylesXml: STYLES,
+        conditionalFormattingXml:
+          `<conditionalFormatting sqref="A1:E1"><cfRule type="cellIs" dxfId="0" priority="1" ` +
+          `operator="${operator}"><formula>${operand}</formula></cfRule></conditionalFormatting>`,
+      }),
+    );
+    return flow.body
+      .flatMap((el) => (el.kind === 'table' ? (el.table.rows[0]?.cells ?? []) : []))
+      .map((c) => c.properties.shading);
+  }
+
+  it('formats every cell that holds something — `notEqual ""`', () => {
+    // How a document asks for "everything with a value in it". Read as a
+    // number the operand is NaN and the rule matched nothing:
+    // tdf152581_bordercolorNotExportedToXLSX.xlsx lost the fill on both cells.
+    const [a, b] = shadings('notEqual', '""', ['test', 'x']);
+    expect(a).toBeDefined();
+    expect(b).toBeDefined();
+  });
+
+  it('compares words case-insensitively', () => {
+    const [a, b] = shadings('equal', '"ABC"', ['abc', 'abd']);
+    expect(a).toBeDefined();
+    expect(b).toBeUndefined();
+  });
+
+  it('leaves a numeric comparison arithmetic', () => {
+    const [a, b] = shadings('greaterThan', '5', [10, 3]);
+    expect(a).toBeDefined();
+    expect(b).toBeUndefined();
+  });
+});

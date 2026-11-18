@@ -1,0 +1,349 @@
+// Table-style resolution (ECMA-376 §17.7.6) — a FlowDoc transform in the
+// stage-6 mould: the reader runs it right after parsing, so the tree carries
+// final effective cell chrome (shading, borders, margins) and the table-style
+// text layer, and no writer has to know table styles exist.
+//
+// Layer model: a table style contributes its base layer (wholeTable) plus
+// conditional region layers (§17.7.6.3) gated by the table's w:tblLook.
+// Application order, low → high (§17.7.6.6): wholeTable → column bands → row
+// bands → first/last column → first/last row → corner cells; the basedOn
+// chain folds root-first within each region.
+//
+// The style's run/paragraph properties are carried on the cell's paragraphs as
+// the layer §17.7.6.6 makes them: between docDefaults and the paragraph's own
+// style, which the cascade merges in at that rank. Written onto the paragraph
+// and its runs instead — as if the document had stated them there — the table
+// style outranked every style a cell's text names, and tdf119054.docx's
+// headings lost the 18pt their style leaves after each of them. Mutates in
+// place — the reader owns the tree (resolveBodyStyles sets the precedent).
+
+import type {
+  BodyElement,
+  CellBorders,
+  ParagraphProperties,
+  RunProperties,
+  Style,
+  StyleSheet,
+  Table,
+  TableCell,
+  TableLook,
+  TableStyleConditionType,
+  TableStyleLayer,
+} from '../document-model';
+
+import { mergeRunPartial } from './resolver';
+
+/**
+ * Apply table styles across a body (ECMA-376 §17.7.6): for each table, fold its
+ * `basedOn` chain and apply the base + `tblLook`-gated conditional region layers
+ * to every cell's chrome (shading, borders, margins) and run/paragraph text, as
+ * a fallback under direct formatting. Recurses into nested tables and shape
+ * text. Mutates the tree IN PLACE and returns it.
+ */
+export function resolveTableStyles(
+  body: ReadonlyArray<BodyElement>,
+  sheet: StyleSheet,
+): ReadonlyArray<BodyElement> {
+  const visit = (el: BodyElement): void => {
+    if (el.kind === 'table') {
+      applyTableStyle(el.table, sheet);
+      for (const row of el.table.rows) {
+        for (const cell of row.cells) {
+          for (const child of cell.content) visit(child);
+        }
+      }
+    } else if (el.kind === 'shape' && el.shape.text) {
+      for (const child of el.shape.text.content) visit(child);
+    }
+  };
+  for (const el of body) visit(el);
+  return body;
+}
+
+interface FoldedTableStyle {
+  readonly base: TableStyleLayer;
+  readonly conditions: ReadonlyMap<TableStyleConditionType, TableStyleLayer>;
+  readonly rowBandSize: number;
+  readonly colBandSize: number;
+}
+
+function applyTableStyle(table: Table, sheet: StyleSheet): void {
+  const styleId = table.properties.styleId;
+  if (!styleId) return;
+  const folded = foldTableStyleChain(styleId, sheet);
+  if (!folded) return;
+
+  // Table-level chrome: the style's grid/outer borders and default cell
+  // margins back-fill the table properties (direct tblPr wins).
+  const tp = table.properties as {
+    borders?: CellBorders;
+    defaultCellMargins?: TableStyleLayer['cellMargins'];
+    indentPt?: TableStyleLayer['indentPt'];
+  };
+  // §17.7.6 — the table's OWN `w:tblBorders` outrank the style's conditional
+  // regions too, so which sides it states has to be known before they are
+  // back-filled from the style below.
+  const directBorders = tp.borders;
+  if (!tp.borders && folded.base.borders) tp.borders = folded.base.borders;
+  if (!tp.defaultCellMargins && folded.base.cellMargins) {
+    tp.defaultCellMargins = folded.base.cellMargins;
+  }
+  if (tp.indentPt === undefined && folded.base.indentPt !== undefined) {
+    tp.indentPt = folded.base.indentPt;
+  }
+
+  const look = table.properties.look ?? {};
+  const rows = table.rows;
+  const colCount = Math.max(
+    table.grid.length,
+    ...rows.map((r) => r.cells.reduce((s, c) => s + (c.properties.colSpan ?? 1), 0)),
+  );
+
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r]!;
+    let colStart = 0;
+    for (const cell of row.cells) {
+      const span = cell.properties.colSpan ?? 1;
+      const layer = cellLayer(folded, look, {
+        // §17.4.7 — a row may CLAIM the first/last-row format whatever its
+        // index is, and Word's calendar templates do exactly that for their
+        // second header row.
+        firstRow: r === 0 || row.properties.conditional?.firstRow === true,
+        lastRow: r === rows.length - 1 || row.properties.conditional?.lastRow === true,
+        firstCol: colStart === 0,
+        lastCol: colStart + span >= colCount,
+        rowBand: bandIndex(r, look.firstRow === true, folded.rowBandSize),
+        colBand: bandIndex(colStart, look.firstColumn === true, folded.colBandSize),
+        noHBand: look.noHBand === true,
+        noVBand: look.noVBand === true,
+      });
+      const pos = {
+        firstRow: r === 0 || row.properties.conditional?.firstRow === true,
+        lastRow: r === rows.length - 1 || row.properties.conditional?.lastRow === true,
+        firstCol: colStart === 0,
+        lastCol: colStart + span >= colCount,
+      };
+      colStart += span;
+      if (!layer) continue;
+      applyLayerToCell(cell, layer, directBorders, pos);
+    }
+  }
+}
+
+interface MutableCell {
+  properties: {
+    borders?: CellBorders;
+    margins?: TableStyleLayer['cellMargins'];
+    shading?: TableStyleLayer['shading'];
+  };
+  content: ReadonlyArray<BodyElement>;
+}
+
+function applyLayerToCell(
+  tableCell: TableCell,
+  layer: TableStyleLayer,
+  // §17.7.6 — the sides the table states in its OWN `w:tblBorders`, which the
+  // style's conditional regions do not get to overrule, and where this cell
+  // sits (which decides whether an edge answers to `top`/`bottom`/`left`/
+  // `right` or to `insideH`/`insideV`).
+  directBorders: CellBorders | undefined,
+  pos: { firstRow: boolean; lastRow: boolean; firstCol: boolean; lastCol: boolean },
+): void {
+  const cell = tableCell as unknown as MutableCell;
+  if (layer.shading && !cell.properties.shading) cell.properties.shading = layer.shading;
+  if (layer.cellMargins && !cell.properties.margins) cell.properties.margins = layer.cellMargins;
+  if (layer.borders) {
+    // Per-side fallback: a direct tcBorders side always wins over the style's.
+    const own = cell.properties.borders ?? {};
+    // …and so does a side the TABLE states. table-style-border.docx rules a
+    // black grid in its `w:tblPr` over a style whose corner regions spell the
+    // same edges away, and taking the region's word for it left the table with
+    // no right edge, no bottom and no rule between its two rows.
+    const fromStyle = { ...layer.borders };
+    if (directBorders) {
+      const stated = (side: 'top' | 'bottom' | 'left' | 'right', outer: boolean): boolean =>
+        (outer
+          ? directBorders[side]
+          : directBorders[side === 'top' || side === 'bottom' ? 'insideH' : 'insideV']) !==
+        undefined;
+      if (stated('top', pos.firstRow)) delete fromStyle.top;
+      if (stated('bottom', pos.lastRow)) delete fromStyle.bottom;
+      if (stated('left', pos.firstCol)) delete fromStyle.left;
+      if (stated('right', pos.lastCol)) delete fromStyle.right;
+    }
+    const merged: CellBorders = { ...fromStyle, ...definedOnly(own) };
+    cell.properties.borders = merged;
+  }
+  if (layer.runProperties || layer.paragraphProperties) {
+    for (const el of cell.content) {
+      if (el.kind !== 'paragraph') continue; // nested tables resolve themselves
+      const p = el.paragraph as unknown as {
+        properties: ParagraphProperties;
+        runs: ReadonlyArray<{ properties: RunProperties }>;
+      };
+      if (layer.paragraphProperties) {
+        // §17.7.2 — carried apart from the direct properties, because the
+        // cascade ranks it UNDER the paragraph's own style; merged in as if
+        // the paragraph stated it, a table style's `w:spacing` beat the
+        // heading style of the cell's text (tdf119054, tdf118947_tableStyle).
+        p.properties = {
+          ...p.properties,
+          tableStyle: { ...p.properties.tableStyle, ...layer.paragraphProperties },
+        };
+      }
+      if (layer.runProperties) {
+        // §17.7.2 again, on the run side: the table style ranks under the
+        // paragraph's style AND under the character style a run names, so it
+        // is carried on the paragraph rather than pushed onto each run.
+        // Pushed on, tdf118812_tableStyles-comprehensive.docx's every cell
+        // came out in the table style's 8pt blue where both references keep
+        // the colour and size of the style each paragraph is written in.
+        // The paragraph MARK reads the same carrier: a cell with no runs still
+        // has one, and its size is the row's height (conditionalstyles-
+        // tbllook.docx sets its first column in 36pt).
+        p.properties = {
+          ...p.properties,
+          inheritedRun: mergeRunPartial(p.properties.inheritedRun ?? {}, layer.runProperties),
+        };
+      }
+    }
+  }
+}
+
+interface CellPosition {
+  readonly firstRow: boolean;
+  readonly lastRow: boolean;
+  readonly firstCol: boolean;
+  readonly lastCol: boolean;
+  readonly rowBand: number; // 0-based band index, -1 when outside banding
+  readonly colBand: number;
+  readonly noHBand: boolean;
+  readonly noVBand: boolean;
+}
+
+// Which band a row/column falls into: rows participating in banding start
+// after the first row when the first-row format is on (§17.7.6.6 note); band
+// size groups N consecutive rows per band.
+function bandIndex(index: number, skipFirst: boolean, bandSize: number): number {
+  const adjusted = index - (skipFirst ? 1 : 0);
+  if (adjusted < 0) return -1;
+  return Math.floor(adjusted / Math.max(1, bandSize));
+}
+
+// Merge the applicable region layers, low → high precedence.
+function cellLayer(
+  folded: FoldedTableStyle,
+  look: TableLook,
+  pos: CellPosition,
+): TableStyleLayer | undefined {
+  // §17.7.6 — the style's WHOLE-TABLE borders are a table-level default, and
+  // the table's own `w:tblBorders` beat them (applyTableStyle back-fills them
+  // onto the table when it declares none). Pushed down onto every cell they
+  // beat the table's instead: all_gaps_word.docx spells its TableGrid away
+  // edge by edge and we boxed every one of its 54 cells.
+  const { borders: _tableWide, ...withoutBorders } = folded.base;
+  const base: TableStyleLayer = withoutBorders;
+  const layers: Array<TableStyleLayer | undefined> = [base];
+  const cond = (t: TableStyleConditionType) => folded.conditions.get(t);
+
+  if (!pos.noVBand && pos.colBand >= 0) {
+    layers.push(pos.colBand % 2 === 0 ? cond('band1Vert') : cond('band2Vert'));
+  }
+  if (!pos.noHBand && pos.rowBand >= 0) {
+    layers.push(pos.rowBand % 2 === 0 ? cond('band1Horz') : cond('band2Horz'));
+  }
+  if (look.firstColumn && pos.firstCol) layers.push(cond('firstCol'));
+  if (look.lastColumn && pos.lastCol) layers.push(cond('lastCol'));
+  if (look.firstRow && pos.firstRow) layers.push(cond('firstRow'));
+  if (look.lastRow && pos.lastRow) layers.push(cond('lastRow'));
+  if (look.firstRow && look.firstColumn && pos.firstRow && pos.firstCol) {
+    layers.push(cond('nwCell'));
+  }
+  if (look.firstRow && look.lastColumn && pos.firstRow && pos.lastCol) layers.push(cond('neCell'));
+  if (look.lastRow && look.firstColumn && pos.lastRow && pos.firstCol) layers.push(cond('swCell'));
+  if (look.lastRow && look.lastColumn && pos.lastRow && pos.lastCol) layers.push(cond('seCell'));
+
+  let out: TableStyleLayer | undefined;
+  for (const layer of layers) {
+    if (!layer) continue;
+    out = out ? mergeLayer(out, layer) : layer;
+  }
+  return out;
+}
+
+// basedOn chain folded root-first: base layers merge into one; conditional
+// layers merge per region type.
+function foldTableStyleChain(styleId: string, sheet: StyleSheet): FoldedTableStyle | undefined {
+  const chain: Array<Style> = [];
+  const visited = new Set<string>();
+  let cursor: string | undefined = styleId;
+  while (cursor && !visited.has(cursor)) {
+    visited.add(cursor);
+    const style = sheet.styles.get(cursor);
+    if (!style || style.type !== 'table') break;
+    chain.unshift(style);
+    cursor = style.basedOn;
+  }
+  if (chain.length === 0) return undefined;
+
+  let base: TableStyleLayer = {};
+  const conditions = new Map<TableStyleConditionType, TableStyleLayer>();
+  let rowBandSize = 1;
+  let colBandSize = 1;
+  for (const style of chain) {
+    // The style's own rPr/pPr are part of its base layer (alongside tblPr).
+    const own: TableStyleLayer = {
+      ...(style.tableLayer ?? {}),
+      ...(Object.keys(style.runProperties).length > 0 && !style.tableLayer?.runProperties
+        ? { runProperties: style.runProperties }
+        : {}),
+      ...(Object.keys(style.paragraphProperties).length > 0 &&
+      !style.tableLayer?.paragraphProperties
+        ? { paragraphProperties: style.paragraphProperties }
+        : {}),
+    };
+    base = mergeLayer(base, own);
+    for (const c of style.tableConditions ?? []) {
+      const prev = conditions.get(c.type);
+      conditions.set(c.type, prev ? mergeLayer(prev, c.layer) : c.layer);
+    }
+    if (style.rowBandSize !== undefined) rowBandSize = style.rowBandSize;
+    if (style.colBandSize !== undefined) colBandSize = style.colBandSize;
+  }
+  return { base, conditions, rowBandSize, colBandSize };
+}
+
+function mergeLayer(base: TableStyleLayer, override: TableStyleLayer): TableStyleLayer {
+  return {
+    ...((override.borders ?? base.borders)
+      ? { borders: { ...base.borders, ...definedOnly(override.borders ?? {}) } }
+      : {}),
+    ...((override.cellMargins ?? base.cellMargins)
+      ? { cellMargins: { ...base.cellMargins, ...definedOnly(override.cellMargins ?? {}) } }
+      : {}),
+    ...((override.indentPt ?? base.indentPt) !== undefined
+      ? { indentPt: override.indentPt ?? base.indentPt }
+      : {}),
+    ...((override.shading ?? base.shading) ? { shading: override.shading ?? base.shading } : {}),
+    ...((override.runProperties ?? base.runProperties)
+      ? { runProperties: mergeRunPartial(base.runProperties ?? {}, override.runProperties ?? {}) }
+      : {}),
+    ...((override.paragraphProperties ?? base.paragraphProperties)
+      ? {
+          paragraphProperties: {
+            ...base.paragraphProperties,
+            ...definedOnly(override.paragraphProperties ?? {}),
+          },
+        }
+      : {}),
+  };
+}
+
+function definedOnly<T extends object>(obj: T): Partial<T> {
+  const out: Partial<T> = {};
+  for (const key of Object.keys(obj) as Array<keyof T>) {
+    const v = obj[key];
+    if (v !== undefined) out[key] = v;
+  }
+  return out;
+}

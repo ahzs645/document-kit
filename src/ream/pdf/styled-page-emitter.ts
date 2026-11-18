@@ -1,0 +1,2190 @@
+// Emit phase: LaidOutDocument → PDF objects (ISO 32000).
+//
+// The counterpart of layoutStyledDocument (the seam of ir-design §7 /
+// oop-design §4.1). Input is the laid-out document plus the output-side
+// EmitOptions only — fonts and images embed first (the object order the
+// pre-split renderer produced), then pages replay their PageItems, then the
+// catalog assembles OutputIntent/XMP/struct-tree/attachments as required.
+
+import type { BorderStyle, DocumentInfo, ImageCrop } from '../core/document-model';
+import type { ResourceId } from '../core/ir';
+import type { EmbeddedFont } from './cid-font';
+import type { PdfDict, PdfRef, PdfValue } from './objects';
+import type {
+  FontResource,
+  ImageItem,
+  ImageResource,
+  ImageToken,
+  LaidOutDocument,
+  LaidOutPage,
+  Line,
+  MathToken,
+  PageItem,
+  TextLineItem,
+  TextToken,
+} from '../layout/page-doc';
+import type {
+  LaidOutPdfDocument,
+  PdfAProfile,
+  SectionRenderCtx,
+  StyledRenderOptions,
+} from '../layout/styled-layout';
+import type { VectorShape } from '../core/vector';
+import type { BuildOptions, PdfDocument } from './writer';
+import type { PdfEncryptOptions } from './encryption';
+import { preparePdfEncryption } from './encryption';
+import { pageLayers, paintPlan } from '../layout/page-doc';
+import { A4_HEIGHT, A4_WIDTH } from '../layout/styled-layout';
+import {
+  BORDER_DASHES,
+  FAUX_ITALIC_SHEAR,
+  computeJustifyExtra,
+  lineVisualOrder,
+  settableInOneMatrix,
+  washVeil,
+} from '../layout/line-paint';
+import { emitClipPath, emitVectorShape, shadowBlurLayers } from './vector-graphics';
+import { buildGradientAlphaMask, buildGradientPattern, shapeBbox } from './shading';
+import { reverseByCodePoint } from '../core/bidi';
+import { warpGlyphMatrix, warpGlyphRun } from '../core/drawingml/text-warp';
+import { sanitizeHref } from '../core/links';
+import { embedTtfFont } from './cid-font';
+import { embedAssociatedFile } from './embedded-file';
+import { buildSrgbIccProfile } from './icc-profile';
+import { addImage } from './image-xobject';
+import { dict, name, ref, stream, unicodeString } from './objects';
+import { addSignaturePlaceholder } from './signature';
+import { buildXmpPacket } from './xmp';
+
+const encoder = new TextEncoder();
+
+/**
+ * The veil operators for a washed picture, to follow its own `/Im Do`: the
+ * placement matrix maps the unit square onto the picture as drawn, so the wash
+ * covers exactly it — cropped, rotated and flipped along with it.
+ */
+function washItems(
+  wash: { readonly gain: number; readonly black: number } | undefined,
+  alphaStateNames: ReadonlyMap<number, string> | undefined,
+): Array<string> {
+  const veil = washVeil(wash);
+  if (!veil) return [];
+  const g = formatNumber(veil.grey);
+  const state =
+    veil.alpha < 1 ? alphaStateNames?.get(Math.round(veil.alpha * 1000) / 1000) : undefined;
+  return [...(state === undefined ? [] : [`/${state} gs`]), `${g} ${g} ${g} rg`, '0 0 1 1 re', 'f'];
+}
+
+// The emit phase sees only the laid-out document plus these output-side
+// options — never the layout options (oop-design §4.1: the seam must not leak).
+type EmitOptions = Pick<
+  StyledRenderOptions,
+  'attachments' | 'info' | 'language' | 'pdfUA' | 'signaturePlaceholder'
+>;
+
+/**
+ * The emit phase: turn a laid-out document into PDF objects (ISO 32000) and
+ * serialize it. The counterpart of `layoutStyledDocument` (the seam of
+ * ir-design §7 / oop-design §4.1); it sees only the laid-out document plus the
+ * output-side options, never the layout options. Fonts and images embed first
+ * (the object order the pre-split renderer produced), pages replay their
+ * `PageItem`s, then the catalog assembles the OutputIntent / XMP / struct-tree /
+ * attachments as required.
+ *
+ * @returns The serialized PDF bytes.
+ */
+export function emitStyledPdf(
+  laid: LaidOutPdfDocument,
+  options: EmitOptions,
+  doc: PdfDocument,
+): Uint8Array {
+  const a = assembleStyledPdf(laid, options, doc);
+  return doc.build(a.catalogRef, a.infoRef, a.buildOptions);
+}
+
+/**
+ * The encrypted build (ISO 32000 §7.6): assemble as usual, encrypt every
+ * collected object with the derived file key, then add the (plaintext)
+ * `/Encrypt` dictionary and emit with a file `/ID`. Asynchronous because
+ * WebCrypto is.
+ *
+ * @param encrypt The encryption parameters (handler revision, permissions,
+ *                passwords) used to prepare the file key and `/Encrypt` dict.
+ * @returns The serialized, encrypted PDF bytes.
+ */
+export async function emitStyledPdfEncrypted(
+  laid: LaidOutPdfDocument,
+  options: EmitOptions,
+  doc: PdfDocument,
+  encrypt: PdfEncryptOptions,
+): Promise<Uint8Array> {
+  const a = assembleStyledPdf(laid, options, doc);
+  const prepared = await preparePdfEncryption(encrypt);
+  await doc.encryptAll(prepared.fileKey);
+  const encryptRef = doc.add(prepared.encryptDict);
+  return doc.build(a.catalogRef, a.infoRef, {
+    ...a.buildOptions,
+    id: true,
+    encrypt: encryptRef,
+  });
+}
+
+function assembleStyledPdf(
+  laid: LaidOutPdfDocument,
+  options: EmitOptions,
+  doc: PdfDocument,
+): { catalogRef: PdfRef; infoRef: PdfRef | undefined; buildOptions: BuildOptions } {
+  const { pages: renderedPages } = laid;
+  // The PDF-only companion (oop-design A13): logical structure, fallback page
+  // geometry, PDF/A apparatus. The PageDoc proper stays writer-neutral.
+  const { structBuilder, sectionCtxs, pdfaProfile, tagged } = laid.pdf;
+  // CM2b — native /Text (sticky-note) annotations for comments, only for
+  // interactive output: archival (PDF/A) and tagged output forbid / would need
+  // extra conformance for them, and already carry the content via the marker.
+  const commentNotes = !pdfaProfile && !structBuilder ? laid.pdf.commentNotes : undefined;
+  // PDF/UA-1 (Matterhorn 06-003/07-001): the document MUST carry a title and
+  // viewers must display it — synthesize one when the source has none.
+  const docInfo =
+    options.pdfUA && !options.info?.title
+      ? { ...options.info, title: 'Untitled document' }
+      : options.info;
+
+  // Create the font/image PDF objects first — the same object order the
+  // pre-split renderer produced (fonts, then images, then pages).
+  const embeddedFonts = embedFontResources(doc, laid, pdfaProfile);
+  const embeddedImages = embedImageResources(doc, laid);
+
+  const pagesDict: PdfDict = dict({ Type: name('Pages'), Count: 0, Kids: [] });
+  const pagesRef = doc.add(pagesDict);
+  // First page's dict object, kept mutable so a signature widget can be added to
+  // its /Annots after the catalog is assembled (merging with link annotations
+  // when the first page carries both).
+  let firstPageDict: PdfDict | undefined;
+  let firstPageAnnots: Array<PdfValue> | undefined;
+  // Scalar /StructParent keys for link annotations sit above the page indices
+  // (pages use 0..N-1 as their /StructParents keys).
+  let annotParentCount = 0;
+  const fontResourceDict = buildFontResourceDict(laid.fontResources, embeddedFonts);
+  const xobjectResourceDict = buildXObjectResourceDict(laid.imageResources, embeddedImages);
+  // A duotone's soft mask draws the picture inside its own form, so it needs
+  // the XObject by the name the page knows it under.
+  const imageRefByName = new Map<string, PdfRef>();
+  for (const [resourceId, res] of laid.imageResources) {
+    const r = embeddedImages.get(resourceId);
+    if (r) imageRefByName.set(res.resourceName, r);
+  }
+  // EP16b — gradient-fill shapes become shading patterns. PDF/A keeps the solid
+  // fallback (a DeviceRGB shading would need OutputIntent juggling). The map is
+  // keyed by VectorShape identity, which the per-page paintPlan preserves.
+  const gradientNames = new Map<VectorShape, string>();
+  const gradientMaskNames = new Map<VectorShape, string>();
+  const patternEntries: Record<string, PdfValue> = {};
+  const extGStateEntries: Record<string, PdfValue> = {};
+  if (!pdfaProfile) {
+    for (const page of renderedPages) {
+      const ph = page.height;
+      const plan = paintPlan(page.commands);
+      const shapesNeedingPatterns = [
+        ...plan.shapes,
+        ...[...plan.behind, ...plan.pictures.flat(), ...plan.ordered.flat()].filter(
+          (i) => i.type === 'shape',
+        ),
+      ];
+      for (const item of shapesNeedingPatterns) {
+        const gradient = item.shape.fillGradient;
+        if (!gradient) continue;
+        const bbox = shapeBbox(item.shape);
+        if (!bbox) continue;
+        // The emitted CTM is the stored top-left transform conjugated with the
+        // page flip (the same matrix emitVectorShape builds); the pattern
+        // /Matrix must match it so the shading maps onto the painted path.
+        const t = item.shape.transform;
+        const ctm = [t[0], -t[1], t[2], -t[3], t[4], ph - t[5]] as const;
+        const nm = `Sh${gradientNames.size}`;
+        patternEntries[nm] = ref(buildGradientPattern(doc, gradient, bbox, ctm).id);
+        gradientNames.set(item.shape, nm);
+        // §11.6.5.2 — a gradient whose stops fade out is painted through a
+        // luminosity mask of the same sweep (see buildGradientAlphaMask).
+        const mask = buildGradientAlphaMask(doc, gradient, bbox, ctm);
+        if (mask) {
+          const gs = `GSm${gradientMaskNames.size}`;
+          gradientMaskNames.set(item.shape, gs);
+          extGStateEntries[gs] = dict({
+            SMask: dict({ S: name('Luminosity'), G: ref(mask.id), BC: [0] }),
+          });
+        }
+      }
+    }
+  }
+  // §20.1.8.23 `a:duotone` — the picture is not painted at all: it becomes a
+  // LUMINOSITY soft mask (ISO 32000-1 §11.6.5.2) through which the light colour
+  // is laid over the dark one, which is exactly the two-tone map the spec
+  // states — shadow where the picture is black, highlight where it is white.
+  // That needs no pixels, which matters: every duotone in the corpus is a JPEG,
+  // and recolouring one would mean decoding it.
+  const duotoneStates = new Map<string, string>();
+  const wantDuotone = (item: ImageItem, pageHeight: number): string | undefined => {
+    if (!item.duotone || item.imageResourceName === '' || pdfaProfile) return undefined;
+    // The mask form is placed by its own matrix, so a picture drawn twice in
+    // two places needs two of them.
+    const key = [
+      item.imageResourceName,
+      Math.round(item.x * 100),
+      Math.round(item.y * 100),
+      Math.round(item.width * 100),
+      Math.round(item.height * 100),
+    ].join('|');
+    const known = duotoneStates.get(key);
+    if (known !== undefined) return known;
+    // The mask form draws the picture alone, in a group whose blending space is
+    // grey — its luminosity IS the picture's.
+    const imageRef = imageRefByName.get(item.imageResourceName);
+    if (!imageRef) return undefined;
+    const form = doc.add(
+      stream(
+        {
+          Type: name('XObject'),
+          Subtype: name('Form'),
+          BBox: [0, 0, item.width, item.height],
+          Matrix: [1, 0, 0, 1, item.x, pageHeight - item.y - item.height],
+          Group: dict({ S: name('Transparency'), CS: name('DeviceGray') }),
+          Resources: dict({ XObject: dict({ [item.imageResourceName]: ref(imageRef.id) }) }),
+        },
+        encoder.encode(
+          `q ${formatNumber(item.width)} 0 0 ${formatNumber(item.height)} 0 0 cm ` +
+            `/${item.imageResourceName} Do Q`,
+        ),
+      ),
+    );
+    const nm = `GSd${duotoneStates.size}`;
+    duotoneStates.set(key, nm);
+    extGStateEntries[nm] = dict({
+      SMask: dict({ S: name('Luminosity'), G: ref(form.id), BC: [0] }),
+    });
+    return nm;
+  };
+
+  // §20.1.8.40 — a shadow is drawn at the transparency its colour asks for,
+  // which in PDF is a constant alpha in an /ExtGState (ISO 32000-1 §11.6.4.4).
+  // One state per distinct alpha, shared by every shadow that wants it.
+  const alphaStateNames = new Map<number, string>();
+  const wantAlpha = (alpha: number | undefined): void => {
+    if (alpha === undefined || alpha >= 1) return;
+    const key = Math.round(alpha * 1000) / 1000;
+    if (alphaStateNames.has(key)) return;
+    const nm = `GSa${alphaStateNames.size}`;
+    alphaStateNames.set(key, nm);
+    extGStateEntries[nm] = dict({ ca: key, CA: key });
+  };
+  for (const page of renderedPages) {
+    const plan = paintPlan(page.commands);
+    for (const item of plan.shapes) {
+      const s = item.shape.shadow;
+      if (s) wantAlpha(shadowBlurLayers(s).alpha);
+      wantAlpha(item.shape.fillAlpha);
+    }
+    for (const img of plan.images) {
+      wantAlpha(washVeil(img.wash)?.alpha);
+      wantAlpha(img.alpha);
+      wantDuotone(img, page.height);
+    }
+    // The runs that paint in their own order carry the same needs.
+    for (const item of [...plan.behind, ...plan.pictures.flat(), ...plan.ordered.flat()]) {
+      if (item.type === 'image') {
+        wantAlpha(washVeil(item.wash)?.alpha);
+        wantAlpha(item.alpha);
+        wantDuotone(item, page.height);
+      }
+      if (item.type === 'shape') {
+        const s = item.shape.shadow;
+        if (s) wantAlpha(shadowBlurLayers(s).alpha);
+        wantAlpha(item.shape.fillAlpha);
+      }
+    }
+    // …and the shadow an inline PICTURE casts, which rides its token rather
+    // than a shape of its own (imgshadow.docx).
+    for (const line of plan.lines) {
+      for (const tok of line.line.tokens) {
+        if (tok.kind === 'image' && tok.shadow) wantAlpha(shadowBlurLayers(tok.shadow).alpha);
+        if (tok.kind === 'image') wantAlpha(washVeil(tok.wash)?.alpha);
+      }
+    }
+  }
+  const resourcesDict = dict({
+    Font: fontResourceDict,
+    ...(xobjectResourceDict ? { XObject: xobjectResourceDict } : {}),
+    ...(Object.keys(patternEntries).length > 0 ? { Pattern: dict(patternEntries) } : {}),
+    ...(Object.keys(extGStateEntries).length > 0 ? { ExtGState: dict(extGStateEntries) } : {}),
+  });
+
+  // PDF/A: build the sRGB ICC stream once — reused by the catalog OutputIntent
+  // and, for PDF/A-2/3, the page transparency-group blend colour space.
+  let pdfaIccRef: PdfRef | undefined;
+  let transparencyGroup: PdfDict | undefined;
+  if (pdfaProfile) {
+    pdfaIccRef = doc.add(stream({ N: 3, Alternate: name('DeviceRGB') }, buildSrgbIccProfile()));
+    if (pdfaProfile.part >= 2) {
+      // PDF/A-2/3 §6.2.4.3 — a page that uses transparency (here, a soft-masked
+      // image) must carry a transparency group with a device-independent blend
+      // colour space; reuse the OutputIntent's ICCBased sRGB.
+      transparencyGroup = dict({
+        S: name('Transparency'),
+        CS: [name('ICCBased'), ref(pdfaIccRef.id)],
+      });
+    }
+  }
+
+  const pageRefs: Array<PdfRef> = [];
+  // Internal-link targets actually referenced by some annotation — only these
+  // get a /Names /Dests entry (unreferenced bookmarks would be dead weight).
+  const referencedAnchors = new Set<string>();
+  renderedPages.forEach((page, pageIndex) => {
+    let pageTagging: PageTagging | undefined;
+    if (structBuilder) {
+      const builder = structBuilder;
+      pageTagging = {
+        next: 0,
+        assigned: false,
+        record: (structId, mcid) => builder.addMcref(structId, pageIndex, mcid),
+        tagFor: (structId) => builder.node(structId).type,
+      };
+    }
+    const { content: contentBytes, links } = emitPageLayers(
+      page,
+      pageTagging,
+      gradientNames,
+      alphaStateNames,
+      wantDuotone,
+      gradientMaskNames,
+    );
+    const contentsRef = doc.add(stream({}, contentBytes));
+    const pageEntries: Record<string, PdfValue> = {
+      Type: name('Page'),
+      Parent: ref(pagesRef.id),
+      MediaBox: [0, 0, page.width, page.height],
+      Resources: resourcesDict,
+      Contents: ref(contentsRef.id),
+    };
+    if (links.length > 0) {
+      // ISO 32000-1 §12.5.6.5 Link annotation + §12.6.4.7 URI action. The
+      // schemes were allowlisted at collection time (core/links). /F 4 sets
+      // the Print flag (PDF/A §6.3.3 requires it on every annotation). In
+      // tagged mode each annotation hangs off a Link StructElem under the
+      // owning line's node via OBJR + a scalar /StructParent entry
+      // (§14.7.4.4, Matterhorn 28-011); an artifact line's link (header/
+      // footer) gets no annotation — there is no structure to attach it to.
+      const annots: Array<PdfValue> = [];
+      for (const l of links) {
+        if (structBuilder && l.structId === undefined) continue;
+        const entries: Record<string, PdfValue> = {
+          Type: name('Annot'),
+          Subtype: name('Link'),
+          Rect: [l.rect[0], l.rect[1], l.rect[2], l.rect[3]],
+          Border: [0, 0, 0],
+          F: 4,
+          // §12.6.4: URI action for external targets; a GoTo with a string
+          // destination (resolved via /Names /Dests) for internal ones.
+          A:
+            l.href !== undefined
+              ? dict({ S: name('URI'), URI: l.href })
+              : dict({ S: name('GoTo'), D: l.anchor ?? '' }),
+          // ISO 14289-1 §7.18.5 — alternate description: the link's visible
+          // text, falling back to its target.
+          Contents: l.text !== '' ? l.text : (l.href ?? l.anchor ?? ''),
+        };
+        if (l.anchor !== undefined) referencedAnchors.add(l.anchor);
+        if (structBuilder && l.structId !== undefined) {
+          entries['StructParent'] = renderedPages.length + annotParentCount;
+        }
+        const annotRef = doc.add(dict(entries));
+        if (structBuilder && l.structId !== undefined) {
+          const linkNode = structBuilder.create('Link', structBuilder.node(l.structId));
+          linkNode.objrs.push({ annotRef, pageIndex });
+          structBuilder.addAnnotParent(renderedPages.length + annotParentCount, linkNode.id);
+          annotParentCount++;
+        }
+        annots.push(ref(annotRef.id));
+        // CM2b — a native /Text sticky note at the comment marker, carrying the
+        // comment's author and text for an interactive pop-up (ISO 32000-1
+        // §12.5.6.4). Gated to non-PDF/A, non-tagged output via `commentNotes`.
+        const note = l.anchor !== undefined ? commentNotes?.get(l.anchor) : undefined;
+        if (note) {
+          const textAnnot = doc.add(
+            dict({
+              Type: name('Annot'),
+              Subtype: name('Text'),
+              Name: name('Comment'),
+              Rect: [l.rect[0], l.rect[1], l.rect[2], l.rect[3]],
+              F: 28, // Print + NoZoom + NoRotate — a fixed-size note icon
+              Contents: note.contents,
+              ...(note.author !== undefined ? { T: note.author } : {}),
+            }),
+          );
+          annots.push(ref(textAnnot.id));
+        }
+      }
+      if (annots.length > 0) {
+        pageEntries['Annots'] = annots;
+        if (pageIndex === 0) firstPageAnnots = annots;
+      }
+    }
+    if (transparencyGroup) pageEntries['Group'] = transparencyGroup;
+    if (pageTagging?.assigned) {
+      // §14.7.4.4 — this page's key into /ParentTree; §14.8.4.2 — structure tab
+      // order so AT navigates in logical, not geometric, order.
+      pageEntries['StructParents'] = pageIndex;
+      pageEntries['Tabs'] = name('S');
+    }
+    const pageDictObj = dict(pageEntries);
+    if (firstPageDict === undefined) firstPageDict = pageDictObj;
+    pageRefs.push(doc.add(pageDictObj));
+  });
+
+  if (pageRefs.length === 0) {
+    // Always emit at least one page (fallback geometry: first section's dims
+    // or A4 if no sections at all).
+    const fallback = sectionCtxs[0] ?? defaultPageCtx();
+    const contentsRef = doc.add(stream({}, new Uint8Array(0)));
+    const fallbackDict = dict({
+      Type: name('Page'),
+      Parent: ref(pagesRef.id),
+      MediaBox: [0, 0, fallback.pageWidth, fallback.pageHeight],
+      Resources: resourcesDict,
+      Contents: ref(contentsRef.id),
+      ...(transparencyGroup ? { Group: transparencyGroup } : {}),
+    });
+    firstPageDict = fallbackDict;
+    pageRefs.push(doc.add(fallbackDict));
+  }
+
+  pagesDict.set('Count', pageRefs.length);
+  pagesDict.set('Kids', pageRefs);
+
+  const namesTreeEntries: Record<string, PdfValue> = {};
+  const catalogEntries: Record<string, PdfValue> = {
+    Type: name('Catalog'),
+    Pages: ref(pagesRef.id),
+  };
+  if (pdfaProfile) {
+    // OutputIntent with the embedded sRGB ICC profile (PDF/A §6.2.2). The same
+    // ICC stream (pdfaIccRef, built above) backs any page transparency group.
+    const outputIntentRef = doc.add(
+      dict({
+        Type: name('OutputIntent'),
+        S: name('GTS_PDFA1'),
+        OutputConditionIdentifier: 'sRGB',
+        Info: 'sRGB IEC61966-2.1',
+        DestOutputProfile: ref(pdfaIccRef!.id),
+      }),
+    );
+    catalogEntries['OutputIntents'] = [ref(outputIntentRef.id)];
+  }
+  if (pdfaProfile || options.pdfUA) {
+    // Document-level XMP metadata carrying the PDF/A (§6.7) and/or PDF/UA
+    // (ISO 14289-1 §5) identifiers.
+    const xmpRef = doc.add(
+      stream(
+        { Type: name('Metadata'), Subtype: name('XML') },
+        buildXmpPacket(xmpFromInfo(docInfo, pdfaProfile, options.pdfUA === true)),
+      ),
+    );
+    catalogEntries['Metadata'] = ref(xmpRef.id);
+  }
+  if (tagged && structBuilder) {
+    // Logical structure (§14.8): emit the tree now that every page ref exists,
+    // then point the catalog at it and mark the document as tagged.
+    const structRootRef = structBuilder.emit(doc, pageRefs);
+    catalogEntries['MarkInfo'] = dict({ Marked: true });
+    catalogEntries['StructTreeRoot'] = ref(structRootRef.id);
+    // §14.9.2 — document natural language (from the docx default, else en-US).
+    catalogEntries['Lang'] = options.language ?? 'en-US';
+    // DisplayDocTitle — AT should announce the document title, not the file name
+    // (Matterhorn 06-003 / PDF/UA). Only meaningful when a title is present.
+    if (docInfo?.title) {
+      catalogEntries['ViewerPreferences'] = dict({ DisplayDocTitle: true });
+    }
+  }
+  // Associated files (§7.11 / PDF/A-3 §6.8) — allowed for plain PDF and PDF/A-3
+  // only; PDF/A-1/2 forbid arbitrary embedded files, so skip them there.
+  if (options.attachments?.length && (!pdfaProfile || pdfaProfile.part === 3)) {
+    const embedded = options.attachments.map((file) => ({
+      file,
+      ref: embedAssociatedFile(doc, file),
+    }));
+    catalogEntries['AF'] = embedded.map((e) => ref(e.ref.id));
+    // /Names /EmbeddedFiles name tree, keyed by file name (sorted → deterministic).
+    const sorted = [...embedded].sort((a, b) =>
+      a.file.name < b.file.name ? -1 : a.file.name > b.file.name ? 1 : 0,
+    );
+    const names: Array<PdfValue> = [];
+    for (const e of sorted) names.push(e.file.name, ref(e.ref.id));
+    const embeddedFilesRef = doc.add(dict({ Names: names }));
+    namesTreeEntries['EmbeddedFiles'] = ref(embeddedFilesRef.id);
+  }
+
+  // §12.3.2.4 string destinations: /Names /Dests maps each referenced
+  // bookmark name to an explicit [page /XYZ] destination (sorted → byte
+  // determinism). Unresolvable anchors (no such bookmark) simply have no
+  // entry — viewers treat the GoTo as a no-op.
+  const bookmarkDests = laid.pdf.bookmarks;
+  const destNames = [...referencedAnchors]
+    .filter((n) => bookmarkDests.has(n))
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  if (destNames.length > 0) {
+    const names: Array<PdfValue> = [];
+    for (const destName of destNames) {
+      const pos = bookmarkDests.get(destName)!;
+      const pageRef = pageRefs[pos.pageIdx];
+      if (!pageRef) continue;
+      // /FitH: jump to the line's top, fit the page width — no null args
+      // (PdfValue has no null; /XYZ would need them).
+      names.push(destName, [ref(pageRef.id), name('FitH'), pos.yTopPt]);
+    }
+    const destsRef = doc.add(dict({ Names: names }));
+    namesTreeEntries['Dests'] = ref(destsRef.id);
+  }
+  if (Object.keys(namesTreeEntries).length > 0) {
+    catalogEntries['Names'] = dict(namesTreeEntries);
+  }
+  // Digital signature placeholder (§12.8): an invisible /Sig widget on page 1,
+  // an /AcroForm in the catalog, and a signature dict with placeholder
+  // ByteRange/Contents that signPdf() fills. The unsigned placeholder is emitted
+  // here; the crypto happens afterwards (async) so the writer stays sync.
+  if (options.signaturePlaceholder && firstPageDict) {
+    const { fieldRef, acroForm } = addSignaturePlaceholder(
+      doc,
+      options.signaturePlaceholder,
+      pageRefs[0]!,
+    );
+    if (firstPageAnnots) firstPageAnnots.push(ref(fieldRef.id));
+    else firstPageDict.set('Annots', [ref(fieldRef.id)]);
+    catalogEntries['AcroForm'] = acroForm;
+  }
+
+  const catalogRef = doc.add(dict(catalogEntries));
+  const infoRef = buildInfoDict(doc, docInfo);
+  return {
+    catalogRef,
+    infoRef,
+    buildOptions: {
+      ...(pdfaProfile ? { version: pdfaProfile.version, id: true } : {}),
+    },
+  };
+}
+
+const DEFAULT_PRODUCER = 'Ream';
+
+function xmpFromInfo(
+  info: DocumentInfo | undefined,
+  p: PdfAProfile | undefined,
+  pdfUA = false,
+): Parameters<typeof buildXmpPacket>[0] {
+  return {
+    ...(p
+      ? {
+          pdfaPart: String(p.part) as '1' | '2' | '3',
+          pdfaConformance: p.level.toUpperCase() as 'A' | 'B' | 'U',
+        }
+      : {}),
+    ...(pdfUA ? { pdfuaPart: '1' as const } : {}),
+    producer: info?.producer ?? DEFAULT_PRODUCER,
+    ...(info?.title ? { title: info.title } : {}),
+    ...(info?.author ? { author: info.author } : {}),
+    ...(info?.subject ? { subject: info.subject } : {}),
+    ...(info?.keywords ? { keywords: info.keywords } : {}),
+    ...(info?.creator ? { creator: info.creator } : {}),
+    ...(info?.creationDate ? { createDate: info.creationDate } : {}),
+    ...(info?.modificationDate ? { modifyDate: info.modificationDate } : {}),
+  };
+}
+
+function buildInfoDict(doc: PdfDocument, info: DocumentInfo | undefined): PdfRef | undefined {
+  const merged: DocumentInfo = {
+    ...info,
+    producer: info?.producer ?? DEFAULT_PRODUCER,
+  };
+  const entries: Record<string, PdfValue> = {};
+  if (merged.title) entries['Title'] = unicodeString(merged.title);
+  if (merged.author) entries['Author'] = unicodeString(merged.author);
+  if (merged.subject) entries['Subject'] = unicodeString(merged.subject);
+  if (merged.keywords) entries['Keywords'] = unicodeString(merged.keywords);
+  if (merged.creator) entries['Creator'] = unicodeString(merged.creator);
+  // Producer always emitted (defaulted above).
+  entries['Producer'] = unicodeString(merged.producer!);
+  if (merged.creationDate) entries['CreationDate'] = formatPdfDate(merged.creationDate);
+  if (merged.modificationDate) entries['ModDate'] = formatPdfDate(merged.modificationDate);
+  return doc.add(dict(entries));
+}
+
+// ISO 32000-1 §7.9.4 — PDF date string `D:YYYYMMDDHHmmSSOHH'mm'` where O is
+// +/-/Z. We always emit UTC ("Z") so the formatter stays deterministic and
+// the output is timezone-independent.
+function formatPdfDate(d: Date): string {
+  const pad = (n: number, w = 2) => String(n).padStart(w, '0');
+  const yyyy = pad(d.getUTCFullYear(), 4);
+  const MM = pad(d.getUTCMonth() + 1);
+  const DD = pad(d.getUTCDate());
+  const hh = pad(d.getUTCHours());
+  const mm = pad(d.getUTCMinutes());
+  const ss = pad(d.getUTCSeconds());
+  return `D:${yyyy}${MM}${DD}${hh}${mm}${ss}Z`;
+}
+
+function defaultPageCtx(): SectionRenderCtx {
+  return {
+    endIndex: 0,
+    properties: { headers: [], footers: [] },
+    pageWidth: A4_WIDTH,
+    pageHeight: A4_HEIGHT,
+    marginLeft: 72,
+    marginTop: 72,
+    marginBottom: 72,
+    contentWidth: A4_WIDTH - 144,
+    pageContentHeight: A4_HEIGHT - 144,
+    headerSet: { default: { commands: [] }, first: { commands: [] }, even: { commands: [] } },
+    footerSet: { default: { commands: [] }, first: { commands: [] }, even: { commands: [] } },
+    titlePg: false,
+    evenAndOddHeaders: false,
+    continuous: false,
+  };
+}
+
+// Emit-phase counterpart: embed the probed images in collection order.
+function embedImageResources(doc: PdfDocument, laid: LaidOutDocument): Map<ResourceId, PdfRef> {
+  const out = new Map<ResourceId, PdfRef>();
+  for (const [resourceId, res] of laid.imageResources) {
+    // A metafile has no raster of its own: the layout has already turned it
+    // into primitives, and there is nothing here to embed.
+    if (!res.prepared) continue;
+    out.set(resourceId, addImage(doc, res.prepared).ref);
+  }
+  return out;
+}
+
+// Emit-phase counterpart: create the PDF font objects (subset to the collected
+// glyphs) for every laid-out font resource, in collection order — keeping the
+// object numbering identical to the pre-split renderer.
+function embedFontResources(
+  doc: PdfDocument,
+  laid: LaidOutDocument,
+  pdfaProfile: PdfAProfile | undefined,
+): Map<string, EmbeddedFont> {
+  // PDF/A-1 requires a /CIDSet; PDF/A-2/3 and non-PDF/A omit it.
+  const cidSet = pdfaProfile?.part === 1;
+  const out = new Map<string, EmbeddedFont>();
+  for (const [variant, res] of laid.fontResources) {
+    // A resource nothing draws from carries no glyphs and needs no program.
+    if (res.gids.size === 0) continue;
+    out.set(
+      variant,
+      embedTtfFont(doc, res.parsed, {
+        usedGids: res.gids,
+        cidSet,
+        ...(res.glyphText ? { glyphText: res.glyphText } : {}),
+        ...(res.glyphChars ? { glyphChars: res.glyphChars } : {}),
+      }),
+    );
+  }
+  return out;
+}
+
+function buildFontResourceDict(
+  resources: ReadonlyMap<string, FontResource>,
+  embedded: ReadonlyMap<string, EmbeddedFont>,
+): PdfDict {
+  const entries: Record<string, PdfRef> = {};
+  for (const [variant, res] of resources) {
+    const emb = embedded.get(variant);
+    if (emb) entries[res.resourceName] = ref(emb.fontRef.id);
+  }
+  return dict(entries);
+}
+
+/**
+ * The operators that paint one picture: normally the XObject itself, but for a
+ * §20.1.8.23 duotone the two colours it is recoloured between, composited
+ * through the picture's own luminosity (`state` is that soft-mask ExtGState).
+ *
+ * @param item  The image to paint.
+ * @param yUp   Its bottom edge in the page's y-up frame.
+ * @param state The duotone's soft-mask state name, when it has one.
+ * @returns The operators, without the surrounding `q`/`Q`.
+ */
+function paintImageBody(item: ImageItem, yUp: number, state: string | undefined): Array<string> {
+  const place = placeImage(
+    item.x,
+    yUp,
+    item.width,
+    item.height,
+    item.crop,
+    item.rotationDeg,
+    item.flipH,
+    item.flipV,
+  );
+  if (state === undefined || !item.duotone) {
+    return [...place, `/${item.imageResourceName} Do`];
+  }
+  const rect =
+    `${formatNumber(item.x)} ${formatNumber(yUp)} ` +
+    `${formatNumber(item.width)} ${formatNumber(item.height)} re`;
+  const [sr, sg, sb] = hexToRgb01(item.duotone.shadowHex);
+  const [hr, hg, hb] = hexToRgb01(item.duotone.highlightHex);
+  return [
+    // The dark end everywhere…
+    `${formatNumber(sr)} ${formatNumber(sg)} ${formatNumber(sb)} rg`,
+    rect,
+    'f',
+    // …and the light end wherever the picture is light.
+    `/${state} gs`,
+    `${formatNumber(hr)} ${formatNumber(hg)} ${formatNumber(hb)} rg`,
+    rect,
+    'f',
+  ];
+}
+
+function buildXObjectResourceDict(
+  resources: ReadonlyMap<ResourceId, ImageResource>,
+  embedded: ReadonlyMap<ResourceId, PdfRef>,
+): PdfDict | undefined {
+  if (embedded.size === 0) return undefined;
+  const entries: Record<string, PdfRef> = {};
+  for (const [resourceId, res] of resources) {
+    const r = embedded.get(resourceId);
+    if (r) entries[res.resourceName] = ref(r.id);
+  }
+  return dict(entries);
+}
+
+// Emit a run of same-typed draw commands (the image or shape pass), opening one
+// marked-content sequence per contiguous group with the same owner: a structId
+// → its struct type (Figure) with a fresh MCID; a pagination artifact; or a bare
+// layout artifact. `body(cmd)` emits each command's own operators. In non-tagged
+// mode it just emits the bodies — byte-identical to before tagging existed.
+function emitTaggedRuns<T extends PageItem>(
+  out: Array<string>,
+  cmds: ReadonlyArray<T>,
+  tagging: PageTagging | undefined,
+  body: (cmd: T) => void,
+): void {
+  if (!tagging) {
+    for (const c of cmds) body(c);
+    return;
+  }
+  let openKey: string | null = null;
+  const close = () => {
+    if (openKey !== null) {
+      out.push('EMC');
+      openKey = null;
+    }
+  };
+  for (const c of cmds) {
+    const key =
+      c.structId !== undefined ? `f${c.structId}` : c.artifact === 'pagination' ? 'p' : 'a';
+    if (key !== openKey) {
+      close();
+      if (c.structId !== undefined) {
+        const mcid = tagging.next++;
+        tagging.assigned = true;
+        tagging.record(c.structId, mcid);
+        out.push(`/${tagging.tagFor(c.structId)} <</MCID ${mcid}>> BDC`);
+      } else if (c.artifact === 'pagination') {
+        out.push('/Artifact <</Type /Pagination>> BDC');
+      } else {
+        out.push('/Artifact BMC');
+      }
+      openKey = key;
+    }
+    body(c);
+  }
+  close();
+}
+
+interface LinkRegion {
+  // Exactly one of the two targets: an external URL (sanitized) or the name
+  // of a bookmark in this document (GoTo destination).
+  readonly href?: string;
+  readonly anchor?: string;
+  // The link's visible text — the annotation's /Contents alternate
+  // description (ISO 14289-1 §7.18.5; AT reads it aloud).
+  readonly text: string;
+  readonly rect: readonly [number, number, number, number]; // PDF y-up
+  // The owning line's structure node (tagged mode) — the annotation hangs off
+  // a Link element under it. Undefined for artifact lines (headers/footers).
+  readonly structId?: number;
+}
+
+/**
+ * The dash array for a §18.18.3 / §17.18.2 border style, in points.
+ *
+ * A pattern is a pattern, not a weight: Word and Excel both draw the same
+ * dashes on a hairline and on a 3pt rule, and both references agree on the
+ * lengths — a `dashed` page border strokes `8 2.5` whether its `w:sz` is 4 or
+ * 24. Scaling them by the width instead drew page-borders-export-case-2.docx's
+ * half-point frame as a row of specks a quarter the length it should be.
+ */
+/** The PDF dash array for a border style; an empty string means a solid rule. */
+function dashPatternFor(style: BorderStyle | undefined): string {
+  const pattern = style !== undefined ? BORDER_DASHES.get(style) : undefined;
+  return pattern ? `[${pattern.map(formatNumber).join(' ')}]` : '';
+}
+
+/**
+ * A page's content stream in its layers (pageLayers): its own items, then —
+ * when some of them stand IN FRONT of its text (PageItemBase.over) — those,
+ * painted again pass by pass over what the first layer left, their own text
+ * last; and each group seen through a window of its own (PageItemBase.window)
+ * inside a clip to it. Each layer is a balanced stream of its own, so they
+ * simply follow one another.
+ */
+function emitPageLayers(
+  page: LaidOutPage,
+  ...rest: DropFirst<Parameters<typeof emitPageContent>>
+): { content: Uint8Array; links: Array<LinkRegion> } {
+  const layers = pageLayers(page.commands);
+  if (layers.length === 1 && !layers[0]!.window) return emitPageContent(page, ...rest);
+  const parts: Array<Uint8Array> = [];
+  const links: Array<LinkRegion> = [];
+  for (const layer of layers) {
+    const emitted = emitPageContent({ ...page, commands: layer.items }, ...rest);
+    links.push(...emitted.links);
+    const w = layer.window;
+    if (!w) {
+      parts.push(emitted.content);
+      continue;
+    }
+    if (emitted.content.length === 0) continue;
+    const rect = [w.x, page.height - w.y - w.height, w.width, w.height].map(formatNumber);
+    parts.push(encoder.encode(`q ${rect.join(' ')} re W n`), emitted.content, encoder.encode('Q'));
+  }
+  const content = new Uint8Array(
+    parts.reduce((sum, p) => sum + p.length, 0) + Math.max(0, parts.length - 1),
+  );
+  let at = 0;
+  parts.forEach((p, i) => {
+    if (i > 0) content[at++] = 0x0a;
+    content.set(p, at);
+    at += p.length;
+  });
+  return { content, links };
+}
+
+type DropFirst<T extends ReadonlyArray<unknown>> = T extends readonly [unknown, ...infer R]
+  ? R
+  : never;
+
+function emitPageContent(
+  page: LaidOutPage,
+  tagging?: PageTagging,
+  gradientNames?: ReadonlyMap<VectorShape, string>,
+  alphaStateNames?: ReadonlyMap<number, string>,
+  duotoneStateFor?: (item: ImageItem, pageHeight: number) => string | undefined,
+  gradientMaskNames?: ReadonlyMap<VectorShape, string>,
+): { content: Uint8Array; links: Array<LinkRegion> } {
+  const commands = page.commands;
+  const links: Array<LinkRegion> = [];
+  if (commands.length === 0) return { content: new Uint8Array(0), links };
+  // PageDoc coordinates are top-left/y-down (the frozen schema); PDF paints in
+  // a y-up bottom-left frame, so every page-frame y converts as `H - y` here.
+  const H = page.height;
+  const out: Array<string> = [];
+
+  // Cell backgrounds (fills) first — they sit underneath text and borders.
+  // In tagged PDFs they are layout decoration → wrapped as an /Artifact so no
+  // page content sits outside the structure tree (PDF/A-1a §6.3.2).
+  const plan = paintPlan(commands);
+  const lines = plan.lines;
+  let inBT = false;
+  let lastFont = '';
+  let lastTc = 0;
+  let lastSize = -1;
+  let lastColor = '';
+  // The stroke width a faked bold is drawn with, or 0 when the face is real,
+  // and the horizontal scale a faked CONDENSED face is set at. Kept beside the
+  // font because a `Q` restores text state too: every place that forgets
+  // `lastFont` must forget these with it.
+  let lastFauxWidth = 0;
+  // The stroking colour the text last set, undefined where a `Q` may have
+  // undone it; and whether the stroke goes with the fill (a faked bold).
+  let lastStroke: string | undefined;
+  let strokeFollowsFill = false;
+  let lastTz = 100;
+  /** A run's letter spacing, in the text space `Tz` scales (§9.4.4). */
+  const spacingOf = (tok: TextToken): number => {
+    const tz =
+      Math.round((tok.synthetic?.widthScale ?? 1) * (tok.resolvedRun.widthScale ?? 1) * 1000) / 10;
+    return (tok.resolvedRun.letterSpacingPt ?? 0) / (tz > 0 ? tz / 100 : 1);
+  };
+  /**
+   * The `rg` that makes `hex` the fill colour, when it is not already, and
+   * the `RG` with it while a faked bold strokes the glyphs in their own colour.
+   */
+  const fillTo = (hex: string): string | undefined => {
+    const ops: Array<string> = [];
+    const [r, g, b] = hexToRgb01(hex);
+    const rgb = `${formatNumber(r)} ${formatNumber(g)} ${formatNumber(b)}`;
+    if (hex !== lastColor) {
+      ops.push(`${rgb} rg`);
+      lastColor = hex;
+    }
+    if (strokeFollowsFill && hex !== lastStroke) {
+      ops.push(`${rgb} RG`);
+      lastStroke = hex;
+    }
+    return ops.length > 0 ? ops.join(' ') : undefined;
+  };
+  /**
+   * The show operators for a token's text, with what the Indic shaper needs
+   * passed on. A syllable a run boundary cut is drawn in its runs' colours: the
+   * fill colour switches between its glyphs, each glyph in the colour of the
+   * first character it stands for, and the text state is left in the last.
+   *
+   * @param colours Per code point of `text`, its colour (the token's own,
+   *                reversed with the text where it is).
+   */
+  const showTextOf = (
+    tok: TextToken,
+    text: string,
+    colours: ReadonlyArray<string> | undefined = tok.charColorsHex,
+  ): string => {
+    const measure = tok.font.measure;
+    if (!measure.clustered(text)) return measure.showText(text);
+    const sources = colours ? measure.glyphSources(text) : undefined;
+    if (!colours || !sources) return measure.showText(text, tok.fontSizePt, spacingOf(tok));
+    const before = new Map<number, string>();
+    sources.forEach((s, i) => {
+      const op = fillTo(colours[s] ?? tok.resolvedRun.colorHex);
+      if (op !== undefined) before.set(i, op);
+    });
+    return measure.showText(text, tok.fontSizePt, spacingOf(tok), before);
+  };
+  const switchFontIfNeeded = (tok: TextToken) => {
+    const fontKey = tok.font.resourceName;
+    if (fontKey !== lastFont || tok.fontSizePt !== lastSize) {
+      out.push(`/${fontKey} ${formatNumber(tok.fontSizePt)} Tf`);
+      lastFont = fontKey;
+      lastSize = tok.fontSizePt;
+    }
+    // ISO 32000-1 §9.3.6 — a font set that carries no bold cut still has bold
+    // asked of it, and the page can draw the weight itself: rendering mode 2
+    // strokes the glyphs as well as filling them, and a line a thirtieth of the
+    // em wide is the usual faux-bold. Both the mode and the width are text
+    // state, so they ride every emit path the way `Tf` does.
+    //
+    // §21.1.2.3.9 `a:rPr/a:ln` asks for the same thing outright: a line round
+    // the glyphs, in its own colour. Where a run states one it wins, since it
+    // is a line the author drew and not a weight the renderer is inventing.
+    const outline = tok.resolvedRun.textOutline;
+    const fauxWidth =
+      outline !== undefined
+        ? outline.widthPt
+        : tok.synthetic?.bold === true
+          ? tok.fontSizePt * 0.03
+          : 0;
+    if (fauxWidth !== lastFauxWidth) {
+      out.push(fauxWidth > 0 ? `2 Tr ${formatNumber(fauxWidth)} w` : '0 Tr');
+      lastFauxWidth = fauxWidth;
+    }
+    // The stroking colour. A stated outline sets its own; a faked bold strokes
+    // in the fill's, since its line is the glyphs' weight and not a line round
+    // them, and it goes with the fill wherever that changes (`fillTo`). Left to
+    // whatever the pen last was, a red word in faux bold was ringed in black.
+    strokeFollowsFill = outline === undefined && fauxWidth > 0;
+    if (outline !== undefined && outline.colorHex !== lastStroke) {
+      const [sr, sg, sb] = hexToRgb01(outline.colorHex);
+      out.push(`${formatNumber(sr)} ${formatNumber(sg)} ${formatNumber(sb)} RG`);
+      lastStroke = outline.colorHex;
+    }
+    // ISO 32000-1 §9.3.3 — horizontal scaling, which is how a condensed face is
+    // drawn when the substitute has no condensed cut, and how a run the
+    // document sets narrower than its face (§17.3.2.43) is drawn. Layout
+    // measured through the same fraction, so the glyphs and the line agree.
+    const scale = (tok.synthetic?.widthScale ?? 1) * (tok.resolvedRun.widthScale ?? 1);
+    // To a tenth of a percent, not a whole one: Cambria's Cyrillic is borrowed
+    // squeezed to 89.4 %, and drawn at 89 % it ran past what was measured.
+    const tz = Math.round(scale * 1000) / 10;
+    if (tz !== lastTz) {
+      out.push(`${formatNumber(tz)} Tz`);
+      lastTz = tz;
+    }
+    // §17.3.2.35 — the run's own character spacing, which PDF applies per
+    // glyph through `Tc` (ISO 32000-1 §9.3.2). Set only when it changes, and
+    // cleared for the runs that ask for none.
+    // §9.4.4 — `Tc` is scaled by `Tz` with the glyphs, and the layout measured
+    // the spacing unscaled. A run of the scripts of India takes its spacing
+    // after each cluster, in its own show operators (see `showTextOf`), and
+    // none from `Tc`, which would put it between a consonant and its vowel sign.
+    const tc = tok.font.measure.clustered(tok.text) ? 0 : spacingOf(tok);
+    if (tc !== lastTc) {
+      out.push(`${formatNumber(tc)} Tc`);
+      lastTc = tc;
+    }
+    const fill = fillTo(tok.resolvedRun.colorHex);
+    if (fill !== undefined) out.push(fill);
+  };
+  const emitImageToken = (tok: ImageToken, x: number, baselineY: number) => {
+    // MS-EMF / MS-WMF — an inline metafile draws itself: its primitives live
+    // in a y-up frame whose origin is this box's bottom-left corner, which
+    // is exactly where the token stands. VariousPictures.docx sets three of
+    // them in one line beside two rasters.
+    const meta = tok.metafile;
+    if (meta) {
+      if (inBT) {
+        out.push('ET');
+        inBT = false;
+      }
+      const b = tok.drawBox;
+      const ox = x + (b?.dxPt ?? 0);
+      const oy = baselineY + (b?.dyPt ?? 0);
+      // §2.3.1 — the bitmaps it blits, under the primitives it draws over them.
+      for (const img of meta.images ?? []) {
+        if (img.resourceName === '') continue;
+        out.push('q');
+        out.push(
+          ...placeImage(ox + img.x, oy + img.y, img.width, img.height, undefined, img.rotationDeg),
+        );
+        out.push(`/${img.resourceName} Do`, 'Q');
+      }
+      for (const sh of meta.shapes) {
+        for (const op of emitVectorShape({ ...sh, transform: [1, 0, 0, 1, ox, oy] })) {
+          out.push(op);
+        }
+      }
+      for (const t of meta.texts) {
+        // The metafile's own words: one token per line, set where the
+        // picture puts it rather than where the paragraph's flow would.
+        const first = t.line.tokens.find((k) => k.kind === 'text');
+        if (!first) continue;
+        const [r, g, bl] = hexToRgb01(first.resolvedRun.colorHex);
+        out.push('BT');
+        out.push(`/${first.font.resourceName} ${formatNumber(first.fontSizePt)} Tf`);
+        out.push(`${formatNumber(r)} ${formatNumber(g)} ${formatNumber(bl)} rg`);
+        out.push(`1 0 0 1 ${formatNumber(ox + t.x)} ${formatNumber(oy + t.y)} Tm`);
+        out.push(first.font.measure.showText(first.text));
+        out.push('ET');
+      }
+      // The shared text state is no longer what the line loop left it.
+      lastFont = '';
+      lastFauxWidth = 0;
+      lastStroke = undefined;
+      lastStroke = undefined;
+      lastTz = 100;
+      lastSize = -1;
+      lastColor = '';
+      return;
+    }
+    // Skip an inline image whose resource failed to embed (the caller still
+    // advances x, so its box stays reserved).
+    if (!tok.imageResourceName) return;
+    // ET out of text mode, place the image XObject, then BT back in. Image
+    // bottom-left sits on the text baseline so the image hangs above the
+    // baseline like an inline glyph.
+    if (inBT) {
+      out.push('ET');
+      inBT = false;
+    }
+    // §20.1.8.40 — the shadow the picture casts, drawn first so the picture
+    // covers it: the same box, offset, in the shadow's own colour and at the
+    // transparency it asks for. imgshadow.docx lifts six screenshots off the
+    // page this way and we drew them flat.
+    const shdw = tok.shadow;
+    if (shdw) {
+      const bx = tok.drawBox;
+      const [shr, shg, shb] = hexToRgb01(shdw.colorHex);
+      const layers = shadowBlurLayers(shdw);
+      const state =
+        layers.alpha < 1 ? alphaStateNames?.get(Math.round(layers.alpha * 1000) / 1000) : undefined;
+      const sx = x + (bx?.dxPt ?? 0) + shdw.dxPt;
+      const sy = baselineY + (bx?.dyPt ?? 0) - shdw.dyPt;
+      const sw = bx?.widthPt ?? tok.widthPt;
+      const sh = bx?.heightPt ?? tok.heightPt;
+      out.push('q');
+      if (state) out.push(`/${state} gs`);
+      out.push(`${formatNumber(shr)} ${formatNumber(shg)} ${formatNumber(shb)} rg`);
+      // §20.1.8.40 `blurRad` — the soft edge, as boxes growing through the
+      // blur's width at a fraction of the transparency each (see
+      // shadowBlurLayers).
+      for (let i = 0; i < layers.count; i++) {
+        const grow =
+          layers.count > 1 ? -shdw.blurPt / 2 + ((i + 0.5) * shdw.blurPt) / layers.count : 0;
+        out.push(
+          `${formatNumber(sx - grow)} ${formatNumber(sy - grow)} ` +
+            `${formatNumber(Math.max(sw + 2 * grow, 0))} ` +
+            `${formatNumber(Math.max(sh + 2 * grow, 0))} re`,
+        );
+        out.push('f');
+      }
+      out.push('Q');
+    }
+    out.push('q');
+    // §20.4.2.6 — the reserved box may be larger than the picture (the
+    // effect extent a rotation needs); the picture sits inside it.
+    const b = tok.drawBox;
+    out.push(
+      ...(b
+        ? placeImage(
+            x + b.dxPt,
+            baselineY + b.dyPt,
+            b.widthPt,
+            b.heightPt,
+            tok.crop,
+            tok.rotationDeg,
+            tok.flipH,
+            tok.flipV,
+          )
+        : placeImage(
+            x,
+            baselineY,
+            tok.widthPt,
+            tok.heightPt,
+            tok.crop,
+            tok.rotationDeg,
+            tok.flipH,
+            tok.flipV,
+          )),
+    );
+    out.push(`/${tok.imageResourceName} Do`);
+    out.push(...washItems(tok.wash, alphaStateNames));
+    out.push('Q');
+    // §20.1.2.2.24 — the picture's own frame, stroked around the box it was
+    // just drawn in. tdf125657.docx borders its inline screenshot and we drew
+    // the picture bare.
+    const frame = tok.outline;
+    if (frame) {
+      const [fr, fg, fb] = hexToRgb01(frame.colorHex);
+      out.push('q');
+      out.push(`${formatNumber(frame.widthPt)} w`);
+      out.push(`${formatNumber(fr)} ${formatNumber(fg)} ${formatNumber(fb)} RG`);
+      out.push(
+        `${formatNumber(x + (b?.dxPt ?? 0))} ${formatNumber(baselineY + (b?.dyPt ?? 0))} ` +
+          `${formatNumber(b?.widthPt ?? tok.widthPt)} ${formatNumber(b?.heightPt ?? tok.heightPt)} re`,
+      );
+      out.push('S');
+      out.push('Q');
+    }
+    // Text state is reset by ET; force re-emit on the next text token.
+    lastFont = '';
+    lastFauxWidth = 0;
+    lastStroke = undefined;
+    lastTz = 100;
+    lastSize = -1;
+    lastColor = '';
+    lastTc = 0;
+  };
+  // Emit an inline math box: glyph items in text mode, rule/path items in
+  // graphics mode. All positions are box-local, offset by the box origin.
+  const emitMathToken = (tok: MathToken, originX: number, baselineY: number) => {
+    for (const it of tok.items) {
+      if (it.kind === 'glyph') {
+        if (!inBT) {
+          out.push('BT');
+          inBT = true;
+        }
+        if (it.font.resourceName !== lastFont || it.sizePt !== lastSize) {
+          out.push(`/${it.font.resourceName} ${formatNumber(it.sizePt)} Tf`);
+          lastFont = it.font.resourceName;
+          lastSize = it.sizePt;
+        }
+        if (lastColor !== '000000') {
+          out.push('0 0 0 rg');
+          lastColor = '000000';
+        }
+        out.push(`1 0 0 1 ${formatNumber(originX + it.x)} ${formatNumber(baselineY + it.y)} Tm`);
+        out.push(it.font.measure.showText(it.text));
+      } else if (it.kind === 'rule') {
+        if (inBT) {
+          out.push('ET');
+          inBT = false;
+        }
+        out.push('q');
+        out.push('0 0 0 rg');
+        out.push(
+          `${formatNumber(originX + it.x)} ${formatNumber(baselineY + it.y)} ${formatNumber(it.w)} ${formatNumber(it.h)} re`,
+        );
+        out.push('f');
+        out.push('Q');
+        lastFont = '';
+        lastFauxWidth = 0;
+        lastStroke = undefined;
+        lastStroke = undefined;
+        lastTz = 100;
+        lastSize = -1;
+        lastColor = '';
+      } else {
+        if (inBT) {
+          out.push('ET');
+          inBT = false;
+        }
+        const shape: VectorShape = {
+          paths: [{ segments: it.segments }],
+          ...(it.fill ? { fillColorHex: '000000' } : {}),
+          ...(it.strokeWidthPt !== undefined
+            ? { stroke: { colorHex: '000000', widthPt: it.strokeWidthPt } }
+            : {}),
+          transform: [1, 0, 0, 1, originX, baselineY],
+        };
+        for (const op of emitVectorShape(shape)) out.push(op);
+        lastFont = '';
+        lastFauxWidth = 0;
+        lastStroke = undefined;
+        lastStroke = undefined;
+        lastTz = 100;
+        lastSize = -1;
+        lastColor = '';
+      }
+    }
+  };
+
+  // Emit one line command's glyphs/images/math. Manages BT/ET through the
+  // shared `inBT` state; produces operator-for-operator the same output as
+  // before tagging existed, so the non-tagged path stays byte-identical.
+  const emitClipped = (cmd: TextLineItem, body: (c: TextLineItem) => void) => {
+    const clip = cmd.clip;
+    if (!clip) {
+      body(cmd);
+      return;
+    }
+    if (inBT) {
+      out.push('ET');
+      inBT = false;
+    }
+    out.push('q');
+    out.push(
+      `${formatNumber(clip.x)} ${formatNumber(H - clip.y - clip.height)} ${formatNumber(clip.width)} ${formatNumber(clip.height)} re W n`,
+    );
+    lastFont = '';
+    lastFauxWidth = 0;
+    lastStroke = undefined;
+    lastTz = 100;
+    lastSize = -1;
+    lastColor = '';
+    lastTc = 0;
+    out.push('BT');
+    inBT = true;
+    body(cmd);
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- `body` may close text mode through a closure; flow analysis cannot see it.
+    if (inBT) {
+      out.push('ET');
+      inBT = false;
+    }
+    out.push('Q');
+    lastFont = '';
+    lastFauxWidth = 0;
+    lastStroke = undefined;
+    lastTz = 100;
+    lastSize = -1;
+    lastColor = '';
+    lastTc = 0;
+  };
+  // A TURNED line whose glyphs one text matrix cannot set is set flat, token
+  // by token, inside a CTM that turns it about its own origin — so its tabs,
+  // its stretched spaces and the rules drawn under it turn with it. Turned by
+  // its matrix alone, a line of tab-separated figures running down a sheet
+  // came back with every figure run up against the one before. Its links turn
+  // too: an annotation's rectangle is the box its turned corners stand in.
+  const emitTurned = (cmd: TextLineItem): void => {
+    if (inBT) {
+      out.push('ET');
+      inBT = false;
+    }
+    const rad = ((cmd.rotationDeg ?? 0) * Math.PI) / 180;
+    const cos = Math.cos(rad);
+    const sin = Math.sin(rad);
+    const ox = cmd.originX;
+    const oy = H - cmd.baselineY;
+    out.push('q');
+    out.push(
+      `${formatNumber(cos)} ${formatNumber(sin)} ${formatNumber(-sin)} ${formatNumber(cos)} ` +
+        `${formatNumber(ox - ox * cos + oy * sin)} ${formatNumber(oy - ox * sin - oy * cos)} cm`,
+    );
+    lastFont = '';
+    lastFauxWidth = 0;
+    lastStroke = undefined;
+    lastTz = 100;
+    lastSize = -1;
+    lastColor = '';
+    lastTc = 0;
+    const from = links.length;
+    const { rotationDeg: _turned, ...flat } = cmd;
+    out.push('BT');
+    inBT = true;
+    emitOneLine(flat);
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- `emitOneLine` may close text mode through a closure; flow analysis cannot see it.
+    if (inBT) {
+      out.push('ET');
+      inBT = false;
+    }
+    out.push('Q');
+    lastFont = '';
+    lastFauxWidth = 0;
+    lastStroke = undefined;
+    lastTz = 100;
+    lastSize = -1;
+    lastColor = '';
+    lastTc = 0;
+    for (let k = from; k < links.length; k++) {
+      const link = links[k]!;
+      const [x0, y0, x1, y1] = link.rect;
+      const corners = [
+        [x0, y0],
+        [x1, y0],
+        [x1, y1],
+        [x0, y1],
+      ].map(([x, y]) => [
+        ox + (x! - ox) * cos - (y! - oy) * sin,
+        oy + (x! - ox) * sin + (y! - oy) * cos,
+      ]);
+      const xs = corners.map((c) => c[0]!);
+      const ys = corners.map((c) => c[1]!);
+      links[k] = {
+        ...link,
+        rect: [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)],
+      };
+    }
+  };
+  const emitOneLine = (cmd: TextLineItem): void => {
+    if (cmd.rotationDeg && cmd.warp === undefined && !settableInOneMatrix(cmd.line)) {
+      emitTurned(cmd);
+      return;
+    }
+    const line = cmd.line;
+    const originX = cmd.originX;
+    const baselineY = H - cmd.baselineY; // top-left frame → PDF y-up
+    const rotationDeg = cmd.rotationDeg ?? 0;
+    // Link regions (ISO 32000-1 §12.5.6.5): contiguous tokens sharing an
+    // href become one clickable rect per line. The box mirrors the layout's
+    // line metrics (ascent: font size vs math ascent; descent: lineDescent's
+    // 0.2·fs rule). Schemes are allowlisted here (core/links); the PDF path
+    // has no loss channel, so a disallowed scheme simply stays plain text —
+    // the same fallback the HTML writer reports as a degraded loss.
+    const lineFs = line.maxFontSizePt || 12;
+    const linkAscent = Math.max(lineFs, line.mathAscentPt ?? 0);
+    const linkDescent = Math.max(lineFs * 0.2, line.mathDescentPt ?? 0);
+    let linkHref: string | undefined;
+    let linkAnchor: string | undefined;
+    let linkText = '';
+    let linkX0 = 0;
+    let linkX1 = 0;
+    const flushLink = () => {
+      if (linkHref === undefined && linkAnchor === undefined) return;
+      // External targets pass the scheme allowlist; an anchor is a bookmark
+      // name, not a URL — no scheme to sanitize.
+      const safe = linkHref !== undefined ? sanitizeHref(linkHref) : undefined;
+      const target =
+        safe !== undefined
+          ? { href: safe }
+          : linkAnchor !== undefined
+            ? { anchor: linkAnchor }
+            : undefined;
+      if (target) {
+        links.push({
+          ...target,
+          text: linkText.trim(),
+          rect: [linkX0, baselineY - linkDescent, linkX1, baselineY + linkAscent],
+          ...(cmd.structId !== undefined ? { structId: cmd.structId } : {}),
+        });
+      }
+      linkHref = undefined;
+      linkAnchor = undefined;
+      linkText = '';
+    };
+    const trackLink = (
+      href: string | undefined,
+      anchor: string | undefined,
+      text: string,
+      x0: number,
+      x1: number,
+    ) => {
+      if (href !== linkHref || anchor !== linkAnchor) {
+        flushLink();
+        if (href !== undefined || anchor !== undefined) {
+          linkHref = href;
+          linkAnchor = anchor;
+          linkX0 = x0;
+        }
+      }
+      if (href !== undefined || anchor !== undefined) {
+        linkX1 = x1;
+        linkText += text;
+      }
+    };
+    const extraPerSpace = computeJustifyExtra(line);
+    const hasImageToken = line.tokens.some((t) => t.kind === 'image');
+    const hasMathToken = line.tokens.some((t) => t.kind === 'math');
+    const hasRtl = line.tokens.some((t) => t.bidiLevel % 2 === 1);
+    // §17.3.1.38 — a tab's width is a DISTANCE, not the advance of the glyphs
+    // it draws: with no leader it draws none at all. The simple path below
+    // sets the text matrix once and lets the font's own advances carry the
+    // cursor, which loses that distance entirely — a numbered list printed
+    // "1.First item". Position such a line token by token instead; the space
+    // after a list marker (§17.9.29) is a distance of its own the same way.
+    const hasTab = line.tokens.some(
+      (t) => t.kind === 'text' && (t.tab === true || t.listMarkerSpace === true),
+    );
+
+    // Encode a token's text, reversing code points for RTL (odd-level) runs
+    // so glyphs lay out right-to-left as our cursor advances left-to-right.
+    /** A text token carrying underline or strikethrough. */
+    const isDecorated = (tok: (typeof line.tokens)[number]): tok is TextToken =>
+      tok.kind === 'text' && (tok.resolvedRun.underline !== 'none' || tok.resolvedRun.strike);
+
+    const showToken = (tok: TextToken): string => {
+      if (tok.bidiLevel % 2 === 0) return showTextOf(tok, tok.text);
+      return showTextOf(tok, reverseByCodePoint(tok.text), tok.charColorsHex?.slice().reverse());
+    };
+    // ISO 32000-1 §14.9.4 — text the Indic shaper set is drawn in an order of
+    // its own (the short i of हि before the ha), and a glyph it formed may
+    // stand for several characters, so each word of it is bracketed with the
+    // text it stands for: copied or searched, it reads as it was written. A
+    // word cut into runs — a vowel sign coloured apart — is one bracket, or a
+    // reader takes each run for a word of its own.
+    //
+    // The word, and not less, though MuPDF (1.28.5) misreads it: its
+    // `do_extract_within_actualtext` keeps the glyphs whose /ToUnicode matches
+    // the text at either end of a bracket and counts in bytes, not characters,
+    // what is left of the text for them, so a tail that matched comes out
+    // twice — हिन्दी reads "हिन्दीन्दी". Bracketing only the glyphs drawn out of
+    // order (हि, and न्दी from /ToUnicode) read right in MuPDF, but poppler
+    // takes a bracket that ends on a mark set back over its letter, the reph
+    // of कर्कश or the rakar of राष्ट्र, for the end of a word ("कर्क श"), and
+    // a bracket that keeps the mark with the letter after it ends on a tail
+    // that matches again ("कर्कशश"). LibreOffice escapes MuPDF by giving no
+    // Unicode value to any glyph of a cluster but the first, which PDF/A-2u
+    // (§6.2.11.7.2) and PDF/UA (§7.21.7) forbid.
+    const actualText = (tokens: ReadonlyArray<(typeof line.tokens)[number]>) => {
+      const open = tokens.map(() => '');
+      const close = tokens.map(() => false);
+      const shaped = (t: (typeof line.tokens)[number] | undefined): t is TextToken =>
+        t?.kind === 'text' && !t.isSpace && t.tab !== true && t.font.measure.clustered(t.text);
+      for (let i = 0; i < tokens.length; i++) {
+        if (!shaped(tokens[i])) continue;
+        let j = i;
+        let text = '';
+        for (let t = tokens[j]; shaped(t); t = tokens[++j]) text += t.text;
+        let hex = '';
+        for (const b of unicodeString(text).bytes) hex += b.toString(16).padStart(2, '0');
+        open[i] = `/Span <</ActualText <${hex.toUpperCase()}>>> BDC`;
+        close[j - 1] = true;
+        i = j - 1;
+      }
+      return { open, close };
+    };
+
+    // §17.3.2.32 — a run's own background, painted behind its glyphs before
+    // anything else on the line. Same shape as the highlight below, but each
+    // run carries its own colour; runs that share one are painted together.
+    if (line.tokens.some((t) => t.kind === 'text' && t.resolvedRun.shadingColorHex)) {
+      if (inBT) {
+        out.push('ET');
+        inBT = false;
+      }
+      const shAscent = Math.max(lineFs, line.mathAscentPt ?? 0);
+      const shDescent = Math.max(lineFs * 0.2, line.mathDescentPt ?? 0);
+      out.push('q');
+      let sx: number = originX;
+      let painted = '';
+      for (const tok of line.tokens) {
+        const w = tok.widthPt + (tok.kind === 'text' && tok.isSpace ? extraPerSpace : 0);
+        const hex = tok.kind === 'text' ? tok.resolvedRun.shadingColorHex : undefined;
+        if (hex !== undefined) {
+          if (hex !== painted) {
+            if (painted !== '') out.push('f');
+            const [sr, sg, sb] = hexToRgb01(hex);
+            out.push(`${formatNumber(sr)} ${formatNumber(sg)} ${formatNumber(sb)} rg`);
+            painted = hex;
+          }
+          out.push(
+            `${formatNumber(sx)} ${formatNumber(baselineY - shDescent)} ` +
+              `${formatNumber(w)} ${formatNumber(shAscent + shDescent)} re`,
+          );
+        }
+        sx += w;
+      }
+      if (painted !== '') out.push('f');
+      out.push('Q');
+    }
+
+    // Comment-range highlight (CM2c): a soft fill behind highlighted tokens.
+    // Path ops can't sit inside a text object, so close BT first; the text
+    // emit below reopens it. Gated on a highlight being present, so every line
+    // in a document with no comment ranges emits byte-identically.
+    if (line.tokens.some((t) => t.kind === 'text' && t.highlight === true)) {
+      if (inBT) {
+        out.push('ET');
+        inBT = false;
+      }
+      const hlAscent = Math.max(lineFs, line.mathAscentPt ?? 0);
+      const hlDescent = Math.max(lineFs * 0.2, line.mathDescentPt ?? 0);
+      const [hr, hg, hb] = hexToRgb01('fff3a3');
+      out.push('q');
+      out.push(`${formatNumber(hr)} ${formatNumber(hg)} ${formatNumber(hb)} rg`);
+      let hx: number = originX;
+      for (const tok of line.tokens) {
+        const w = tok.widthPt + (tok.kind === 'text' && tok.isSpace ? extraPerSpace : 0);
+        if (tok.kind === 'text' && tok.highlight === true) {
+          out.push(
+            `${formatNumber(hx)} ${formatNumber(baselineY - hlDescent)} ` +
+              `${formatNumber(w)} ${formatNumber(hlAscent + hlDescent)} re`,
+          );
+        }
+        hx += w;
+      }
+      out.push('f');
+      out.push('Q');
+    }
+
+    // §17.3.2.40 `w:u` / §17.3.2.9 `w:strike` — decoration is a path, not a
+    // glyph, so like the highlight above it is drawn with the text object
+    // closed. Trailing spaces are decorated too, which is what a run of them
+    // under an underline is for. Gated on a decorated token being present, so
+    // a document with none emits byte-identically.
+    if (line.tokens.some(isDecorated)) {
+      if (inBT) {
+        out.push('ET');
+        inBT = false;
+      }
+      out.push('q');
+      let dx: number = originX;
+      for (const tok of line.tokens) {
+        const w = tok.widthPt + (tok.kind === 'text' && tok.isSpace ? extraPerSpace : 0);
+        if (isDecorated(tok)) {
+          const thickness = Math.max(0.4, tok.fontSizePt * 0.06);
+          const paint = (hex: string): void => {
+            const [r, g, b] = hexToRgb01(hex);
+            out.push(`${formatNumber(r)} ${formatNumber(g)} ${formatNumber(b)} rg`);
+          };
+          paint(tok.resolvedRun.colorHex);
+          if (tok.resolvedRun.underline !== 'none') {
+            // §17.3.2.40 — the rule carries its own colour when the run gives
+            // it one; the strike below always takes the text's.
+            if (tok.resolvedRun.underlineColorHex) paint(tok.resolvedRun.underlineColorHex);
+            // §17.18.99 — the style says how the rule is drawn, not just that
+            // it is: a `thick` one is twice the weight and a `double` is two.
+            // fdo56679.docx rules its sentence thick and red and we drew the
+            // hairline every other style got.
+            const style = tok.resolvedRun.underline;
+            const heavy = style === 'thick' || style === 'dottedHeavy' || style === 'dashHeavy';
+            const t = heavy ? thickness * 2 : thickness;
+            const y = baselineY - tok.fontSizePt * 0.12 - t;
+            const dashed =
+              style === 'dotted' || style === 'dottedHeavy'
+                ? [t, t * 2]
+                : style === 'dash' || style === 'dashHeavy'
+                  ? [t * 4, t * 3]
+                  : undefined;
+            if (dashed) {
+              // A pattern has to be STROKED — a filled rectangle has no dash.
+              out.push(`${formatNumber(t)} w`);
+              out.push(`[${dashed.map((n) => formatNumber(n)).join(' ')}] 0 d`);
+              const [r, g, b] = hexToRgb01(
+                tok.resolvedRun.underlineColorHex ?? tok.resolvedRun.colorHex,
+              );
+              out.push(`${formatNumber(r)} ${formatNumber(g)} ${formatNumber(b)} RG`);
+              out.push(
+                `${formatNumber(dx)} ${formatNumber(y + t / 2)} m ` +
+                  `${formatNumber(dx + w)} ${formatNumber(y + t / 2)} l S`,
+              );
+              out.push('[] 0 d');
+            } else {
+              out.push(
+                `${formatNumber(dx)} ${formatNumber(y)} ` +
+                  `${formatNumber(w)} ${formatNumber(t)} re f`,
+              );
+              // The second rule of a `double`, a rule's width below the first.
+              if (style === 'double') {
+                out.push(
+                  `${formatNumber(dx)} ${formatNumber(y - t * 2)} ` +
+                    `${formatNumber(w)} ${formatNumber(t)} re f`,
+                );
+              }
+            }
+            if (tok.resolvedRun.underlineColorHex) paint(tok.resolvedRun.colorHex);
+          }
+          if (tok.resolvedRun.strike) {
+            const y = baselineY + tok.fontSizePt * 0.26;
+            out.push(
+              `${formatNumber(dx)} ${formatNumber(y)} ` +
+                `${formatNumber(w)} ${formatNumber(thickness)} re f`,
+            );
+          }
+        }
+        dx += w;
+      }
+      out.push('Q');
+    }
+
+    // A super/subscript draws off the baseline, so the line can no longer be
+    // one Tm and a run of Tj — each token needs its own placement.
+    const hasRise = line.tokens.some((t) => t.kind === 'text' && t.risePt !== undefined);
+    // ISO 32000-1 §9.4.2 — a faked italic is a SHEAR of the text matrix, and
+    // the matrix is per token, so a line carrying one takes the placed path
+    // exactly as a superscript does.
+    const hasFauxItalic = line.tokens.some(
+      (t) => t.kind === 'text' && t.synthetic?.italic === true,
+    );
+    // §20.1.9.10 — WordArt. Every glyph sits at its own point on the warp's
+    // curve, where the two edges are their own distance apart and running at
+    // their own slope, so no two glyphs share a text matrix: each is placed,
+    // scaled and sheared on its own. Set flat, tdf114848's eight bent words
+    // were eight straight ones a third of the size.
+    const warp = cmd.warp;
+    if (warp) {
+      if (!inBT) {
+        out.push('BT');
+        inBT = true;
+      }
+      // The warp's matrix works in the page's top-left frame; PDF's is y-up, so
+      // the two terms that carry y flip and the origin reflects.
+      const placeGlyph = (m: readonly [number, number, number, number, number, number]) =>
+        `${formatNumber(m[0])} ${formatNumber(-m[1])} ${formatNumber(m[2])} ` +
+        `${formatNumber(-m[3])} ${formatNumber(m[4])} ${formatNumber(H - m[5])} Tm`;
+      const at = actualText(line.tokens);
+      let cursor: number = originX;
+      for (let ti = 0; ti < line.tokens.length; ti++) {
+        const tok = line.tokens[ti]!;
+        if (tok.kind !== 'text' || tok.isSpace) {
+          cursor += tok.widthPt;
+          continue;
+        }
+        switchFontIfNeeded(tok);
+        // The scripts of India go onto the curve as the shaper set them, glyph
+        // by glyph in its order, and the word stays bracketed with the text it
+        // was written as.
+        if (tok.font.measure.clustered(tok.text)) {
+          if (at.open[ti]) out.push(at.open[ti] ?? '');
+          const glyphs = warpGlyphRun(
+            warp,
+            tok.font.measure.glyphRun(tok.text),
+            cursor,
+            tok.widthPt,
+            tok.fontSizePt / tok.font.parsed.unitsPerEm,
+            cmd.baselineY,
+          );
+          // A syllable a run boundary cut: each glyph in its first character's colour.
+          const colours = tok.charColorsHex;
+          const sources = colours ? tok.font.measure.glyphSources(tok.text) : undefined;
+          for (const g of glyphs) {
+            const fill = sources
+              ? fillTo(colours?.[sources[g.index]!] ?? tok.resolvedRun.colorHex)
+              : undefined;
+            if (fill !== undefined) out.push(fill);
+            out.push(placeGlyph(g.matrix));
+            out.push(`<${g.gid.toString(16).padStart(4, '0').toUpperCase()}> Tj`);
+          }
+          if (at.close[ti]) out.push('EMC');
+          cursor += tok.widthPt;
+          continue;
+        }
+        // Per-glyph placement drops the shaper's kerning, which the line was
+        // measured WITH: the token's own glyphs are rescaled to the width it
+        // was measured at, so the block still ends where the layout said.
+        const chars = [...tok.text];
+        const raw = chars.map((c) => tok.font.measure.textWidthPt(c, tok.fontSizePt));
+        const total = raw.reduce((a, b) => a + b, 0);
+        const k = total > 0 ? tok.widthPt / total : 1;
+        for (let i = 0; i < chars.length; i++) {
+          const adv = raw[i]! * k;
+          const m = warpGlyphMatrix(warp, cursor, adv, cmd.baselineY);
+          cursor += adv;
+          if (!m) continue;
+          out.push(placeGlyph(m));
+          out.push(tok.font.measure.showText(chars[i]!));
+        }
+      }
+      return;
+    }
+    // A rotated line advances its glyphs along the ROTATED axis, which one text
+    // matrix already does for free — but only on the single-Tm path, where the
+    // advance is the font's and not one this emitter computes in page space.
+    if (rotationDeg !== 0 && !hasImageToken && !hasMathToken) {
+      if (!inBT) {
+        out.push('BT');
+        inBT = true;
+      }
+      const rad = (rotationDeg * Math.PI) / 180;
+      const cos = formatNumber(Math.cos(rad));
+      const sin = formatNumber(Math.sin(rad));
+      out.push(
+        `${cos} ${sin} ${formatNumber(-Math.sin(rad))} ${cos} ` +
+          `${formatNumber(originX)} ${formatNumber(baselineY)} Tm`,
+      );
+      const at = actualText(line.tokens);
+      line.tokens.forEach((tok, i) => {
+        if (tok.kind !== 'text') return;
+        switchFontIfNeeded(tok);
+        if (at.open[i]) out.push(at.open[i] ?? '');
+        out.push(showTextOf(tok, tok.text));
+        if (at.close[i]) out.push('EMC');
+      });
+    } else if (
+      extraPerSpace !== 0 ||
+      hasImageToken ||
+      hasMathToken ||
+      hasRtl ||
+      hasRise ||
+      hasFauxItalic ||
+      hasTab
+    ) {
+      // Per-token absolute positioning. Required for justify (inter-word
+      // slack), inline images (text-mode exits), and BiDi (visual order
+      // differs from logical order). Tokens are emitted in visual order.
+      const order = hasRtl ? lineVisualOrder(line) : line.tokens.map((_, i) => i);
+      const at = actualText(order.map((i) => line.tokens[i]!));
+      let x: number = originX;
+      for (let oi = 0; oi < order.length; oi++) {
+        const tok = line.tokens[order[oi]!]!;
+        if (tok.kind === 'image') {
+          flushLink();
+          emitImageToken(tok, x, baselineY);
+          x += tok.widthPt;
+          continue;
+        }
+        if (tok.kind === 'math') {
+          flushLink();
+          emitMathToken(tok, x, baselineY);
+          x += tok.widthPt;
+          continue;
+        }
+        if (!inBT) {
+          out.push('BT');
+          inBT = true;
+        }
+        switchFontIfNeeded(tok);
+        // The `c` term leans the glyphs off the baseline: a fifth of the
+        // height per unit of it, which is the slant a text italic carries.
+        const slant = tok.synthetic?.italic === true ? FAUX_ITALIC_SHEAR : 0;
+        out.push(
+          `1 0 ${formatNumber(slant)} 1 ` +
+            `${formatNumber(x)} ${formatNumber(baselineY + (tok.risePt ?? 0))} Tm`,
+        );
+        if (at.open[oi]) out.push(at.open[oi] ?? '');
+        out.push(showToken(tok));
+        if (at.close[oi]) out.push('EMC');
+        const tokenX0 = x;
+        x += tok.widthPt;
+        if (tok.isSpace) x += extraPerSpace;
+        trackLink(tok.href, tok.anchor, tok.text, tokenX0, x);
+      }
+      flushLink();
+    } else {
+      if (!inBT) {
+        out.push('BT');
+        inBT = true;
+      }
+      out.push(`1 0 0 1 ${formatNumber(originX)} ${formatNumber(baselineY)} Tm`);
+      const at = actualText(line.tokens);
+      let x: number = originX;
+      for (let i = 0; i < line.tokens.length; i++) {
+        const tok = line.tokens[i]!;
+        if (tok.kind !== 'text') continue; // unreachable here, but TS-narrowed
+        switchFontIfNeeded(tok);
+        if (at.open[i]) out.push(at.open[i] ?? '');
+        out.push(showTextOf(tok, tok.text));
+        if (at.close[i]) out.push('EMC');
+        trackLink(tok.href, tok.anchor, tok.text, x, x + tok.widthPt);
+        x += tok.widthPt;
+      }
+      flushLink();
+    }
+  };
+
+  // The text pass, defined with the emitters above and RUN where it stood —
+  // after everything that paints under it.
+  const emitLinesPass = (): void => {
+    if (lines.length === 0) return;
+    if (tagging) {
+      // Tagged PDF: each line is its own marked-content sequence. A body line
+      // (carrying a structId) becomes /P <</MCID n>> BDC … EMC and registers its
+      // MCID with the owning structure node; a line without a structId (header/
+      // footer text) is a pagination artifact. The BDC/EMC bracket cleanly wraps
+      // the line's own BT…ET (and any inline-image/math q…Q), which is legal —
+      // marked-content brackets nest independently of BT/ET and q/Q (§14.6.1).
+      for (const cmd of lines) {
+        if (inBT) {
+          out.push('ET');
+          inBT = false;
+        }
+        const sid = cmd.structId;
+        if (sid !== undefined) {
+          const mcid = tagging.next++;
+          tagging.assigned = true;
+          tagging.record(sid, mcid);
+          out.push(`/${tagging.tagFor(sid)} <</MCID ${mcid}>> BDC`);
+        } else if (cmd.artifact === 'pagination') {
+          out.push('/Artifact <</Type /Pagination>> BDC');
+        } else {
+          out.push('/Artifact BMC');
+        }
+        emitClipped(cmd, emitOneLine);
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- emitOneLine may leave text mode open (inBT true) via a closure; flow analysis can't track it.
+        if (inBT) {
+          out.push('ET');
+          inBT = false;
+        }
+        out.push('EMC');
+      }
+    } else {
+      out.push('BT');
+      inBT = true;
+      for (const cmd of lines) emitClipped(cmd, emitOneLine);
+      // Ensure we exit text mode if the last line ended on an image token.
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- emitOneLine toggles inBT via a closure; flow analysis can't see it and assumes it stays true.
+      if (inBT) out.push('ET');
+    }
+  };
+  // One item of a run that paints in its own order — a picture's primitives, or
+  // what the page puts behind its content. Text is set the way an inline
+  // metafile's is: one run at a point.
+  const emitInOrder = (item: PageItem): void => {
+    if (item.type === 'shape') {
+      const t = item.shape.transform;
+      const fillAlpha = item.shape.fillAlpha;
+      // §20.1.8.40 — a shadow is drawn at the transparency its colour asks for,
+      // and the state that carries it has to be named here as it is in the
+      // shape pass. Left out, a shape that paints inside a PICTURE cast its
+      // shadow at full strength: tdf128596's is 50% black under a nearly
+      // transparent tile, and it came out solid black.
+      const layer = item.shape.shadow ? shadowBlurLayers(item.shape.shadow) : undefined;
+      for (const op of emitVectorShape(
+        { ...item.shape, transform: [t[0], -t[1], t[2], -t[3], t[4], H - t[5]] },
+        gradientNames?.get(item.shape),
+        layer && layer.alpha < 1
+          ? alphaStateNames?.get(Math.round(layer.alpha * 1000) / 1000)
+          : undefined,
+        gradientMaskNames?.get(item.shape) ??
+          (fillAlpha !== undefined && fillAlpha < 1
+            ? alphaStateNames?.get(Math.round(fillAlpha * 1000) / 1000)
+            : undefined),
+      )) {
+        out.push(op);
+      }
+      return;
+    }
+    if (item.type === 'image') {
+      if (item.imageResourceName === '') return;
+      out.push('q');
+      if (item.clip) {
+        const t = item.clip.transform;
+        out.push(...emitClipPath(item.clip.paths, [t[0], -t[1], t[2], -t[3], t[4], H - t[5]]));
+      }
+      const state =
+        item.alpha !== undefined && item.alpha < 1
+          ? alphaStateNames?.get(Math.round(item.alpha * 1000) / 1000)
+          : undefined;
+      if (state !== undefined) out.push(`/${state} gs`);
+      out.push(...paintImageBody(item, H - item.y - item.height, duotoneStateFor?.(item, H)));
+      out.push(...washItems(item.wash, alphaStateNames));
+      out.push('Q');
+      return;
+    }
+    if (item.type === 'fill') {
+      const [r, g, b] = hexToRgb01(item.fillColorHex);
+      out.push(
+        `${formatNumber(r)} ${formatNumber(g)} ${formatNumber(b)} rg`,
+        `${formatNumber(item.x)} ${formatNumber(H - item.y - item.height)} ` +
+          `${formatNumber(item.width)} ${formatNumber(item.height)} re`,
+        'f',
+      );
+      return;
+    }
+    if (item.type !== 'line') return;
+    // Set with the SAME emitter the page's own text uses: a line is a line
+    // wherever it paints. Written here as "the first token at a point" — which
+    // is all a metafile's label ever is — a master's caption lost every word
+    // after its first (WithMaster.pptx: "This" for "This text comes from the
+    // Master Slide").
+    emitClipped(item, emitOneLine);
+    if (inBT) {
+      out.push('ET');
+      inBT = false;
+    }
+  };
+
+  // §20.4.2.3 — what the page puts BEHIND its content paints before all of it,
+  // in its own order. Riding the passes below, a slide's white backdrop landed
+  // on top of the photograph the slide is made of: every shape paints after
+  // every image there (corpus: tdf156808, tdf157635, tdf156856).
+  if (plan.behind.length > 0) {
+    if (tagging) out.push('/Artifact BMC');
+    for (const item of plan.behind) emitInOrder(item);
+    if (tagging) out.push('EMC');
+  }
+
+  const fills = plan.fills;
+  if (fills.length > 0) {
+    if (tagging) out.push('/Artifact BMC');
+    out.push('q');
+    let lastFill = '';
+    for (const f of fills) {
+      const color = f.fillColorHex;
+      if (color !== lastFill) {
+        const [r, g, b] = hexToRgb01(color);
+        out.push(`${formatNumber(r)} ${formatNumber(g)} ${formatNumber(b)} rg`);
+        lastFill = color;
+      }
+      out.push(
+        `${formatNumber(f.x)} ${formatNumber(H - f.y - f.height)} ${formatNumber(f.width)} ${formatNumber(f.height)} re`,
+      );
+      out.push('f');
+    }
+    out.push('Q');
+    if (tagging) out.push('EMC');
+  }
+
+  // Block images. In tagged mode each carries its owning Figure (structId) → a
+  // /Figure marked-content sequence; header/footer images are pagination
+  // artifacts; anything else a bare artifact.
+  // Drop images whose resource failed to embed (unsupported/corrupt) — they have
+  // no XObject, so a `/<name> Do` would be a dangling reference.
+  const images = plan.images.filter((c) => c.imageResourceName !== '');
+  emitTaggedRuns(out, images, tagging, (img) => {
+    // ISO 32000-1 §8.9.5.1 — Image XObject placement.
+    // q             save graphics state
+    // w 0 0 h x y cm   scale unit square to (w,h) and translate to (x,y)
+    // /Im1 Do       paint the XObject
+    // Q             restore
+    out.push('q');
+    // §20.1.8.14 — a picture FILL is clipped to the shape it fills. The stored
+    // matrix is the top-left one; the page flip (an involution) recovers the
+    // y-up CTM the clip is emitted under, exactly as a shape's is.
+    if (img.clip) {
+      const t = img.clip.transform;
+      out.push(...emitClipPath(img.clip.paths, [t[0], -t[1], t[2], -t[3], t[4], H - t[5]]));
+    }
+    // §20.1.8.4 — a picture the document draws at less than full opacity is
+    // painted through a constant-alpha state, so what stands behind it shows
+    // through: a slide backed by a photograph at 70 % is a wash of it.
+    const state =
+      img.alpha !== undefined && img.alpha < 1
+        ? alphaStateNames?.get(Math.round(img.alpha * 1000) / 1000)
+        : undefined;
+    if (state !== undefined) out.push(`/${state} gs`);
+    out.push(...paintImageBody(img, H - img.y - img.height, duotoneStateFor?.(img, H)));
+    out.push(...washItems(img.wash, alphaStateNames));
+    out.push('Q');
+  });
+
+  const borders = plan.borders;
+  if (borders.length > 0) {
+    if (tagging) out.push('/Artifact BMC');
+    out.push('q');
+    // ISO 32000-1 §8.4.3.3 cap style 2 — a projecting square end, half the line
+    // width past each endpoint. Each cell edge is stroked as its own segment, so
+    // with the initial butt cap two collinear segments MEET rather than overlap:
+    // 56295.xlsx shows a lighter pixel at every cell boundary that lands
+    // mid-pixel, and all four corners of a boxed range are left unpainted where
+    // the horizontal rule stops short of the vertical one. LibreOffice reaches
+    // the same result by overshooting each run by exactly half a width.
+    out.push('2 J');
+    let lastWidth = -1;
+    let lastStroke = '';
+    let lastDash = '';
+    for (const b of borders) {
+      const width = b.borderSizePt;
+      const color = b.borderColorHex;
+      // §18.18.3 names line PATTERNS, not just weights, and ISO 32000-1 §8.4.3.6
+      // is where they belong. 57423.xlsx rules a whole band `dashed` and we drew
+      // twelve continuous edges. The projecting cap set above would lengthen
+      // every dash by half a width at each end and close the gaps, so a
+      // patterned rule reverts to the butt cap §8.4.3.3 starts with.
+      const dash = dashPatternFor(b.borderStyle);
+      if (dash !== lastDash) {
+        out.push(dash === '' ? '[] 0 d 2 J' : `${dash} 0 d 0 J`);
+        lastDash = dash;
+      }
+      // Each rule of a `double` takes a third of the declared width.
+      const strokeW = b.borderStyle === 'double' ? Math.max(0.25, width / 3) : width;
+      if (strokeW !== lastWidth) {
+        out.push(`${formatNumber(strokeW)} w`);
+        lastWidth = strokeW;
+      }
+      if (color !== lastStroke) {
+        const [r, g, bl] = hexToRgb01(color);
+        out.push(`${formatNumber(r)} ${formatNumber(g)} ${formatNumber(bl)} RG`);
+        lastStroke = color;
+      }
+      const x = b.x;
+      const y = H - b.y - b.height; // box bottom edge in PDF's y-up frame
+      const w = b.width;
+      const h = b.height;
+      // The edge as a segment plus the direction to offset it in: a `double`
+      // rule is TWO lines straddling the edge, and every other style is the one
+      // line down the middle of it.
+      const [x1, y1, x2, y2, nx, ny]: readonly [number, number, number, number, number, number] =
+        b.side === 'top'
+          ? [x, y + h, x + w, y + h, 0, 1]
+          : b.side === 'bottom'
+            ? [x, y, x + w, y, 0, 1]
+            : b.side === 'left'
+              ? [x, y, x, y + h, 1, 0]
+              : [x + w, y, x + w, y + h, 1, 0];
+      // §18.18.3 `double` is a pair of rules with a gap between them, not a
+      // heavier single one — 59264.xlsx labels its sampler cell DOUBLE and both
+      // references draw two lines where we drew one. Each line takes a third of
+      // the declared width and the gap the middle third, which is how Excel and
+      // Calc split it.
+      const offsets = b.borderStyle === 'double' ? [-width / 3, width / 3] : [0];
+      for (const d of offsets) {
+        out.push(`${formatNumber(x1 + nx * d)} ${formatNumber(y1 + ny * d)} m`);
+        out.push(`${formatNumber(x2 + nx * d)} ${formatNumber(y2 + ny * d)} l`);
+      }
+      out.push('S');
+    }
+    out.push('Q');
+    if (tagging) out.push('EMC');
+  }
+
+  // Vector shapes (DrawingML §20). Each shape is a self-contained q…cm…Q block
+  // (emitVectorShape). Drawn after table fills/images/borders but before the
+  // text pass, so both body text and the shape's own text (emitted as 'line'
+  // commands) land on top of shape fills. In tagged mode a shape/chart carries
+  // its Figure structId → /Figure marked content (contiguous chart shapes share
+  // one MCID); decorative shapes fall back to a bare artifact.
+  const shapes = plan.shapes;
+  emitTaggedRuns(out, shapes, tagging, (sh) => {
+    // The stored transform targets the top-left page frame; conjugating with
+    // the page flip (an involution — same operation layout applied) recovers
+    // the y-up CTM. The linear part negates exactly; only f re-rounds.
+    const t = sh.shape.transform;
+    const shape: VectorShape = {
+      ...sh.shape,
+      transform: [t[0], -t[1], t[2], -t[3], t[4], H - t[5]],
+    };
+    const shadowLayer = sh.shape.shadow ? shadowBlurLayers(sh.shape.shadow) : undefined;
+    const alphaState =
+      shadowLayer && shadowLayer.alpha < 1
+        ? alphaStateNames?.get(Math.round(shadowLayer.alpha * 1000) / 1000)
+        : undefined;
+    const fillAlpha = sh.shape.fillAlpha;
+    const fillAlphaState =
+      gradientMaskNames?.get(sh.shape) ??
+      (fillAlpha !== undefined && fillAlpha < 1
+        ? alphaStateNames?.get(Math.round(fillAlpha * 1000) / 1000)
+        : undefined);
+    for (const op of emitVectorShape(
+      shape,
+      gradientNames?.get(sh.shape),
+      alphaState,
+      fillAlphaState,
+    )) {
+      out.push(op);
+    }
+  });
+
+  // A PICTURE paints in its OWN order: a metafile writes a label, lays a panel
+  // over it and writes the label again as its own shadow, so the buried copy
+  // must stay buried. Its text is set the way an inline metafile's is — one run
+  // at a point, no tabs or links to carry.
+  for (const run of plan.pictures) {
+    if (run.length === 0) continue;
+    if (tagging) out.push('/Artifact BMC');
+    for (const item of run) emitInOrder(item);
+    if (tagging) out.push('EMC');
+  }
+
+  // §19.3.1 — and a page that states its own order paints in it, kind by kind
+  // ignored. A slide's shape tree IS that order.
+  for (const run of plan.ordered) {
+    for (const item of run) emitInOrder(item);
+  }
+
+  emitLinesPass();
+
+  return { content: encoder.encode(out.join('\n')), links };
+}
+
+/**
+ * The operators that put an image XObject in a box — ISO 32000-1 §8.9.5.1: the
+ * unit square scaled to the box and moved to `(x, y)`, its bottom-left corner.
+ *
+ * A `a:srcRect` crop (§20.1.8.55) cuts edges off the SOURCE and fits what is
+ * left to the same box, so the picture is drawn larger than the box and the box
+ * is made a clipping path. Ignored, ImageCrop.docx drew the whole mountain
+ * where LibreOffice shows the peak.
+ *
+ * @returns The content-stream lines, to be pushed between `q` and the `Do`.
+ */
+function placeImage(
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+  crop: ImageCrop | undefined,
+  rotationDeg?: number,
+  flipH?: boolean,
+  flipV?: boolean,
+): Array<string> {
+  const cm = (w: number, h: number, ox: number, oy: number): string =>
+    `${formatNumber(w)} 0 0 ${formatNumber(h)} ${formatNumber(ox)} ${formatNumber(oy)} cm`;
+  // §20.1.7.6 — a picture turned in its frame turns about the frame's CENTRE,
+  // and the clip and scale below then work in the turned frame exactly as they
+  // do in an upright one. DrawingML measures clockwise, PDF counter-clockwise.
+  const spin = rotationDeg
+    ? [rotateAboutCm(x + width / 2, y + height / 2, -rotationDeg)]
+    : ([] as Array<string>);
+  // §20.1.7.6 `@flipH`/`@flipV` — mirrored about the same centre, before the
+  // box is filled, so everything after it works in the mirrored frame.
+  if (flipH === true || flipV === true) {
+    const sx = flipH === true ? -1 : 1;
+    const sy = flipV === true ? -1 : 1;
+    spin.push(
+      `${formatNumber(sx)} 0 0 ${formatNumber(sy)} ` +
+        `${formatNumber(sx === -1 ? 2 * x + width : 0)} ` +
+        `${formatNumber(sy === -1 ? 2 * y + height : 0)} cm`,
+    );
+  }
+  if (!crop) return [...spin, cm(width, height, x, y)];
+  const kept = { w: 1 - crop.left - crop.right, h: 1 - crop.top - crop.bottom };
+  // The full picture at the scale that makes its kept part fill the box, moved
+  // so that part lands ON the box: left by the cut-away left edge, and down by
+  // the cut-away BOTTOM one (PDF's y runs up, DrawingML's crop runs down).
+  const full = { w: width / kept.w, h: height / kept.h };
+  return [
+    ...spin,
+    `${formatNumber(x)} ${formatNumber(y)} ${formatNumber(width)} ${formatNumber(height)} re`,
+    'W',
+    'n',
+    cm(full.w, full.h, x - crop.left * full.w, y - crop.bottom * full.h),
+  ];
+}
+
+/** A `cm` that turns the frame `deg` counter-clockwise about `(cx, cy)`. */
+function rotateAboutCm(cx: number, cy: number, deg: number): string {
+  const rad = (deg * Math.PI) / 180;
+  const c = Math.cos(rad);
+  const s = Math.sin(rad);
+  return (
+    `${formatNumber(c)} ${formatNumber(s)} ${formatNumber(-s)} ${formatNumber(c)} ` +
+    `${formatNumber(cx - cx * c + cy * s)} ${formatNumber(cy - cx * s - cy * c)} cm`
+  );
+}
+
+function hexToRgb01(hex: string): readonly [number, number, number] {
+  const r = parseInt(hex.slice(0, 2), 16) / 255;
+  const g = parseInt(hex.slice(2, 4), 16) / 255;
+  const b = parseInt(hex.slice(4, 6), 16) / 255;
+  return [r, g, b];
+}
+
+function formatNumber(n: number): string {
+  if (Number.isInteger(n)) return String(n);
+  return n.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+}
+
+/**
+ * Per-page tagging state threaded into `emitPageContent` when emitting a tagged
+ * PDF (ISO 32000-1 §14.7).
+ */
+export interface PageTagging {
+  /** The running MCID counter, reset per page. */
+  next: number;
+  /** Whether any tagged marked content was emitted (so the page gets `/StructParents`). */
+  assigned: boolean;
+  /** Tie an assigned MCID back to its structure node. */
+  record: (structId: number, mcid: number) => void;
+  /**
+   * The marked-content tag for a structure node — its structure type, so the
+   * `BDC` tag matches the `StructElem` `/S` (§14.7.2: a heading is `/H1`, a
+   * cell's paragraph `/P`, …), not a hardcoded `/P`.
+   */
+  tagFor: (structId: number) => string;
+}

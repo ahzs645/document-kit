@@ -1,0 +1,12 @@
+{
+  // The template engine brought in from officeParser was written without noUncheckedIndexedAccess:
+  // under it, about 220 array and record reads would need a non-null assertion. Every other option
+  // of the kit's tsconfig applies. See docs/template-upstream.md, "Type checking".
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "noUncheckedIndexedAccess": false
+  },
+  "include": ["./**/*.ts"],
+  // The root config leaves this folder out; here it is the whole program.
+  "exclude": []
+}

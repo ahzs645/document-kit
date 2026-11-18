@@ -1,0 +1,214 @@
+// Format-agnostic vector model (paths, strokes, shapes) — the shared
+// vocabulary of every writer, plus the path-data/flip helpers every emitter
+// of that vocabulary needs. The PDF operator emission lives in
+// pdf/vector-graphics (oop-design §8, C9 — this move cut the svg→pdf model
+// dependency).
+
+/**
+ * One drawing operator of a path, in the y-up local frame. The `op` discriminant
+ * mirrors the PDF path operators noted on each arm (`m`/`l`/`c`/`h`).
+ */
+export type PathSegment =
+  | { readonly op: 'move'; readonly x: number; readonly y: number } // m
+  | { readonly op: 'line'; readonly x: number; readonly y: number } // l
+  | {
+      readonly op: 'cubic'; // c
+      readonly x1: number;
+      readonly y1: number;
+      readonly x2: number;
+      readonly y2: number;
+      readonly x: number;
+      readonly y: number;
+    }
+  | { readonly op: 'close' }; // h
+
+/** A single subpath: a sequence of {@link PathSegment}s plus an optional fill rule. */
+export interface VectorPath {
+  readonly segments: ReadonlyArray<PathSegment>;
+  /**
+   * Winding rule for filling (§8.5.3.3). Defaults to nonzero. `evenodd` selects
+   * the `*` painting variants (`f*`/`B*`).
+   */
+  readonly fillRule?: 'nonzero' | 'evenodd';
+}
+
+/** A stroke description: colour, width, line cap/join and dash pattern. */
+export interface StrokeStyle {
+  /** Stroke colour as 6-hex, no leading `#`. */
+  readonly colorHex: string; // 6-hex, no leading '#'
+  readonly widthPt: number;
+  readonly cap?: 'butt' | 'round' | 'square'; // §8.4.3.3 → 0|1|2 J
+  readonly join?: 'miter' | 'round' | 'bevel'; // §8.4.3.4 → 0|1|2 j
+  /** Dash pattern in points (§8.4.3.6). Empty/omitted = solid line. */
+  readonly dash?: ReadonlyArray<number>;
+}
+
+/**
+ * One stop of a {@link ShapeGradient}: a colour pinned at a fractional `offset`
+ * along the gradient axis.
+ */
+export interface GradientStop {
+  /** Position along the gradient axis, `0..1`. */
+  readonly offset: number; // 0..1
+  /** Stop colour as 6-hex, no leading `#`. */
+  readonly colorHex: string; // 6-hex, no leading '#'
+  /**
+   * §20.1.2.3.1 `a:alpha` — how opaque THIS stop is, `0..1`; absent is opaque.
+   * The colour beside it is the stop's own, not composited over the paper.
+   */
+  readonly alpha?: number;
+}
+
+/**
+ * A gradient fill — the format-agnostic vocabulary shared by the shape model
+ * (DrawingML `a:gradFill`) and the readers (PDF axial/radial shadings, EP16). A
+ * linear gradient runs along `angle` (degrees clockwise, 0 = left→right); a
+ * radial gradient runs centre→edge. Stops are sorted, offset `0..1`.
+ */
+export interface ShapeGradient {
+  readonly kind: 'linear' | 'radial';
+  /** Linear only: gradient direction in degrees clockwise (0 = left→right). */
+  readonly angle?: number; // linear only: degrees clockwise, 0 = left→right
+  /**
+   * Radial only: where the first stop sits inside the box, as fractions of it
+   * (`{x: 0, y: 0}` is the top-left corner). Absent means the middle, which is
+   * where DrawingML's own `a:path` puts it; VML aims it at a corner instead
+   * (`@focus` with an `@angle`), and fill.docx's page sweep starts in one.
+   */
+  readonly center?: { readonly x: number; readonly y: number };
+  /**
+   * Radial only: the shape of the sweep's contours. Circles by default, which
+   * is what DrawingML's `a:path path="circle"` draws; VML's `gradientRadial`
+   * grows RECTANGLES out to the box instead, and so does the page background
+   * of fill.docx.
+   */
+  readonly sweep?: 'circle' | 'rect';
+  readonly stops: ReadonlyArray<GradientStop>;
+}
+
+/**
+ * A drawable shape: one or more {@link VectorPath}s with a fill (solid or
+ * gradient), an optional stroke, and the CTM that maps its local frame onto the
+ * page.
+ */
+export interface VectorShape {
+  readonly paths: ReadonlyArray<VectorPath>;
+  /**
+   * Non-stroking fill colour (6-hex). Omitted = no fill. When `fillGradient` is
+   * present this carries its solid approximation (writers without gradient
+   * support, e.g. the plain PDF emitter, paint this instead).
+   */
+  readonly fillColorHex?: string;
+  /**
+   * A gradient fill (EP16). Writers that support gradients (SVG) prefer this
+   * over `fillColorHex`.
+   */
+  readonly fillGradient?: ShapeGradient;
+  /**
+   * §20.1.2.3.1 — the fill's opacity, `0..1`. Absent is opaque. Writers without
+   * transparency paint `fillColorHex` at full strength.
+   */
+  readonly fillAlpha?: number;
+  /** Stroke description. Omitted = no stroke. */
+  readonly stroke?: StrokeStyle;
+  /**
+   * §20.1.8.40 — a drop shadow drawn UNDER this shape: the same paths, offset
+   * by `(dxPt, dyPt)` in the page's own frame (y down), filled in `colorHex` at
+   * `alpha`. `blurPt` is the softness the source asked for; writers that cannot
+   * blur draw a hard edge.
+   */
+  readonly shadow?: {
+    readonly dxPt: number;
+    readonly dyPt: number;
+    readonly blurPt: number;
+    readonly colorHex: string;
+    readonly alpha: number;
+  };
+  /**
+   * CTM applied via `cm` (§8.3.4): maps the local frame onto the page. The
+   * 6-tuple is `[a b c d e f]` of the matrix `[[a b 0][c d 0][e f 1]]`.
+   */
+  readonly transform: readonly [number, number, number, number, number, number];
+}
+
+/** Fluent builder so geometry modules read like the shape they describe. */
+export class PathBuilder {
+  private readonly segments: Array<PathSegment> = [];
+
+  /** Begin a new subpath at `(x, y)`. */
+  moveTo(x: number, y: number): this {
+    this.segments.push({ op: 'move', x, y });
+    return this;
+  }
+
+  /** Add a straight segment to `(x, y)`. */
+  lineTo(x: number, y: number): this {
+    this.segments.push({ op: 'line', x, y });
+    return this;
+  }
+
+  /** Add a cubic Bézier to `(x, y)` with control points `(x1, y1)` and `(x2, y2)`. */
+  cubicTo(x1: number, y1: number, x2: number, y2: number, x: number, y: number): this {
+    this.segments.push({ op: 'cubic', x1, y1, x2, y2, x, y });
+    return this;
+  }
+
+  /** Append already-built segments (e.g. an arc decomposed into cubics). */
+  append(segments: ReadonlyArray<PathSegment>): this {
+    for (const s of segments) this.segments.push(s);
+    return this;
+  }
+
+  /** Close the current subpath back to its start. */
+  close(): this {
+    this.segments.push({ op: 'close' });
+    return this;
+  }
+
+  /** Snapshot the accumulated segments as a {@link VectorPath}. */
+  build(fillRule?: 'nonzero' | 'evenodd'): VectorPath {
+    return { segments: this.segments.slice(), ...(fillRule ? { fillRule } : {}) };
+  }
+}
+
+// Emit the content-stream operators for one shape as a list of lines. Fully
+// self-contained inside its own q…Q so stroke/dash/colour state never leaks
+// into a neighbouring pass.
+
+/**
+ * Compose the page flip with a local→page CTM built in the y-up frame, so the
+ * stored transform targets the top-left frame the PageDoc schema froze on.
+ * The flip is an involution: the PDF emitter applies the same operation to
+ * recover the y-up matrix. Negating the linear part only flips sign bits
+ * (exact in IEEE 754); the y-translation is the one component that re-rounds.
+ *
+ * @param m          The local→page CTM 6-tuple `[a b c d e f]`.
+ * @param pageHeight The page height the y-translation flips about.
+ */
+export function flipTransform(
+  m: readonly [number, number, number, number, number, number],
+  pageHeight: number,
+): [number, number, number, number, number, number] {
+  return [m[0], -m[1], m[2], -m[3], m[4], pageHeight - m[5]];
+}
+
+/**
+ * SVG path-data string from `segments`, in raw coordinates (the caller's
+ * transform maps the local frame into the target one).
+ *
+ * @param fmt Number formatter applied to every coordinate.
+ */
+export function svgPathData(
+  segments: ReadonlyArray<PathSegment>,
+  fmt: (n: number) => string,
+): string {
+  const parts: Array<string> = [];
+  for (const s of segments) {
+    if (s.op === 'move') parts.push(`M ${fmt(s.x)} ${fmt(s.y)}`);
+    else if (s.op === 'line') parts.push(`L ${fmt(s.x)} ${fmt(s.y)}`);
+    else if (s.op === 'cubic')
+      parts.push(`C ${fmt(s.x1)} ${fmt(s.y1)} ${fmt(s.x2)} ${fmt(s.y2)} ${fmt(s.x)} ${fmt(s.y)}`);
+    else parts.push('Z');
+  }
+  return parts.join(' ');
+}

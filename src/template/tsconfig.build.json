@@ -1,0 +1,13 @@
+{
+  // Declarations for document-kit/template, built with this folder's own options (see tsconfig.json
+  // here). Proposed to run from the root build once the root tsconfig files exclude src/template.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "emitDeclarationOnly": true,
+    "declaration": true,
+    "outDir": "../../dist/types/template",
+    "rootDir": "."
+  },
+  "include": ["./**/*.ts"]
+}

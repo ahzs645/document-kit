@@ -1,0 +1,1278 @@
+// Build a minimal valid xlsx package in memory for tests, optionally with a
+// custom styles.xml and merged cell ranges.
+
+import { zipSync } from 'fflate';
+
+import { formatCellRef } from '../../../src/ream/excel';
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+const CONTENT_TYPES_HEADER = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>`;
+
+const CONTENT_TYPES_FIXED_OVERRIDES =
+  '<Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>';
+
+const STYLES_TYPE_OVERRIDE =
+  '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>';
+
+const ROOT_RELS = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>`;
+
+export type XlsxValue = string | number | boolean | null;
+
+export interface XlsxCellSpec {
+  readonly value: XlsxValue;
+  readonly styleIndex?: number;
+}
+
+export interface XlsxRowHeightSpec {
+  readonly row: number; // 0-indexed
+  readonly heightPt: number;
+  readonly customHeight?: boolean;
+  readonly hidden?: boolean;
+  /** §18.3.1.73 `s` + `customFormat="1"` — the row's default cell style. */
+  readonly styleIndex?: number;
+}
+
+export interface XlsxPageMarginsSpec {
+  readonly left: number;
+  readonly right: number;
+  readonly top: number;
+  readonly bottom: number;
+  readonly header?: number;
+  readonly footer?: number;
+}
+
+export interface XlsxPageSetupSpec {
+  readonly paperSize?: number;
+  readonly orientation?: 'portrait' | 'landscape';
+  readonly scale?: number;
+  readonly fitToWidth?: number;
+  readonly fitToHeight?: number;
+  /** §18.3.1.63 — where the sheet's notes print, if at all. */
+  readonly cellComments?: 'none' | 'asDisplayed' | 'atEnd';
+}
+
+export interface XlsxPrintOptionsSpec {
+  readonly gridLines?: boolean;
+  readonly horizontalCentered?: boolean;
+  readonly verticalCentered?: boolean;
+  /** §18.3.1.70 — print the row numbers and column letters. */
+  readonly headings?: boolean;
+}
+
+export interface XlsxDefinedNameSpec {
+  readonly name: string;
+  readonly localSheetId?: number;
+  readonly value: string;
+}
+
+export interface XlsxSheetSpec {
+  readonly name: string;
+  readonly rows: ReadonlyArray<ReadonlyArray<XlsxValue | XlsxCellSpec>>;
+  readonly mergeRefs?: ReadonlyArray<string>;
+  readonly columns?: ReadonlyArray<{
+    readonly min: number;
+    readonly max: number;
+    readonly widthChars: number;
+    readonly hidden?: boolean;
+    /** §18.3.1.13 `style` — the default style of every cell in the span. */
+    readonly styleIndex?: number;
+  }>;
+  readonly rowHeights?: ReadonlyArray<XlsxRowHeightSpec>;
+  /** §18.3.1.81 `<sheetFormatPr defaultRowHeight>` — height of rows with no `ht`. */
+  readonly defaultRowHeightPt?: number;
+  /** §18.3.1.81 `<sheetFormatPr defaultColWidth>` — width of columns no `<col>` covers. */
+  readonly defaultColWidthChars?: number;
+  /** §18.3.1.81 `<sheetFormatPr baseColWidth>` — what the default column is derived from. */
+  readonly baseColWidthChars?: number;
+  readonly pageMargins?: XlsxPageMarginsSpec;
+  readonly pageSetup?: XlsxPageSetupSpec;
+  readonly printOptions?: XlsxPrintOptionsSpec;
+  readonly fitToPage?: boolean;
+  readonly rowBreaks?: ReadonlyArray<number>;
+  readonly colBreaks?: ReadonlyArray<number>;
+  /** <sheetView><pane state="frozen"> — frozen leading rows / columns. */
+  readonly freeze?: { readonly rows?: number; readonly cols?: number };
+  /** <sheetView showGridLines="0"> — the window draws no gridlines. */
+  readonly hideGridLines?: boolean;
+  /** <sheetView rightToLeft="1"> — column A at the right edge. */
+  readonly rightToLeft?: boolean;
+  /** Raw <conditionalFormatting> markup injected into the worksheet. */
+  readonly conditionalFormattingXml?: string;
+  /** Raw <dataValidations> markup injected into the worksheet (E-SHEET SV1). */
+  readonly dataValidationsXml?: string;
+  /** <headerFooter><oddHeader>/<oddFooter> &-code strings (E-SHEET W4). */
+  readonly headerFooter?: { readonly oddHeader?: string; readonly oddFooter?: string };
+  /** Raw <extLst> markup injected at the end of the worksheet (x14 sparklines). */
+  readonly extLstXml?: string;
+}
+
+export interface XlsxBuilderOptions {
+  readonly rows?: ReadonlyArray<ReadonlyArray<XlsxValue | XlsxCellSpec>>;
+  readonly sheets?: ReadonlyArray<XlsxSheetSpec>;
+  readonly stylesXml?: string;
+  /** Raw <si> entries for xl/sharedStrings.xml, overriding the generated table —
+   *  for rich-text (W6) fixtures. Cell string indices must line up with these. */
+  readonly sharedStringsXml?: string;
+  readonly mergeRefs?: ReadonlyArray<string>;
+  readonly columns?: ReadonlyArray<{
+    readonly min: number;
+    readonly max: number;
+    readonly widthChars: number;
+    readonly hidden?: boolean;
+    /** §18.3.1.13 `style` — the default style of every cell in the span. */
+    readonly styleIndex?: number;
+  }>;
+  readonly rowHeights?: ReadonlyArray<XlsxRowHeightSpec>;
+  /** §18.3.1.81 `<sheetFormatPr defaultRowHeight>` — height of rows with no `ht`. */
+  readonly defaultRowHeightPt?: number;
+  /** §18.3.1.81 `<sheetFormatPr defaultColWidth>` — width of columns no `<col>` covers. */
+  readonly defaultColWidthChars?: number;
+  /** §18.3.1.81 `<sheetFormatPr baseColWidth>` — what the default column is derived from. */
+  readonly baseColWidthChars?: number;
+  readonly pageMargins?: XlsxPageMarginsSpec;
+  readonly pageSetup?: XlsxPageSetupSpec;
+  readonly printOptions?: XlsxPrintOptionsSpec;
+  readonly fitToPage?: boolean;
+  readonly rowBreaks?: ReadonlyArray<number>;
+  readonly colBreaks?: ReadonlyArray<number>;
+  readonly freeze?: { readonly rows?: number; readonly cols?: number };
+  readonly conditionalFormattingXml?: string;
+  readonly dataValidationsXml?: string;
+  readonly headerFooter?: { readonly oddHeader?: string; readonly oddFooter?: string };
+  readonly extLstXml?: string;
+  readonly date1904?: boolean;
+  readonly definedNames?: ReadonlyArray<XlsxDefinedNameSpec>;
+  /** Attach a chart to the FIRST sheet via a drawing part (twoCellAnchor). */
+  /** A whole `a:theme` part (xl/theme/theme1.xml), related from the workbook. */
+  readonly themeXml?: string;
+  readonly sheetChart?: {
+    readonly chartXml: string; // full c:chartSpace markup
+    readonly colorsXml?: string; // full cs:colorStyle markup (colors1.xml)
+    /** Anchor cells; defaults to B2..H17 (≈ 6×4 inches on default tracks). */
+    readonly anchor?: { from: [number, number]; to: [number, number] };
+  };
+  /** Attach a picture to the FIRST sheet via a drawing part (xdr:pic, W1). */
+  readonly sheetImage?: {
+    readonly pngBytes: Uint8Array;
+    readonly anchor?: { from: [number, number]; to: [number, number] };
+  };
+  /** Attach a shape to the FIRST sheet via a drawing part (xdr:sp, W2). */
+  readonly sheetShape?: {
+    readonly text?: string;
+    readonly fillHex?: string;
+    readonly preset?: string;
+    readonly anchor?: { from: [number, number]; to: [number, number] };
+    /** Drop the explicit `a:ln` and carry `<xdr:style>` instead (gallery style). */
+    readonly styleOnly?: boolean;
+    /** §20.1.2.2.8 `<xdr:cNvPr hidden="1"/>` — the object is not to be shown. */
+    readonly hidden?: boolean;
+    /** A colour element for the run's own `<a:rPr><a:solidFill>` (e.g. an `a:sysClr`). */
+    readonly runColorXml?: string;
+    /** Raw drawing body, replacing the generated `xdr:sp` (e.g. an `xdr:grpSp`). */
+    readonly rawShapeXml?: string;
+    /** Raw anchor, replacing the generated `xdr:twoCellAnchor` whole (§20.5.2.1). */
+    readonly rawAnchorXml?: string;
+  };
+  /** Attach cell hyperlinks to the FIRST sheet (E-SHEET W3). A `url` is emitted as
+   *  an external `r:id` relationship; a `location` is an in-workbook target. */
+  readonly hyperlinks?: ReadonlyArray<{
+    readonly ref: string;
+    readonly url?: string;
+    readonly location?: string;
+    readonly tooltip?: string;
+  }>;
+  /** Legacy cell comments (xl/comments) on the FIRST sheet (E-SHEET W7). */
+  readonly comments?: ReadonlyArray<{
+    readonly ref: string;
+    readonly author: string;
+    readonly text: string;
+    /**
+     * The note is SHOWN: its VML shape carries `<x:Visible/>` and this
+     * `<x:Anchor>` ("col, dx px, row, dy px, col, dx px, row, dy px"). When
+     * any comment has one, a vmlDrawing part is written for all of them.
+     */
+    readonly shownAnchor?: string;
+  }>;
+  /**
+   * Raw legacy VML shapes (the inside of `<xml>`, `v:`/`o:`/`x:` prefixes) for
+   * the FIRST sheet's `vmlDrawing1.vml` — form controls, groups. Not combined
+   * with shown `comments`, which write that part themselves.
+   */
+  readonly legacyVmlXml?: string;
+  /** Threaded comments on the FIRST sheet + the workbook person directory (W7). */
+  readonly threadedComments?: ReadonlyArray<{
+    readonly ref: string;
+    readonly personId: string;
+    readonly text: string;
+  }>;
+  readonly persons?: ReadonlyArray<{ readonly id: string; readonly name: string }>;
+  /** Form controls on the FIRST sheet (E-SHEET W8): each gets a ctrlProp part. */
+  readonly formControls?: ReadonlyArray<{
+    readonly name: string;
+    readonly objectType: string;
+    readonly checked?: boolean;
+    readonly value?: number;
+    /** §18.3.1.20 `<controlPr print>` — false writes `print="0"`. */
+    readonly print?: boolean;
+  }>;
+  /** ActiveX controls on the FIRST sheet (E-SHEET W10): <oleObjects> + activeX part. */
+  readonly oleObjects?: ReadonlyArray<{
+    readonly progId: string;
+    readonly caption?: string;
+    readonly value?: string;
+    readonly groupName?: string;
+    /** When set, the control is persistStreamInit: no <ax:ocxPr>, an activeX#.bin
+     *  (MS-OFORMS) carrying these bytes wired through the activeX part's rels. */
+    readonly binBytes?: Uint8Array;
+  }>;
+  /** Attach Excel table parts to the FIRST sheet (E-SHEET SC3). */
+  readonly tables?: ReadonlyArray<{
+    readonly ref: string;
+    readonly name?: string;
+    readonly styleName?: string;
+    readonly showRowStripes?: boolean;
+    readonly showColumnStripes?: boolean;
+    readonly showFirstColumn?: boolean;
+    readonly headerRowCount?: number;
+    /** `totalsRowCount` — the totals row at the foot of the table. */
+    readonly totalsRowCount?: number;
+    /** `<tableColumn name>`s, left to right — what a structured reference names. */
+    readonly columns?: ReadonlyArray<string>;
+    /** <autoFilter><filterColumn colId><filters><filter val> — slicer selection. */
+    readonly filters?: ReadonlyArray<{
+      readonly colId: number;
+      readonly values: ReadonlyArray<string>;
+    }>;
+  }>;
+  /** Attach slicer + slicerCache parts (E-SHEET SV2). The slicer part rel is on
+   *  the FIRST sheet; the cache rel is on the workbook. A `cache.tableId` binds
+   *  the slicer to a `tables` entry (1-based by order) for native-table items. */
+  readonly slicers?: ReadonlyArray<{
+    readonly name: string;
+    readonly caption: string;
+    readonly cacheName: string;
+    readonly columnCount?: number;
+    readonly styleName?: string;
+    readonly cache: {
+      readonly sourceName?: string;
+      readonly tableId?: number;
+      readonly column?: number; // table column id (1-based)
+    };
+  }>;
+  /** Attach pivot table parts to the FIRST sheet (E-PIVOT). Referenced via a
+   *  sheet relationship only — no element in the worksheet XML. */
+  readonly pivotTables?: ReadonlyArray<{
+    readonly ref: string;
+    readonly name?: string;
+    readonly styleName?: string;
+    readonly firstHeaderRow?: number;
+    readonly firstDataRow?: number;
+    readonly firstDataCol?: number;
+    readonly showRowStripes?: boolean;
+    readonly showColStripes?: boolean;
+    /** <rowItems>/<colItems> @t per data row/column ('grand'/subtotal/undefined). */
+    readonly rowItemTypes?: ReadonlyArray<string | undefined>;
+    readonly colItemTypes?: ReadonlyArray<string | undefined>;
+  }>;
+}
+
+function isCellSpec(v: XlsxValue | XlsxCellSpec): v is XlsxCellSpec {
+  return typeof v === 'object' && v !== null && 'value' in v;
+}
+
+function escapeXml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function buildTableXml(
+  id: number,
+  t: {
+    ref: string;
+    name?: string;
+    styleName?: string;
+    showRowStripes?: boolean;
+    showColumnStripes?: boolean;
+    showFirstColumn?: boolean;
+    headerRowCount?: number;
+    totalsRowCount?: number;
+    columns?: ReadonlyArray<string>;
+    filters?: ReadonlyArray<{ colId: number; values: ReadonlyArray<string> }>;
+  },
+): string {
+  const name = t.name ?? `Table${id}`;
+  const style = t.styleName ?? 'TableStyleMedium2';
+  const stripes = t.showRowStripes === false ? '0' : '1';
+  const hrc = t.headerRowCount !== undefined ? ` headerRowCount="${t.headerRowCount}"` : '';
+  const trc = t.totalsRowCount ? ` totalsRowCount="${t.totalsRowCount}"` : ' totalsRowShown="0"';
+  const autoFilter =
+    t.filters && t.filters.length > 0
+      ? `<autoFilter ref="${t.ref}">${t.filters
+          .map(
+            (fc) =>
+              `<filterColumn colId="${fc.colId}"><filters>${fc.values
+                .map((v) => `<filter val="${escapeXml(v)}"/>`)
+                .join('')}</filters></filterColumn>`,
+          )
+          .join('')}</autoFilter>`
+      : `<autoFilter ref="${t.ref}"/>`;
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" id="${id}" name="${name}" displayName="${name}" ref="${t.ref}"${hrc}${trc}>
+  ${autoFilter}
+  ${
+    t.columns
+      ? `<tableColumns count="${t.columns.length}">${t.columns
+          .map((c, i) => `<tableColumn id="${i + 1}" name="${escapeXml(c)}"/>`)
+          .join('')}</tableColumns>`
+      : '<tableColumns count="1"><tableColumn id="1" name="Col"/></tableColumns>'
+  }
+  <tableStyleInfo name="${style}" showFirstColumn="${t.showFirstColumn ? 1 : 0}" showLastColumn="0" showRowStripes="${stripes}" showColumnStripes="${t.showColumnStripes ? 1 : 0}"/>
+</table>`;
+}
+
+function buildPivotTableXml(
+  id: number,
+  p: {
+    ref: string;
+    name?: string;
+    styleName?: string;
+    firstHeaderRow?: number;
+    firstDataRow?: number;
+    firstDataCol?: number;
+    showRowStripes?: boolean;
+    showColStripes?: boolean;
+    rowItemTypes?: ReadonlyArray<string | undefined>;
+    colItemTypes?: ReadonlyArray<string | undefined>;
+  },
+): string {
+  const name = p.name ?? `PivotTable${id}`;
+  const style = p.styleName ?? 'PivotStyleLight16';
+  const fhr = p.firstHeaderRow ?? 1;
+  const fdr = p.firstDataRow ?? 2;
+  const fdc = p.firstDataCol ?? 1;
+  const rowStripes = p.showRowStripes ? '1' : '0';
+  const colStripes = p.showColStripes ? '1' : '0';
+  const items = (tag: string, types?: ReadonlyArray<string | undefined>): string =>
+    types
+      ? `<${tag} count="${types.length}">${types
+          .map((t) => `<i${t ? ` t="${t}"` : ''}><x/></i>`)
+          .join('')}</${tag}>`
+      : '';
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<pivotTableDefinition xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" name="${name}" cacheId="0" dataCaption="Values" outline="1" outlineData="1">
+  <location ref="${p.ref}" firstHeaderRow="${fhr}" firstDataRow="${fdr}" firstDataCol="${fdc}"/>
+  ${items('rowItems', p.rowItemTypes)}${items('colItems', p.colItemTypes)}<pivotTableStyleInfo name="${style}" showRowHeaders="1" showColHeaders="1" showRowStripes="${rowStripes}" showColStripes="${colStripes}" showLastColumn="0"/>
+</pivotTableDefinition>`;
+}
+
+export function buildXlsx(
+  rowsOrOptions: ReadonlyArray<ReadonlyArray<XlsxValue>> | XlsxBuilderOptions,
+): Uint8Array {
+  // Array.isArray does not narrow a ReadonlyArray union, so the else branch
+  // keeps both members; test for the options shape instead.
+  const options: XlsxBuilderOptions = Array.isArray(rowsOrOptions)
+    ? { rows: rowsOrOptions as ReadonlyArray<ReadonlyArray<XlsxValue>> }
+    : (rowsOrOptions as XlsxBuilderOptions);
+
+  const sheets: Array<XlsxSheetSpec> =
+    options.sheets && options.sheets.length > 0
+      ? [...options.sheets]
+      : [
+          {
+            name: 'Sheet1',
+            rows: options.rows ?? [],
+            ...(options.mergeRefs ? { mergeRefs: options.mergeRefs } : {}),
+            ...(options.columns ? { columns: options.columns } : {}),
+            ...(options.rowHeights ? { rowHeights: options.rowHeights } : {}),
+            ...(options.defaultRowHeightPt !== undefined
+              ? { defaultRowHeightPt: options.defaultRowHeightPt }
+              : {}),
+            ...(options.defaultColWidthChars !== undefined
+              ? { defaultColWidthChars: options.defaultColWidthChars }
+              : {}),
+            ...(options.baseColWidthChars !== undefined
+              ? { baseColWidthChars: options.baseColWidthChars }
+              : {}),
+            ...(options.pageMargins ? { pageMargins: options.pageMargins } : {}),
+            ...(options.pageSetup ? { pageSetup: options.pageSetup } : {}),
+            ...(options.printOptions ? { printOptions: options.printOptions } : {}),
+            ...(options.fitToPage !== undefined ? { fitToPage: options.fitToPage } : {}),
+            ...(options.rowBreaks ? { rowBreaks: options.rowBreaks } : {}),
+            ...(options.colBreaks ? { colBreaks: options.colBreaks } : {}),
+            ...(options.freeze ? { freeze: options.freeze } : {}),
+            ...(options.conditionalFormattingXml
+              ? { conditionalFormattingXml: options.conditionalFormattingXml }
+              : {}),
+            ...(options.dataValidationsXml
+              ? { dataValidationsXml: options.dataValidationsXml }
+              : {}),
+            ...(options.headerFooter ? { headerFooter: options.headerFooter } : {}),
+            ...(options.extLstXml ? { extLstXml: options.extLstXml } : {}),
+          },
+        ];
+
+  const sharedStringsList: Array<string> = [];
+  const sharedStringIndex = new Map<string, number>();
+  const internString = (s: string): number => {
+    const existing = sharedStringIndex.get(s);
+    if (existing !== undefined) return existing;
+    const idx = sharedStringsList.length;
+    sharedStringIndex.set(s, idx);
+    sharedStringsList.push(s);
+    return idx;
+  };
+
+  const sheetParts: Array<{ fileName: string; xml: string }> = [];
+  for (let s = 0; s < sheets.length; s++) {
+    const sheet = sheets[s]!;
+    const rowHeightLookup = new Map<number, XlsxRowHeightSpec>();
+    for (const h of sheet.rowHeights ?? []) rowHeightLookup.set(h.row, h);
+    const sheetRows: Array<string> = [];
+    for (let r = 0; r < sheet.rows.length; r++) {
+      const row = sheet.rows[r]!;
+      const cells: Array<string> = [];
+      for (let c = 0; c < row.length; c++) {
+        const item = row[c];
+        const spec: XlsxCellSpec | undefined =
+          item === null || item === undefined
+            ? undefined
+            : isCellSpec(item)
+              ? item
+              : { value: item };
+        if (!spec) continue;
+        const ref = formatCellRef({ row: r, column: c });
+        const styleAttr = spec.styleIndex !== undefined ? ` s="${spec.styleIndex}"` : '';
+        if (spec.value === null) {
+          // A styled EMPTY cell — `<c r=".." s="N"/>` with no value. Real files
+          // are full of them (whole-row/column formatting), and they behave
+          // differently from an absent cell: they paint, so a neighbour's text
+          // cannot overflow across them. A `{ value: null }` with no style is
+          // still just an absent cell.
+          if (spec.styleIndex !== undefined) cells.push(`<c r="${ref}"${styleAttr}/>`);
+          continue;
+        }
+        if (typeof spec.value === 'number') {
+          cells.push(`<c r="${ref}"${styleAttr}><v>${spec.value}</v></c>`);
+        } else if (typeof spec.value === 'boolean') {
+          cells.push(`<c r="${ref}"${styleAttr} t="b"><v>${spec.value ? 1 : 0}</v></c>`);
+        } else {
+          const idx = internString(spec.value);
+          cells.push(`<c r="${ref}"${styleAttr} t="s"><v>${idx}</v></c>`);
+        }
+      }
+      const heightSpec = rowHeightLookup.get(r);
+      const heightAttrs = heightSpec
+        ? ` ht="${heightSpec.heightPt}"${heightSpec.customHeight !== false ? ' customHeight="1"' : ''}` +
+          (heightSpec.hidden ? ' hidden="1"' : '') +
+          (heightSpec.styleIndex !== undefined
+            ? ` s="${heightSpec.styleIndex}" customFormat="1"`
+            : '')
+        : '';
+      if (cells.length > 0 || heightSpec) {
+        sheetRows.push(`  <row r="${r + 1}"${heightAttrs}>${cells.join('')}</row>`);
+      }
+    }
+
+    const colsXml =
+      sheet.columns && sheet.columns.length > 0
+        ? '<cols>' +
+          sheet.columns
+            .map(
+              (c) =>
+                `<col min="${c.min}" max="${c.max}" width="${c.widthChars}" customWidth="1"` +
+                (c.hidden ? ' hidden="1"' : '') +
+                (c.styleIndex !== undefined ? ` style="${c.styleIndex}"` : '') +
+                '/>',
+            )
+            .join('') +
+          '</cols>'
+        : '';
+    const mergeXml =
+      sheet.mergeRefs && sheet.mergeRefs.length > 0
+        ? `<mergeCells count="${sheet.mergeRefs.length}">` +
+          sheet.mergeRefs.map((r) => `<mergeCell ref="${escapeXml(r)}"/>`).join('') +
+          '</mergeCells>'
+        : '';
+    const marginsXml = sheet.pageMargins
+      ? `<pageMargins left="${sheet.pageMargins.left}" right="${sheet.pageMargins.right}"` +
+        ` top="${sheet.pageMargins.top}" bottom="${sheet.pageMargins.bottom}"` +
+        (sheet.pageMargins.header !== undefined ? ` header="${sheet.pageMargins.header}"` : '') +
+        (sheet.pageMargins.footer !== undefined ? ` footer="${sheet.pageMargins.footer}"` : '') +
+        '/>'
+      : '';
+    const setupXml = sheet.pageSetup
+      ? `<pageSetup` +
+        (sheet.pageSetup.paperSize !== undefined
+          ? ` paperSize="${sheet.pageSetup.paperSize}"`
+          : '') +
+        (sheet.pageSetup.orientation !== undefined
+          ? ` orientation="${sheet.pageSetup.orientation}"`
+          : '') +
+        (sheet.pageSetup.scale !== undefined ? ` scale="${sheet.pageSetup.scale}"` : '') +
+        (sheet.pageSetup.fitToWidth !== undefined
+          ? ` fitToWidth="${sheet.pageSetup.fitToWidth}"`
+          : '') +
+        (sheet.pageSetup.fitToHeight !== undefined
+          ? ` fitToHeight="${sheet.pageSetup.fitToHeight}"`
+          : '') +
+        (sheet.pageSetup.cellComments !== undefined
+          ? ` cellComments="${sheet.pageSetup.cellComments}"`
+          : '') +
+        '/>'
+      : '';
+    const sheetPrXml = sheet.fitToPage ? '<sheetPr><pageSetUpPr fitToPage="1"/></sheetPr>' : '';
+    const sheetFormatPrXml =
+      sheet.defaultRowHeightPt !== undefined ||
+      sheet.defaultColWidthChars !== undefined ||
+      sheet.baseColWidthChars !== undefined
+        ? `<sheetFormatPr` +
+          (sheet.baseColWidthChars !== undefined
+            ? ` baseColWidth="${sheet.baseColWidthChars}"`
+            : '') +
+          (sheet.defaultRowHeightPt !== undefined
+            ? ` defaultRowHeight="${sheet.defaultRowHeightPt}"`
+            : '') +
+          (sheet.defaultColWidthChars !== undefined
+            ? ` defaultColWidth="${sheet.defaultColWidthChars}"`
+            : '') +
+          '/>'
+        : '';
+    const printOptionsXml = sheet.printOptions
+      ? `<printOptions` +
+        (sheet.printOptions.gridLines !== undefined
+          ? ` gridLines="${sheet.printOptions.gridLines ? 1 : 0}"`
+          : '') +
+        (sheet.printOptions.horizontalCentered !== undefined
+          ? ` horizontalCentered="${sheet.printOptions.horizontalCentered ? 1 : 0}"`
+          : '') +
+        (sheet.printOptions.verticalCentered !== undefined
+          ? ` verticalCentered="${sheet.printOptions.verticalCentered ? 1 : 0}"`
+          : '') +
+        (sheet.printOptions.headings !== undefined
+          ? ` headings="${sheet.printOptions.headings ? 1 : 0}"`
+          : '') +
+        '/>'
+      : '';
+    const rowBreaksXml =
+      sheet.rowBreaks && sheet.rowBreaks.length > 0
+        ? `<rowBreaks count="${sheet.rowBreaks.length}" manualBreakCount="${sheet.rowBreaks.length}">` +
+          sheet.rowBreaks.map((id) => `<brk id="${id}" max="16383" man="1"/>`).join('') +
+          '</rowBreaks>'
+        : '';
+    const colBreaksXml =
+      sheet.colBreaks && sheet.colBreaks.length > 0
+        ? `<colBreaks count="${sheet.colBreaks.length}" manualBreakCount="${sheet.colBreaks.length}">` +
+          sheet.colBreaks.map((id) => `<brk id="${id}" max="1048575" man="1"/>`).join('') +
+          '</colBreaks>'
+        : '';
+    const headerFooterXml = sheet.headerFooter
+      ? '<headerFooter>' +
+        (sheet.headerFooter.oddHeader
+          ? `<oddHeader>${escapeXml(sheet.headerFooter.oddHeader)}</oddHeader>`
+          : '') +
+        (sheet.headerFooter.oddFooter
+          ? `<oddFooter>${escapeXml(sheet.headerFooter.oddFooter)}</oddFooter>`
+          : '') +
+        '</headerFooter>'
+      : '';
+    const freezeCols = sheet.freeze?.cols ?? 0;
+    const freezeRows = sheet.freeze?.rows ?? 0;
+    const gridAttr =
+      (sheet.hideGridLines ? ' showGridLines="0"' : '') +
+      (sheet.rightToLeft ? ' rightToLeft="1"' : '');
+    const sheetViewsXml =
+      freezeCols > 0 || freezeRows > 0
+        ? `<sheetViews><sheetView${gridAttr} workbookViewId="0"><pane` +
+          (freezeCols > 0 ? ` xSplit="${freezeCols}"` : '') +
+          (freezeRows > 0 ? ` ySplit="${freezeRows}"` : '') +
+          ` state="frozen"/>` +
+          '</sheetView></sheetViews>'
+        : gridAttr
+          ? `<sheetViews><sheetView${gridAttr} workbookViewId="0"/></sheetViews>`
+          : '';
+    const xml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  ${sheetPrXml}
+  ${sheetViewsXml}
+  ${sheetFormatPrXml}
+  ${colsXml}
+  <sheetData>
+${sheetRows.join('\n')}
+  </sheetData>
+  ${printOptionsXml}
+  ${mergeXml}
+  ${sheet.conditionalFormattingXml ?? ''}
+  ${sheet.dataValidationsXml ?? ''}
+  ${marginsXml}
+  ${setupXml}
+  ${headerFooterXml}
+  ${rowBreaksXml}
+  ${colBreaksXml}
+  ${sheet.extLstXml ?? ''}
+</worksheet>`;
+    sheetParts.push({ fileName: `sheet${s + 1}.xml`, xml });
+  }
+
+  const workbookXml = buildWorkbookXml(
+    sheets,
+    options.date1904 ?? false,
+    options.definedNames ?? [],
+  );
+  const workbookRelsXml = buildWorkbookRelsXml(
+    sheets.length,
+    Boolean(options.stylesXml),
+    Boolean(options.themeXml),
+  );
+
+  const sharedStringsXml = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="${sharedStringsList.length}" uniqueCount="${sharedStringsList.length}">
+${options.sharedStringsXml ?? sharedStringsList.map((str) => `  <si><t>${escapeXml(str)}</t></si>`).join('\n')}
+</sst>`;
+
+  const sheetOverrides = sheetParts
+    .map(
+      (s) =>
+        `<Override PartName="/xl/worksheets/${s.fileName}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`,
+    )
+    .join('');
+  const contentTypes =
+    CONTENT_TYPES_HEADER +
+    sheetOverrides +
+    CONTENT_TYPES_FIXED_OVERRIDES +
+    (options.stylesXml ? STYLES_TYPE_OVERRIDE : '') +
+    (options.themeXml
+      ? '<Override PartName="/xl/theme/theme1.xml" ContentType="application/vnd.openxmlformats-officedocument.theme+xml"/>'
+      : '') +
+    (options.sheetChart
+      ? '<Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>' +
+        '<Override PartName="/xl/charts/chart1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/>' +
+        (options.sheetChart.colorsXml
+          ? '<Override PartName="/xl/charts/colors1.xml" ContentType="application/vnd.ms-office.chartcolorstyle+xml"/>'
+          : '')
+      : '') +
+    (options.sheetImage
+      ? '<Default Extension="png" ContentType="image/png"/>' +
+        '<Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>'
+      : '') +
+    (options.sheetShape && !options.sheetImage
+      ? '<Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>'
+      : '') +
+    (options.tables
+      ? options.tables
+          .map(
+            (_, i) =>
+              `<Override PartName="/xl/tables/table${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.table+xml"/>`,
+          )
+          .join('')
+      : '') +
+    (options.pivotTables
+      ? options.pivotTables
+          .map(
+            (_, i) =>
+              `<Override PartName="/xl/pivotTables/pivotTable${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml"/>`,
+          )
+          .join('')
+      : '') +
+    (options.slicers
+      ? options.slicers
+          .map(
+            (_, i) =>
+              `<Override PartName="/xl/slicers/slicer${i + 1}.xml" ContentType="application/vnd.ms-excel.slicer+xml"/>` +
+              `<Override PartName="/xl/slicerCaches/slicerCache${i + 1}.xml" ContentType="application/vnd.ms-excel.slicerCache+xml"/>`,
+          )
+          .join('')
+      : '') +
+    '\n</Types>';
+
+  const entries: Record<string, Uint8Array> = {
+    '[Content_Types].xml': encoder.encode(contentTypes),
+    '_rels/.rels': encoder.encode(ROOT_RELS),
+    'xl/workbook.xml': encoder.encode(workbookXml),
+    'xl/_rels/workbook.xml.rels': encoder.encode(workbookRelsXml),
+    'xl/sharedStrings.xml': encoder.encode(sharedStringsXml),
+  };
+  if (options.themeXml) entries['xl/theme/theme1.xml'] = encoder.encode(options.themeXml);
+  if (options.sheetChart && sheetParts.length > 0) {
+    const first = sheetParts[0]!;
+    first.xml = first.xml.replace('</worksheet>', '<drawing r:id="rId100"/></worksheet>');
+    entries[`xl/worksheets/_rels/${first.fileName}.rels`] = encoder.encode(
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId100" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/>
+</Relationships>`,
+    );
+    const a = options.sheetChart.anchor ?? { from: [1, 1], to: [7, 16] };
+    entries['xl/drawings/drawing1.xml'] = encoder.encode(
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <xdr:twoCellAnchor>
+    <xdr:from><xdr:col>${a.from[0]}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${a.from[1]}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+    <xdr:to><xdr:col>${a.to[0]}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${a.to[1]}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
+    <xdr:graphicFrame macro="">
+      <xdr:nvGraphicFramePr><xdr:cNvPr id="2" name="Chart 1"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr>
+      <xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm>
+      <a:graphic><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">
+        <c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rId1"/>
+      </a:graphicData></a:graphic>
+    </xdr:graphicFrame>
+    <xdr:clientData/>
+  </xdr:twoCellAnchor>
+</xdr:wsDr>`,
+    );
+    const chartRels = options.sheetChart.colorsXml
+      ? '  <Relationship Id="rId9" Type="http://schemas.microsoft.com/office/2011/relationships/chartColorStyle" Target="colors1.xml"/>\n'
+      : '';
+    entries['xl/drawings/_rels/drawing1.xml.rels'] = encoder.encode(
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart" Target="../charts/chart1.xml"/>
+</Relationships>`,
+    );
+    entries['xl/charts/chart1.xml'] = encoder.encode(options.sheetChart.chartXml);
+    if (options.sheetChart.colorsXml) {
+      entries['xl/charts/_rels/chart1.xml.rels'] = encoder.encode(
+        `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+${chartRels}</Relationships>`,
+      );
+      entries['xl/charts/colors1.xml'] = encoder.encode(options.sheetChart.colorsXml);
+    }
+  }
+  if (options.sheetImage && sheetParts.length > 0) {
+    const first = sheetParts[0]!;
+    first.xml = first.xml.replace('</worksheet>', '<drawing r:id="rId100"/></worksheet>');
+    entries[`xl/worksheets/_rels/${first.fileName}.rels`] = encoder.encode(
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId100" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/>
+</Relationships>`,
+    );
+    const a = options.sheetImage.anchor ?? { from: [1, 1], to: [4, 8] };
+    entries['xl/drawings/drawing1.xml'] = encoder.encode(
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <xdr:twoCellAnchor>
+    <xdr:from><xdr:col>${a.from[0]}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${a.from[1]}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+    <xdr:to><xdr:col>${a.to[0]}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${a.to[1]}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
+    <xdr:pic>
+      <xdr:nvPicPr><xdr:cNvPr id="2" name="Picture 1"/><xdr:cNvPicPr/></xdr:nvPicPr>
+      <xdr:blipFill><a:blip r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill>
+      <xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>
+    </xdr:pic>
+    <xdr:clientData/>
+  </xdr:twoCellAnchor>
+</xdr:wsDr>`,
+    );
+    entries['xl/drawings/_rels/drawing1.xml.rels'] = encoder.encode(
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/>
+</Relationships>`,
+    );
+    entries['xl/media/image1.png'] = options.sheetImage.pngBytes;
+  }
+  if (options.sheetShape && sheetParts.length > 0) {
+    const first = sheetParts[0]!;
+    first.xml = first.xml.replace('</worksheet>', '<drawing r:id="rId100"/></worksheet>');
+    entries[`xl/worksheets/_rels/${first.fileName}.rels`] = encoder.encode(
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId100" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/>
+</Relationships>`,
+    );
+    const a = options.sheetShape.anchor ?? { from: [1, 1], to: [4, 6] };
+    const fill = options.sheetShape.fillHex ?? '4472C4';
+    const preset = options.sheetShape.preset ?? 'roundRect';
+    const text = options.sheetShape.text ?? 'Shape text';
+    entries['xl/drawings/drawing1.xml'] = encoder.encode(
+      options.sheetShape.rawAnchorXml
+        ? `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+${options.sheetShape.rawAnchorXml}
+</xdr:wsDr>`
+        : `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <xdr:twoCellAnchor>
+    <xdr:from><xdr:col>${a.from[0]}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${a.from[1]}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from>
+    <xdr:to><xdr:col>${a.to[0]}</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>${a.to[1]}</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to>
+${
+  options.sheetShape.rawShapeXml ??
+  `    <xdr:sp>
+      <xdr:nvSpPr><xdr:cNvPr id="2" name="Shape 1"${
+        options.sheetShape.hidden ? ' hidden="1"' : ''
+      }/><xdr:cNvSpPr/></xdr:nvSpPr>
+      <xdr:spPr>
+        <a:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></a:xfrm>
+        <a:prstGeom prst="${preset}"><a:avLst/></a:prstGeom>
+        <a:solidFill><a:srgbClr val="${fill}"/></a:solidFill>
+        ${options.sheetShape.styleOnly ? '' : '<a:ln w="12700"><a:solidFill><a:srgbClr val="2F5496"/></a:solidFill></a:ln>'}
+      </xdr:spPr>
+      ${
+        options.sheetShape.styleOnly
+          ? `<xdr:style>
+        <a:lnRef idx="2"><a:srgbClr val="123456"/></a:lnRef>
+        <a:fillRef idx="1"><a:srgbClr val="654321"/></a:fillRef>
+        <a:effectRef idx="0"><a:srgbClr val="000000"/></a:effectRef>
+        <a:fontRef idx="minor"><a:srgbClr val="FFFFFF"/></a:fontRef>
+      </xdr:style>`
+          : ''
+      }
+      <xdr:txBody><a:bodyPr/><a:p><a:r>${
+        options.sheetShape.runColorXml
+          ? `<a:rPr lang="en-US"><a:solidFill>${options.sheetShape.runColorXml}</a:solidFill></a:rPr>`
+          : ''
+      }<a:t>${escapeXml(text)}</a:t></a:r></a:p></xdr:txBody>
+    </xdr:sp>`
+}
+    <xdr:clientData/>
+  </xdr:twoCellAnchor>
+</xdr:wsDr>`,
+    );
+  }
+  if (options.hyperlinks && options.hyperlinks.length > 0 && sheetParts.length > 0) {
+    const first = sheetParts[0]!;
+    const rels: Array<string> = [];
+    const linkTags = options.hyperlinks.map((h, i) => {
+      const tip = h.tooltip ? ` tooltip="${escapeXml(h.tooltip)}"` : '';
+      if (h.url !== undefined) {
+        const rid = `rIdHl${i + 1}`;
+        rels.push(
+          `  <Relationship Id="${rid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="${escapeXml(h.url)}" TargetMode="External"/>`,
+        );
+        return `<hyperlink ref="${escapeXml(h.ref)}" r:id="${rid}"${tip}/>`;
+      }
+      const loc = h.location ? ` location="${escapeXml(h.location)}"` : '';
+      return `<hyperlink ref="${escapeXml(h.ref)}"${loc}${tip}/>`;
+    });
+    first.xml = first.xml.replace(
+      '</worksheet>',
+      `<hyperlinks>${linkTags.join('')}</hyperlinks></worksheet>`,
+    );
+    if (rels.length > 0) {
+      const relsPath = `xl/worksheets/_rels/${first.fileName}.rels`;
+      const existing = entries[relsPath] ? decoder.decode(entries[relsPath]) : undefined;
+      entries[relsPath] = encoder.encode(
+        existing
+          ? existing.replace('</Relationships>', `${rels.join('\n')}\n</Relationships>`)
+          : `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+${rels.join('\n')}
+</Relationships>`,
+      );
+    }
+  }
+  // W7: legacy cell comments — xl/comments1.xml + a worksheet relationship.
+  if (options.comments && options.comments.length > 0 && sheetParts.length > 0) {
+    const first = sheetParts[0]!;
+    const authors = [...new Set(options.comments.map((c) => c.author))];
+    const authorsXml = authors.map((a) => `<author>${escapeXml(a)}</author>`).join('');
+    const listXml = options.comments
+      .map(
+        (c) =>
+          `<comment ref="${escapeXml(c.ref)}" authorId="${authors.indexOf(c.author)}">` +
+          `<text><r><t xml:space="preserve">${escapeXml(c.text)}</t></r></text></comment>`,
+      )
+      .join('');
+    entries['xl/comments1.xml'] = encoder.encode(
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><authors>${authorsXml}</authors><commentList>${listXml}</commentList></comments>`,
+    );
+    mergeWorksheetRel(
+      entries,
+      first.fileName,
+      '  <Relationship Id="rIdCmt" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/comments" Target="../comments1.xml"/>',
+    );
+    // The note shapes, when any note is shown: Excel's own markup, one shape
+    // per comment, `<x:Visible/>` on the shown ones.
+    if (options.comments.some((c) => c.shownAnchor !== undefined)) {
+      const shapes = options.comments.map((c, i) => {
+        const col = /^[A-Z]+/.exec(c.ref)![0];
+        const column = [...col].reduce((n, ch) => n * 26 + ch.charCodeAt(0) - 64, 0) - 1;
+        const row = Number(c.ref.slice(col.length)) - 1;
+        return (
+          `<v:shape id="_x0000_s${1025 + i}" type="#_x0000_t202" style="position:absolute;` +
+          `margin-left:100pt;margin-top:10pt;width:96pt;height:55.5pt;z-index:${i + 1}` +
+          `${c.shownAnchor === undefined ? ';visibility:hidden' : ''}" fillcolor="#ffffe1" o:insetmode="auto">` +
+          '<v:fill color2="#ffffe1"/><v:shadow on="t" color="black" obscured="t"/>' +
+          '<v:path o:connecttype="none"/>' +
+          '<v:textbox style="mso-direction-alt:auto"><div style="text-align:left"></div></v:textbox>' +
+          '<x:ClientData ObjectType="Note"><x:MoveWithCells/><x:SizeWithCells/>' +
+          `<x:Anchor>${c.shownAnchor ?? '1, 15, 0, 2, 3, 15, 4, 16'}</x:Anchor>` +
+          `<x:AutoFill>False</x:AutoFill><x:Row>${row}</x:Row><x:Column>${column}</x:Column>` +
+          `${c.shownAnchor === undefined ? '' : '<x:Visible/>'}</x:ClientData></v:shape>`
+        );
+      });
+      entries['xl/drawings/vmlDrawing1.vml'] = encoder.encode(
+        '<xml xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" ' +
+          'xmlns:x="urn:schemas-microsoft-com:office:excel">' +
+          '<v:shapetype id="_x0000_t202" coordsize="21600,21600" o:spt="202" path="m,l,21600r21600,l21600,xe">' +
+          '<v:stroke joinstyle="miter"/><v:path gradientshapeok="t" o:connecttype="rect"/></v:shapetype>' +
+          `${shapes.join('')}</xml>`,
+      );
+      first.xml = first.xml.replace(
+        '</worksheet>',
+        '<legacyDrawing xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rIdVml"/></worksheet>',
+      );
+      mergeWorksheetRel(
+        entries,
+        first.fileName,
+        '  <Relationship Id="rIdVml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing" Target="../drawings/vmlDrawing1.vml"/>',
+      );
+    }
+  }
+  if (options.legacyVmlXml !== undefined && sheetParts.length > 0) {
+    const first = sheetParts[0]!;
+    entries['xl/drawings/vmlDrawing1.vml'] = encoder.encode(
+      '<xml xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" ' +
+        `xmlns:x="urn:schemas-microsoft-com:office:excel">${options.legacyVmlXml}</xml>`,
+    );
+    first.xml = first.xml.replace(
+      '</worksheet>',
+      '<legacyDrawing xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:id="rIdVml"/></worksheet>',
+    );
+    mergeWorksheetRel(
+      entries,
+      first.fileName,
+      '  <Relationship Id="rIdVml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing" Target="../drawings/vmlDrawing1.vml"/>',
+    );
+  }
+  // W7: threaded comments — the part + a worksheet rel; persons → workbook rel.
+  if (options.threadedComments && options.threadedComments.length > 0 && sheetParts.length > 0) {
+    const first = sheetParts[0]!;
+    const tcXml = options.threadedComments
+      .map(
+        (t, i) =>
+          `<threadedComment ref="${escapeXml(t.ref)}" id="{0000-${i}}" personId="${escapeXml(t.personId)}">` +
+          `<text>${escapeXml(t.text)}</text></threadedComment>`,
+      )
+      .join('');
+    entries['xl/threadedComments/threadedComment1.xml'] = encoder.encode(
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ThreadedComments xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments">${tcXml}</ThreadedComments>`,
+    );
+    mergeWorksheetRel(
+      entries,
+      first.fileName,
+      '  <Relationship Id="rIdTc" Type="http://schemas.microsoft.com/office/2017/10/relationships/threadedComment" Target="../threadedComments/threadedComment1.xml"/>',
+    );
+  }
+  if (options.persons && options.persons.length > 0) {
+    const personsXml = options.persons
+      .map(
+        (p) =>
+          `<person displayName="${escapeXml(p.name)}" id="${escapeXml(p.id)}" userId="" providerId="None"/>`,
+      )
+      .join('');
+    entries['xl/persons/person.xml'] = encoder.encode(
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<personList xmlns="http://schemas.microsoft.com/office/spreadsheetml/2018/threadedcomments">${personsXml}</personList>`,
+    );
+    const wbRelsPath = 'xl/_rels/workbook.xml.rels';
+    const existing = decoder.decode(entries[wbRelsPath]);
+    entries[wbRelsPath] = encoder.encode(
+      existing.replace(
+        '</Relationships>',
+        '  <Relationship Id="rIdPerson" Type="http://schemas.microsoft.com/office/2017/10/relationships/person" Target="persons/person.xml"/>\n</Relationships>',
+      ),
+    );
+  }
+  // W8: form controls — an x14 extLst <controls> on the sheet + a ctrlProp part
+  // (type + state) per control, each wired by a worksheet ctrlProp relationship.
+  if (options.formControls && options.formControls.length > 0 && sheetParts.length > 0) {
+    const first = sheetParts[0]!;
+    const parts = options.formControls.map((fc, i) => ({ rid: `rIdFc${i + 1}`, idx: i + 1, fc }));
+    const ctrlXml = parts
+      .map(
+        (p) =>
+          `<x14:control shapeId="${p.idx}" r:id="${p.rid}" name="${escapeXml(p.fc.name)}"><x14:controlPr${p.fc.print === false ? ' print="0"' : ''}/></x14:control>`,
+      )
+      .join('');
+    const extLst =
+      '<extLst><ext xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"' +
+      ' xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"' +
+      ' xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"' +
+      ' uri="{05C60535-1F16-4fd2-B633-F4F36F0B64E0}">' +
+      `<x14:controls><mc:AlternateContent><mc:Choice Requires="x14">${ctrlXml}</mc:Choice></mc:AlternateContent></x14:controls></ext></extLst>`;
+    first.xml = first.xml.replace('</worksheet>', `${extLst}</worksheet>`);
+    for (const p of parts) {
+      const checked =
+        p.fc.checked !== undefined ? ` checked="${p.fc.checked ? 'Checked' : 'Unchecked'}"` : '';
+      const val = p.fc.value !== undefined ? ` val="${p.fc.value}"` : '';
+      entries[`xl/ctrlProps/ctrlProp${p.idx}.xml`] = encoder.encode(
+        `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<formControlPr xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" objectType="${p.fc.objectType}"${checked}${val}/>`,
+      );
+      mergeWorksheetRel(
+        entries,
+        first.fileName,
+        `  <Relationship Id="${p.rid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/ctrlProp" Target="../ctrlProps/ctrlProp${p.idx}.xml"/>`,
+      );
+    }
+  }
+  // W10: ActiveX controls — a worksheet <oleObjects> + an activeX#.xml part
+  // (the property bag) per control, wired by a worksheet oleObject relationship.
+  if (options.oleObjects && options.oleObjects.length > 0 && sheetParts.length > 0) {
+    const first = sheetParts[0]!;
+    const parts = options.oleObjects.map((ole, i) => ({ rid: `rIdAx${i + 1}`, idx: i + 1, ole }));
+    const oleXml = parts
+      .map(
+        (p) =>
+          `<oleObject progId="${escapeXml(p.ole.progId)}" shapeId="${p.idx}" r:id="${p.rid}"><objectPr defaultSize="0"/></oleObject>`,
+      )
+      .join('');
+    first.xml = first.xml.replace(
+      '</worksheet>',
+      `<oleObjects xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">${oleXml}</oleObjects></worksheet>`,
+    );
+    for (const p of parts) {
+      if (p.ole.binBytes) {
+        // persistStreamInit: no <ax:ocxPr>; the state is in activeX#.bin, wired
+        // through the activeX part's own relationships.
+        entries[`xl/activeX/activeX${p.idx}.xml`] = encoder.encode(
+          `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ax:ocx ax:classid="{8BD21D40-EC42-11CE-9E0D-00AA006002F3}" ax:persistence="persistStreamInit" r:id="rId1" xmlns:ax="http://schemas.microsoft.com/office/2006/activeX" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"/>`,
+        );
+        entries[`xl/activeX/activeX${p.idx}.bin`] = p.ole.binBytes;
+        entries[`xl/activeX/_rels/activeX${p.idx}.xml.rels`] = encoder.encode(
+          `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.microsoft.com/office/2006/relationships/activeXControlBinary" Target="activeX${p.idx}.bin"/></Relationships>`,
+        );
+      } else {
+        const ocxPr = [
+          p.ole.caption !== undefined
+            ? `<ax:ocxPr ax:name="Caption" ax:value="${escapeXml(p.ole.caption)}"/>`
+            : '',
+          p.ole.value !== undefined
+            ? `<ax:ocxPr ax:name="Value" ax:value="${escapeXml(p.ole.value)}"/>`
+            : '',
+          p.ole.groupName !== undefined
+            ? `<ax:ocxPr ax:name="GroupName" ax:value="${escapeXml(p.ole.groupName)}"/>`
+            : '',
+        ].join('');
+        entries[`xl/activeX/activeX${p.idx}.xml`] = encoder.encode(
+          `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ax:ocx ax:classid="{00000000-0000-0000-0000-000000000000}" ax:persistence="persistPropertyBag" xmlns:ax="http://schemas.microsoft.com/office/2006/activeX">${ocxPr}</ax:ocx>`,
+        );
+      }
+      mergeWorksheetRel(
+        entries,
+        first.fileName,
+        `  <Relationship Id="${p.rid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/oleObject" Target="../activeX/activeX${p.idx}.xml"/>`,
+      );
+    }
+  }
+  if (options.tables && options.tables.length > 0 && sheetParts.length > 0) {
+    const first = sheetParts[0]!;
+    const parts = options.tables.map((t, i) => ({ rid: `rIdT${i + 1}`, idx: i + 1, t }));
+    const tablePartsXml = `<tableParts count="${parts.length}">${parts
+      .map((p) => `<tablePart r:id="${p.rid}"/>`)
+      .join('')}</tableParts>`;
+    first.xml = first.xml.replace('</worksheet>', `${tablePartsXml}</worksheet>`);
+    const relLines = parts
+      .map(
+        (p) =>
+          `  <Relationship Id="${p.rid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table" Target="../tables/table${p.idx}.xml"/>`,
+      )
+      .join('\n');
+    entries[`xl/worksheets/_rels/${first.fileName}.rels`] = encoder.encode(
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+${relLines}
+</Relationships>`,
+    );
+    for (const p of parts) {
+      entries[`xl/tables/table${p.idx}.xml`] = encoder.encode(buildTableXml(p.idx, p.t));
+    }
+  }
+  if (options.pivotTables && options.pivotTables.length > 0 && sheetParts.length > 0) {
+    // A pivot table is referenced ONLY by a worksheet relationship (no element
+    // in the sheet XML); merge the rel into any existing sheet rels (E-PIVOT).
+    const first = sheetParts[0]!;
+    const parts = options.pivotTables.map((p, i) => ({ rid: `rIdP${i + 1}`, idx: i + 1, p }));
+    const relLines = parts
+      .map(
+        (p) =>
+          `  <Relationship Id="${p.rid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/pivotTable" Target="../pivotTables/pivotTable${p.idx}.xml"/>`,
+      )
+      .join('\n');
+    const relsPath = `xl/worksheets/_rels/${first.fileName}.rels`;
+    const existing = entries[relsPath] ? decoder.decode(entries[relsPath]) : undefined;
+    entries[relsPath] = encoder.encode(
+      existing
+        ? existing.replace('</Relationships>', `${relLines}\n</Relationships>`)
+        : `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+${relLines}
+</Relationships>`,
+    );
+    for (const p of parts) {
+      entries[`xl/pivotTables/pivotTable${p.idx}.xml`] = encoder.encode(
+        buildPivotTableXml(p.idx, p.p),
+      );
+    }
+  }
+  if (options.slicers && options.slicers.length > 0 && sheetParts.length > 0) {
+    const first = sheetParts[0]!;
+    const slicerParts = options.slicers.map((s, i) => ({ idx: i + 1, s }));
+    // Worksheet rels → slicer parts (merge into sheet1's existing rels).
+    const wsRelLines = slicerParts
+      .map(
+        (p) =>
+          `  <Relationship Id="rIdSl${p.idx}" Type="http://schemas.microsoft.com/office/2007/relationships/slicer" Target="../slicers/slicer${p.idx}.xml"/>`,
+      )
+      .join('\n');
+    const wsRelsPath = `xl/worksheets/_rels/${first.fileName}.rels`;
+    const wsExisting = entries[wsRelsPath] ? decoder.decode(entries[wsRelsPath]) : undefined;
+    entries[wsRelsPath] = encoder.encode(
+      wsExisting
+        ? wsExisting.replace('</Relationships>', `${wsRelLines}\n</Relationships>`)
+        : `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+${wsRelLines}
+</Relationships>`,
+    );
+    // Workbook rels → slicerCache parts.
+    const wbRelLines = slicerParts
+      .map(
+        (p) =>
+          `  <Relationship Id="rIdSc${p.idx}" Type="http://schemas.microsoft.com/office/2007/relationships/slicerCache" Target="slicerCaches/slicerCache${p.idx}.xml"/>`,
+      )
+      .join('\n');
+    const wbRelsPath = 'xl/_rels/workbook.xml.rels';
+    entries[wbRelsPath] = encoder.encode(
+      decoder
+        .decode(entries[wbRelsPath])
+        .replace('</Relationships>', `${wbRelLines}\n</Relationships>`),
+    );
+    // The slicer + slicerCache parts.
+    const x14 = 'http://schemas.microsoft.com/office/spreadsheetml/2009/9/main';
+    const rNs = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+    for (const p of slicerParts) {
+      const sl = p.s;
+      const styleAttr = sl.styleName ? ` style="${escapeXml(sl.styleName)}"` : '';
+      entries[`xl/slicers/slicer${p.idx}.xml`] = encoder.encode(
+        `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<slicers xmlns="${x14}" xmlns:r="${rNs}"><slicer name="${escapeXml(sl.name)}" cache="${escapeXml(
+          sl.cacheName,
+        )}" caption="${escapeXml(sl.caption)}" columnCount="${sl.columnCount ?? 1}"${styleAttr}/></slicers>`,
+      );
+      const cache = sl.cache;
+      const sourceAttr = cache.sourceName ? ` sourceName="${escapeXml(cache.sourceName)}"` : '';
+      const tableExt =
+        cache.tableId !== undefined && cache.column !== undefined
+          ? `<extLst><ext xmlns:x14="${x14}" uri="{2F2917AC-EB37-4324-AD4E-5DD8C200BD13}"><x14:slicerCacheDefinition><x14:tableSlicerCache tableId="${cache.tableId}" column="${cache.column}"/></x14:slicerCacheDefinition></ext></extLst>`
+          : '';
+      entries[`xl/slicerCaches/slicerCache${p.idx}.xml`] = encoder.encode(
+        `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<slicerCacheDefinition xmlns="${x14}" xmlns:r="${rNs}" name="${escapeXml(
+          sl.cacheName,
+        )}"${sourceAttr}>${tableExt}</slicerCacheDefinition>`,
+      );
+    }
+  }
+  for (const s of sheetParts) {
+    entries[`xl/worksheets/${s.fileName}`] = encoder.encode(s.xml);
+  }
+  if (options.stylesXml) {
+    entries['xl/styles.xml'] = encoder.encode(
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+${options.stylesXml}
+</styleSheet>`,
+    );
+  }
+  return zipSync(entries);
+}
+
+function buildWorkbookXml(
+  sheets: ReadonlyArray<XlsxSheetSpec>,
+  date1904: boolean,
+  definedNames: ReadonlyArray<XlsxDefinedNameSpec>,
+): string {
+  const lines = sheets.map(
+    (s, i) => `    <sheet name="${escapeXml(s.name)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`,
+  );
+  const propsXml = date1904 ? '  <workbookPr date1904="1"/>\n' : '';
+  const definedNamesXml =
+    definedNames.length > 0
+      ? '\n  <definedNames>' +
+        definedNames
+          .map(
+            (d) =>
+              `<definedName name="${escapeXml(d.name)}"` +
+              (d.localSheetId !== undefined ? ` localSheetId="${d.localSheetId}"` : '') +
+              `>${escapeXml(d.value)}</definedName>`,
+          )
+          .join('') +
+        '</definedNames>'
+      : '';
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+${propsXml}  <sheets>
+${lines.join('\n')}
+  </sheets>${definedNamesXml}
+</workbook>`;
+}
+
+// Merge a relationship line into a worksheet's .rels (creating the file if none),
+// so several features can each attach a rel to the same sheet (W7).
+function mergeWorksheetRel(
+  entries: Record<string, Uint8Array>,
+  sheetFileName: string,
+  relLine: string,
+): void {
+  const relsPath = `xl/worksheets/_rels/${sheetFileName}.rels`;
+  const existing = entries[relsPath] ? decoder.decode(entries[relsPath]) : undefined;
+  entries[relsPath] = encoder.encode(
+    existing
+      ? existing.replace('</Relationships>', `${relLine}\n</Relationships>`)
+      : `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+${relLine}
+</Relationships>`,
+  );
+}
+
+function buildWorkbookRelsXml(
+  sheetCount: number,
+  includeStyles: boolean,
+  includeTheme = false,
+): string {
+  const lines: Array<string> = [
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>',
+    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">',
+  ];
+  for (let i = 0; i < sheetCount; i++) {
+    lines.push(
+      `  <Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`,
+    );
+  }
+  const sharedId = sheetCount + 1;
+  lines.push(
+    `  <Relationship Id="rId${sharedId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/>`,
+  );
+  if (includeStyles) {
+    lines.push(
+      `  <Relationship Id="rId${sharedId + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>`,
+    );
+  }
+  if (includeTheme) {
+    lines.push(
+      `  <Relationship Id="rId${sharedId + 2}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme" Target="theme/theme1.xml"/>`,
+    );
+  }
+  lines.push('</Relationships>');
+  return lines.join('\n');
+}

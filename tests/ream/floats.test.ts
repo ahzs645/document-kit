@@ -1,0 +1,669 @@
+import { readFileSync } from 'node:fs';
+
+import { describe, expect, it } from 'vitest';
+
+import { buildDocxFromBody } from './fixtures/build-docx';
+import { buildTinyPng } from './fixtures/build-png';
+import { Ream } from '../../src/ream/core/converter/ream';
+import { FontRegistry } from '../../src/ream/core/font';
+import { flowRenderOptions } from '../../src/ream/core/converter/project';
+import { layoutStyledDocument } from '../../src/ream/layout/styled-layout';
+import { shadowBlurLayers } from '../../src/ream/pdf/vector-graphics';
+import { readDocx } from '../../src/ream/word/docx-reader';
+
+const FONTS = {
+  regular: new Uint8Array(readFileSync('tests/ream/fixtures/fonts/Roboto-Regular.ttf')),
+  bold: new Uint8Array(readFileSync('tests/ream/fixtures/fonts/Roboto-Bold.ttf')),
+};
+
+// A floating rect shape anchored to the page: 1828800×914400 EMU = 144×72pt.
+const anchoredShape = (posAndWrap: string, attrs = '') =>
+  `<w:p><w:r><w:drawing>
+    <wp:anchor xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" ${attrs}>
+      <wp:extent cx="1828800" cy="914400"/>
+      ${posAndWrap}
+      <wp:docPr id="3" name="Float 1"/>
+      <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+        <a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+          <wps:wsp xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+            <wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1828800" cy="914400"/></a:xfrm>
+              <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+              <a:solidFill><a:srgbClr val="DDEEFF"/></a:solidFill>
+            </wps:spPr>
+            <wps:bodyPr/>
+          </wps:wsp>
+        </a:graphicData>
+      </a:graphic>
+    </wp:anchor>
+  </w:drawing></w:r></w:p>`;
+
+const PAGE_POS =
+  '<wp:positionH relativeFrom="page"><wp:posOffset>1270000</wp:posOffset></wp:positionH>' +
+  '<wp:positionV relativeFrom="page"><wp:posOffset>635000</wp:posOffset></wp:positionV>' +
+  '<wp:wrapNone/>';
+
+const TEXT = '<w:p><w:r><w:t>flowing text</w:t></w:r></w:p>';
+
+function layoutOf(docx: Uint8Array) {
+  const flow = Ream.parse(docx).flow;
+  return layoutStyledDocument(flow.body, {
+    registry: FontRegistry.fromBytes(FONTS),
+    ...flowRenderOptions(flow),
+  });
+}
+
+describe('floating drawings (wp:anchor, §20.4.2.3)', () => {
+  it('parses the anchor placement onto the shape', () => {
+    const { doc } = readDocx(buildDocxFromBody(anchoredShape(PAGE_POS) + TEXT));
+    const el = doc.body[0]!;
+    if (el.kind !== 'shape') throw new Error('expected shape');
+    expect(el.shape.float?.wrap).toBe('none');
+    expect(el.shape.float?.posH).toEqual({ relativeFrom: 'page', offsetPt: 100 });
+    expect(el.shape.float?.posV).toEqual({ relativeFrom: 'page', offsetPt: 50 });
+  });
+
+  it('renders out of flow at the page-relative position (text unaffected)', () => {
+    const laid = layoutOf(buildDocxFromBody(anchoredShape(PAGE_POS) + TEXT));
+    const withoutFloat = layoutOf(buildDocxFromBody(TEXT));
+    const cmds = laid.pages[0]!.commands;
+    const shape = cmds.find((c) => c.type === 'shape') as unknown as {
+      shape: { transform: ReadonlyArray<number> };
+    };
+    expect(shape).toBeDefined();
+    // 1270000 EMU = 100pt from the page's left edge.
+    expect(shape.shape.transform[4]).toBeCloseTo(100, 1);
+    // The text line sits exactly where it would without the float.
+    const lineY = (cs: ReadonlyArray<{ type: string }>) =>
+      (cs.find((c) => c.type === 'line') as unknown as { baselineY: number }).baselineY;
+    expect(lineY(cmds)).toBeCloseTo(lineY(withoutFloat.pages[0]!.commands), 4);
+  });
+
+  it('behindDoc sinks below body text; default floats above it', () => {
+    const behind = layoutOf(buildDocxFromBody(anchoredShape(PAGE_POS, 'behindDoc="1"') + TEXT))
+      .pages[0]!.commands;
+    const bShape = behind.findIndex((c) => c.type === 'shape');
+    const bLine = behind.findIndex((c) => c.type === 'line');
+    expect(bShape).toBeLessThan(bLine);
+
+    const front = layoutOf(buildDocxFromBody(anchoredShape(PAGE_POS) + TEXT)).pages[0]!.commands;
+    expect(front.findIndex((c) => c.type === 'shape')).toBeGreaterThan(
+      front.findIndex((c) => c.type === 'line'),
+    );
+  });
+
+  it('behindDoc puts a drawing behind the text only where the text does not wrap round it', () => {
+    // Word's own wrap format for behindDoc="1" beside wrapTight or wrapSquare
+    // is plain "tight" or "square", and "behind" only beside wrapNone: sunk
+    // behind the text, tdf60351.docx's cover lost its top half under its
+    // paragraph's white shading.
+    const behindWith = (wrap: string): boolean | undefined => {
+      const pos = PAGE_POS.replace('<wp:wrapNone/>', wrap);
+      const { doc } = readDocx(buildDocxFromBody(anchoredShape(pos, 'behindDoc="1"') + TEXT));
+      const el = doc.body[0]!;
+      if (el.kind !== 'shape') throw new Error('expected shape');
+      return el.shape.float?.behind;
+    };
+    expect(behindWith('<wp:wrapNone/>')).toBe(true);
+    expect(behindWith('<wp:wrapSquare wrapText="bothSides"/>')).toBeFalsy();
+    expect(
+      behindWith(
+        '<wp:wrapTight wrapText="bothSides"><wp:wrapPolygon edited="0"><wp:start x="0" y="0"/>' +
+          '<wp:lineTo x="21600" y="0"/><wp:lineTo x="21600" y="21600"/><wp:lineTo x="0" y="21600"/>' +
+          '<wp:lineTo x="0" y="0"/></wp:wrapPolygon></wp:wrapTight>',
+      ),
+    ).toBeFalsy();
+  });
+
+  it('goes to the next page with a paragraph that breaks to it (§17.3.1.21)', () => {
+    // Word stands the picture on its paragraph's own page; placed before the
+    // paragraph's break, it stayed at the foot of the page before.
+    const pos =
+      '<wp:positionH relativeFrom="margin"><wp:posOffset>0</wp:posOffset></wp:positionH>' +
+      '<wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>' +
+      '<wp:wrapSquare wrapText="bothSides"/>';
+    const breaking = anchoredShape(pos)
+      .replace('<w:p>', '<w:p><w:pPr><w:pageBreakBefore/></w:pPr>')
+      .replace('</w:p>', '<w:r><w:t>two</w:t></w:r></w:p>');
+    const laid = layoutOf(buildDocxFromBody('<w:p><w:r><w:t>one</w:t></w:r></w:p>' + breaking));
+    expect(laid.pages).toHaveLength(2);
+    expect(laid.pages[0]!.commands.some((c) => c.type === 'shape')).toBe(false);
+    expect(laid.pages[1]!.commands.some((c) => c.type === 'shape')).toBe(true);
+  });
+
+  it('margin-relative vertical offsets hang off the top margin', () => {
+    const pos =
+      '<wp:positionH relativeFrom="margin"><wp:align>right</wp:align></wp:positionH>' +
+      '<wp:positionV relativeFrom="margin"><wp:posOffset>0</wp:posOffset></wp:positionV>' +
+      '<wp:wrapNone/>';
+    const laid = layoutOf(buildDocxFromBody(anchoredShape(pos) + TEXT));
+    const shape = laid.pages[0]!.commands.find((c) => c.type === 'shape') as unknown as {
+      shape: { transform: ReadonlyArray<number> };
+    };
+    // Letter (the page a docx with no `w:pgSz` is on) + 1" margins: content
+    // right edge at 540pt; 144pt wide → x = 396.
+    expect(shape.shape.transform[4]).toBeCloseTo(612 - 72 - 144, 0);
+  });
+
+  it('side-wrapping floats keep the text at its height (no vertical push)', () => {
+    const pos =
+      '<wp:positionH relativeFrom="margin"><wp:posOffset>0</wp:posOffset></wp:positionH>' +
+      '<wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>' +
+      '<wp:wrapSquare wrapText="bothSides"/>';
+    const laid = layoutOf(buildDocxFromBody(anchoredShape(pos) + TEXT));
+    const withoutFloat = layoutOf(buildDocxFromBody(TEXT));
+    // Out of flow now: the first text line keeps its baseline and flows
+    // BESIDE the float instead of below it.
+    const first = (cs: ReadonlyArray<{ type: string }>) =>
+      cs.find((c) => c.type === 'line') as unknown as { baselineY: number; originX: number };
+    expect(first(laid.pages[0]!.commands).baselineY).toBeCloseTo(
+      first(withoutFloat.pages[0]!.commands).baselineY,
+      1,
+    );
+    expect(first(laid.pages[0]!.commands).originX).toBeGreaterThan(200);
+  });
+
+  it('wrapSquare narrows lines beside the float and restores full width below', () => {
+    // 144x72pt float at the left margin, paragraph-anchored; long text flows.
+    const pos =
+      '<wp:positionH relativeFrom="margin"><wp:posOffset>0</wp:posOffset></wp:positionH>' +
+      '<wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>' +
+      '<wp:wrapSquare wrapText="bothSides"/>';
+    const words = Array.from({ length: 120 }, (_, i) => `word${i}`).join(' ');
+    const docx = buildDocxFromBody(
+      anchoredShape(pos) + `<w:p><w:r><w:t>${words}</w:t></w:r></w:p>`,
+    );
+    const laid = layoutOf(docx);
+    const cmds = laid.pages[0]!.commands;
+    const lines = cmds.filter((c) => c.type === 'line') as unknown as Array<{
+      originX: number;
+      baselineY: number;
+    }>;
+    expect(lines.length).toBeGreaterThan(4);
+    // A4 + 1" margins: marginLeft = 72. The float spans x 72..216, y-down top
+    // of the paragraph. Lines BESIDE the float must start right of it.
+    const floatBottomYDown = 72 + 72; // page top margin + float height? — derive instead:
+    const beside = lines.filter((l) => l.originX > 200);
+    const below = lines.filter((l) => l.originX < 100);
+    expect(beside.length).toBeGreaterThan(0); // narrowed, shifted lines exist
+    expect(below.length).toBeGreaterThan(0); // and full-width lines resume
+    // Every shifted line sits ABOVE every resumed line (y-down: smaller y).
+    const maxBesideY = Math.max(...beside.map((l) => l.baselineY));
+    const minBelowY = Math.min(...below.map((l) => l.baselineY));
+    expect(maxBesideY).toBeLessThan(minBelowY);
+    // The float itself renders (front layer) as a shape command.
+    expect(cmds.some((c) => c.type === 'shape')).toBe(true);
+  });
+
+  it('fills BOTH gaps beside a float at one baseline (§20.4.2.3 bothSides)', () => {
+    // A 144pt box in the MIDDLE of the measure: text stands to its left and
+    // carries on to its right at the same height. Taking the wider side alone
+    // left fdo65718.docx's narrow column blank down the whole float.
+    const pos =
+      '<wp:positionH relativeFrom="margin"><wp:posOffset>1524000</wp:posOffset></wp:positionH>' +
+      '<wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>' +
+      '<wp:wrapSquare wrapText="bothSides"/>';
+    const words = Array.from({ length: 120 }, (_, i) => `w${String(i)}`).join(' ');
+    const laid = layoutOf(
+      buildDocxFromBody(anchoredShape(pos) + `<w:p><w:r><w:t>${words}</w:t></w:r></w:p>`),
+    );
+    const lines = laid.pages[0]!.commands.filter((c) => c.type === 'line').map(
+      (c) => c as unknown as { originX: number; baselineY: number },
+    );
+    // Two segments share a baseline, one each side of the box.
+    const byBaseline = new Map<number, Array<number>>();
+    for (const l of lines) {
+      const at = byBaseline.get(Math.round(l.baselineY)) ?? [];
+      at.push(l.originX);
+      byBaseline.set(Math.round(l.baselineY), at);
+    }
+    const pairs = [...byBaseline.values()].filter((xs) => xs.length === 2);
+    expect(pairs.length).toBeGreaterThan(0);
+    for (const [a, b] of pairs) expect(Math.abs(a! - b!)).toBeGreaterThan(144);
+  });
+
+  it('keeps one side when the anchor names one (§20.4.2.3 wrapText="right")', () => {
+    const pos =
+      '<wp:positionH relativeFrom="margin"><wp:posOffset>1524000</wp:posOffset></wp:positionH>' +
+      '<wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>' +
+      '<wp:wrapSquare wrapText="right"/>';
+    const words = Array.from({ length: 120 }, (_, i) => `w${String(i)}`).join(' ');
+    const laid = layoutOf(
+      buildDocxFromBody(anchoredShape(pos) + `<w:p><w:r><w:t>${words}</w:t></w:r></w:p>`),
+    );
+    const baselines = laid.pages[0]!.commands.filter((c) => c.type === 'line').map((c) =>
+      Math.round((c as unknown as { baselineY: number }).baselineY),
+    );
+    expect(new Set(baselines).size).toBe(baselines.length);
+  });
+
+  it('side-wrapped floats no longer consume vertical flow space', () => {
+    const pos =
+      '<wp:positionH relativeFrom="margin"><wp:posOffset>0</wp:posOffset></wp:positionH>' +
+      '<wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>' +
+      '<wp:wrapSquare wrapText="bothSides"/>';
+    const text = '<w:p><w:r><w:t>short text</w:t></w:r></w:p>';
+    const withFloat = layoutOf(buildDocxFromBody(anchoredShape(pos) + text));
+    const lines = withFloat.pages[0]!.commands.filter(
+      (c) => c.type === 'line',
+    ) as unknown as Array<{
+      originX: number;
+    }>;
+    // The single short line sits beside the float (shifted), not under it.
+    expect(lines[0]!.originX).toBeGreaterThan(200);
+  });
+});
+
+describe('the text beside a float (§20.4.2.3 distL/distR)', () => {
+  // A 144pt box against the right margin of the fixture's Letter page with 1"
+  // margins: its left edge stands at 72 + 468 - 144.
+  const FLOAT_LEFT = 72 + 468 - 144;
+  const RIGHT_BOX =
+    '<wp:positionH relativeFrom="margin"><wp:align>right</wp:align></wp:positionH>' +
+    '<wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>' +
+    '<wp:wrapSquare wrapText="bothSides"/>';
+  const words = Array.from({ length: 120 }, (_, i) => `w${String(i)}`).join(' ');
+  const justified = (pPr = ''): string =>
+    `<w:p><w:pPr>${pPr}<w:jc w:val="both"/></w:pPr><w:r><w:t>${words}</w:t></w:r></w:p>`;
+
+  /** Where the paragraph's first four lines end — all beside the 72pt box; a justified line runs to its measure. */
+  function rightEnds(body: string): Array<number> {
+    const lines = layoutOf(buildDocxFromBody(body)).pages[0]!.commands.filter(
+      (c) => c.type === 'line',
+    ) as unknown as Array<{
+      originX: number;
+      line: { availableWidthPt: number; tokens: ReadonlyArray<{ kind: string; text?: string }> };
+    }>;
+    const worded = lines.filter((l) =>
+      l.line.tokens.some((t) => t.kind === 'text' && (t.text ?? '').trim() !== ''),
+    );
+    expect(worded.length).toBeGreaterThan(4);
+    return worded.slice(0, 4).map((l) => l.originX + l.line.availableWidthPt);
+  }
+
+  it('ends a justified line at the float’s own stand-off and nowhere short of it', () => {
+    // Word: 0.15, 9.35 and 17.7pt short of a picture 0, 9 and 18pt off.
+    for (const end of rightEnds(anchoredShape(RIGHT_BOX) + justified())) {
+      expect(end).toBeCloseTo(FLOAT_LEFT, 3);
+    }
+    for (const end of rightEnds(anchoredShape(RIGHT_BOX, 'distL="114300"') + justified())) {
+      expect(end).toBeCloseTo(FLOAT_LEFT - 9, 3);
+    }
+  });
+
+  it('gives an indented first line the room its indent leaves, not the float’s whole gap', () => {
+    // tdf60351.docx's first line, indented 18pt, ran 18pt into the picture.
+    const ends = rightEnds(
+      anchoredShape(RIGHT_BOX, 'distL="114300"') + justified('<w:ind w:firstLine="360"/>'),
+    );
+    for (const end of ends) expect(end).toBeCloseTo(FLOAT_LEFT - 9, 3);
+  });
+
+  it('keeps 9pt either side of a VML shape whose style states no distance', () => {
+    // Word's own wrap format for such a shape reads 0, 0, 9, 9.
+    const vml =
+      '<w:p><w:r><w:pict><v:rect xmlns:v="urn:schemas-microsoft-com:vml" ' +
+      'xmlns:w10="urn:schemas-microsoft-com:office:word" style="position:absolute;' +
+      'margin-left:0;margin-top:0;width:144pt;height:144pt;z-index:1;' +
+      'mso-position-horizontal:right;mso-position-horizontal-relative:margin;' +
+      'mso-position-vertical-relative:text" fillcolor="#3366aa" stroked="f">' +
+      '<w10:wrap type="square"/></v:rect></w:pict></w:r></w:p>';
+    const { doc } = readDocx(buildDocxFromBody(vml + TEXT));
+    const shape = doc.body.find((el) => el.kind === 'shape');
+    const dist = shape?.kind === 'shape' ? shape.shape.float?.wrapDist : undefined;
+    expect(dist).toEqual({ topPt: 0, bottomPt: 0, leftPt: 9, rightPt: 9 });
+  });
+});
+
+// A one-cell table whose only paragraph carries an anchored shape (§20.4.2.4).
+const cellFloat = (posAndWrap: string, attrs = '') =>
+  `<w:tbl>
+    <w:tblPr><w:tblW w:w="5000" w:type="dxa"/></w:tblPr>
+    <w:tblGrid><w:gridCol w:w="5000"/></w:tblGrid>
+    <w:tr><w:tc>
+      <w:tcPr><w:tcW w:w="5000" w:type="dxa"/></w:tcPr>
+      ${anchoredShape(posAndWrap, attrs)}
+    </w:tc></w:tr>
+  </w:tbl>${TEXT}`;
+
+const shapeX = (laid: ReturnType<typeof layoutOf>): number => {
+  const shape = laid.pages[0]!.commands.find((c) => c.type === 'shape');
+  if (!shape) throw new Error('the anchored shape was not drawn');
+  return (shape as unknown as { shape: { transform: ReadonlyArray<number> } }).shape.transform[4]!;
+};
+
+describe('a drawing anchored inside a table cell (§20.4.2.4)', () => {
+  // The table starts at the left margin (72pt) — Word 2013's placement; an
+  // older document's table stands out by its cell margin (see
+  // table-compat-outdent.test.ts) — and the cell keeps Word's default 5.4pt
+  // of padding, so a cell-relative offset lands 77.4pt further right than
+  // the same offset read against the page.
+  const WORD_2013 =
+    '<w:compat><w:compatSetting w:name="compatibilityMode" ' +
+    'w:uri="http://schemas.microsoft.com/office/word" w:val="15"/></w:compat>';
+  const AT_100 =
+    '<wp:positionH relativeFrom="page"><wp:posOffset>1270000</wp:posOffset></wp:positionH>' +
+    '<wp:positionV relativeFrom="page"><wp:posOffset>635000</wp:posOffset></wp:positionV>' +
+    '<wp:wrapNone/>';
+
+  it('is drawn at all — it used to be dropped for having nowhere to stand', () => {
+    const laid = layoutOf(buildDocxFromBody(cellFloat(AT_100)));
+    expect(laid.pages[0]!.commands.some((c) => c.type === 'shape')).toBe(true);
+  });
+
+  it('measures its position in the CELL, which is what layoutInCell means', () => {
+    const docx = buildDocxFromBody(cellFloat(AT_100), { settingsXml: WORD_2013 });
+    expect(shapeX(layoutOf(docx))).toBeCloseTo(177.4, 0);
+  });
+
+  it('…and reaches past the table to the page when layoutInCell is off', () => {
+    const laid = layoutOf(buildDocxFromBody(cellFloat(AT_100, 'layoutInCell="0"')));
+    expect(shapeX(laid)).toBeCloseTo(100, 0);
+  });
+
+  it('takes no room in the cell it is anchored in', () => {
+    const withFloat = layoutOf(buildDocxFromBody(cellFloat(AT_100)));
+    const bare = layoutOf(
+      buildDocxFromBody(cellFloat(AT_100).replace(anchoredShape(AT_100), '<w:p/>')),
+    );
+    const lineY = (l: ReturnType<typeof layoutOf>) =>
+      (
+        l.pages[0]!.commands.filter((c) => c.type === 'line').at(-1) as unknown as {
+          baselineY: number;
+        }
+      ).baselineY;
+    expect(lineY(withFloat)).toBeCloseTo(lineY(bare), 4);
+  });
+});
+
+// Two boxes of one chain: the first holds the words (`wps:txbx id`), the second
+// only says it continues them (`wps:linkedTxbx id seq`).
+const chained = (heightEmu: number, text: string) =>
+  buildDocxFromBody(
+    `<w:p><w:r><w:drawing>
+      <wp:anchor xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">
+        <wp:extent cx="1828800" cy="${String(heightEmu)}"/>
+        <wp:positionH relativeFrom="page"><wp:posOffset>635000</wp:posOffset></wp:positionH>
+        <wp:positionV relativeFrom="page"><wp:posOffset>635000</wp:posOffset></wp:positionV>
+        <wp:wrapNone/>
+        <wp:docPr id="1" name="Box 1"/>
+        <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+            <wps:wsp xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+              <wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1828800" cy="${String(heightEmu)}"/></a:xfrm>
+                <a:prstGeom prst="rect"><a:avLst/></a:prstGeom></wps:spPr>
+              <wps:txbx id="7"><w:txbxContent>${text}</w:txbxContent></wps:txbx>
+              <wps:bodyPr lIns="0" tIns="0" rIns="0" bIns="0"/>
+            </wps:wsp>
+          </a:graphicData>
+        </a:graphic>
+      </wp:anchor>
+    </w:drawing></w:r></w:p>` +
+      `<w:p><w:r><w:drawing>
+      <wp:anchor xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">
+        <wp:extent cx="1828800" cy="3657600"/>
+        <wp:positionH relativeFrom="page"><wp:posOffset>3175000</wp:posOffset></wp:positionH>
+        <wp:positionV relativeFrom="page"><wp:posOffset>635000</wp:posOffset></wp:positionV>
+        <wp:wrapNone/>
+        <wp:docPr id="2" name="Box 2"/>
+        <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+          <a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+            <wps:wsp xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+              <wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1828800" cy="3657600"/></a:xfrm>
+                <a:prstGeom prst="rect"><a:avLst/></a:prstGeom></wps:spPr>
+              <wps:linkedTxbx id="7" seq="1"/>
+              <wps:bodyPr lIns="0" tIns="0" rIns="0" bIns="0"/>
+            </wps:wsp>
+          </a:graphicData>
+        </a:graphic>
+      </wp:anchor>
+    </w:drawing></w:r></w:p>`,
+  );
+
+const PARAS = Array.from(
+  { length: 8 },
+  (_, i) => `<w:p><w:r><w:t>line ${String(i)}</w:t></w:r></w:p>`,
+).join('');
+
+// The x of every line that carries words, by the text on it — the two body
+// paragraphs the drawings hang off draw an empty line each.
+const linesByText = (laid: ReturnType<typeof layoutOf>) =>
+  laid.pages[0]!.commands.filter((c) => c.type === 'line')
+    .map(
+      (c) =>
+        c as unknown as { originX: number; line: { tokens: ReadonlyArray<{ text?: string }> } },
+    )
+    .map((c) => ({ x: c.originX, text: c.line.tokens.map((t) => t.text ?? '').join('') }))
+    .filter((d) => d.text !== '');
+
+describe('linked text boxes (wps:linkedTxbx)', () => {
+  it('continues what will not fit in the next box of the chain', () => {
+    // A box 36pt tall holds three 12pt lines; the rest belong to box 2, which
+    // stands 200pt to its right.
+    const laid = layoutOf(chained(457200, PARAS));
+    const drawn = linesByText(laid);
+    expect(drawn.map((d) => d.text)).toEqual(PARAS.match(/line \d/gu));
+    const first = drawn[0]!.x;
+    const carried = drawn.filter((d) => d.x > first + 100);
+    expect(carried.length).toBeGreaterThan(0);
+    expect(drawn.filter((d) => d.x === first).length).toBeGreaterThan(0);
+    // Every carried line comes AFTER every kept one: one chain, read in order.
+    const lastKept = drawn.map((d) => d.x === first).lastIndexOf(true);
+    expect(lastKept).toBeLessThan(drawn.indexOf(carried[0]!));
+  });
+
+  it('leaves a box that holds its whole text alone', () => {
+    const laid = layoutOf(chained(3657600, PARAS));
+    const drawn = linesByText(laid);
+    const first = drawn[0]!.x;
+    expect(drawn.every((d) => d.x === first)).toBe(true);
+  });
+});
+
+describe('a tiled picture fill (§14.1.2.5 type="tile" / §20.1.8.58 a:tile)', () => {
+  // A 2x2 PNG is 1.5pt square at the 96 dpi Office measures a picture in, so a
+  // 144x72pt shape is papered with 96 x 48 copies of it rather than one blur.
+  const tiled = (fill: string, dpi?: number) =>
+    buildDocxFromBody(
+      `<w:p><w:r><w:drawing>
+        <wp:anchor xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">
+          <wp:extent cx="1828800" cy="914400"/>
+          <wp:positionH relativeFrom="page"><wp:posOffset>635000</wp:posOffset></wp:positionH>
+          <wp:positionV relativeFrom="page"><wp:posOffset>635000</wp:posOffset></wp:positionV>
+          <wp:wrapNone/>
+          <wp:docPr id="9" name="Papered"/>
+          <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+            <a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+              <wps:wsp xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+                <wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1828800" cy="914400"/></a:xfrm>
+                  <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+                  ${fill}
+                </wps:spPr>
+                <wps:bodyPr/>
+              </wps:wsp>
+            </a:graphicData>
+          </a:graphic>
+        </wp:anchor>
+      </w:drawing></w:r></w:p>`,
+      {
+        images: {
+          rId20: {
+            contentType: 'image/png',
+            bytes: buildTinyPng(2, 2, [0, 0, 255, 255], dpi),
+            extension: 'png',
+          },
+        },
+      },
+    );
+  const blip = (inner: string) => `<a:blipFill><a:blip r:embed="rId20"/>${inner}</a:blipFill>`;
+  const images = (docx: Uint8Array) =>
+    layoutOf(docx).pages[0]!.commands.filter((c) => c.type === 'image');
+
+  it('papers the shape when the fill names neither a tile nor a stretch', () => {
+    // §20.1.8.14 — the fill MODE is optional, and a `blipFill` that states
+    // neither tiles. tdf128596.pptx is a rounded rectangle papered with a
+    // 32x32 tick and nothing else in its fill; read as a stretch it came out
+    // as one tick blown up over the whole shape.
+    const bare = images(tiled(blip('')));
+    const asked = images(tiled(blip('<a:tile tx="0" ty="0"/>')));
+    expect(bare.length).toBe(asked.length);
+    expect(bare.length).toBeGreaterThan(1);
+  });
+
+  it('stretches the picture when the fill says so', () => {
+    const stretched = images(tiled(blip('<a:stretch><a:fillRect/></a:stretch>')));
+    expect(stretched).toHaveLength(1);
+  });
+
+  it('measures one copy at the resolution the picture states for itself', () => {
+    // §11.3.5.3 — the same 2x2 PNG, but saying it is 24 dpi: a pixel is then
+    // four times as wide as the 96-dpi default makes it, so one copy is 6pt
+    // square and the box holds sixteen times fewer of them. Measured at 96
+    // whatever the file said, one tile of 119877's 300-dpi mountains covered a
+    // whole table column where every reader repeats it three times down.
+    const drawn = images(tiled(blip('<a:tile tx="0" ty="0"/>'), 24));
+    const first = drawn[0] as unknown as { width: number; height: number };
+    expect(first.width).toBeCloseTo(6, 1);
+    expect(first.height).toBeCloseTo(6, 1);
+  });
+
+  it('repeats the picture over the box instead of stretching it', () => {
+    const drawn = images(tiled(blip('<a:tile tx="0" ty="0" sx="100000" sy="100000"/>')));
+    expect(drawn.length).toBeGreaterThan(100);
+    const first = drawn[0] as unknown as { width: number; height: number };
+    expect(first.width).toBeCloseTo(1.5, 1);
+    expect(first.height).toBeCloseTo(1.5, 1);
+  });
+
+  it('scales a copy before repeating it, as `sx` / `sy` ask', () => {
+    // §20.1.8.58 — the scale is thousandths of a percent, and it applies to the
+    // picture BEFORE the repeat. Read as a plain tile, a texture the file
+    // doubles repeats four times as often as it should.
+    const drawn = images(tiled(blip('<a:tile tx="0" ty="0" sx="200000" sy="400000"/>')));
+    const first = drawn[0] as unknown as { width: number; height: number };
+    expect(first.width).toBeCloseTo(3, 1); // 1.5pt × 2
+    expect(first.height).toBeCloseTo(6, 1); // 1.5pt × 4
+  });
+
+  it('pins a DrawingML grid to the box’s corner', () => {
+    // §20.1.8.58 `a:tile @algn` defaults to `tl`: the first copy starts where
+    // the box does, and a partial copy is left over at the far edge.
+    const drawn = images(tiled(blip('<a:tile tx="0" ty="0"/>'))) as unknown as Array<{
+      x: number;
+      y: number;
+    }>;
+    // No copy starts before the box: the grid opens exactly at its corner, and
+    // whatever does not divide evenly is left over at the FAR edge. The
+    // MS-ODRAW texture of a `.ppt` centres its grid instead, which is what
+    // turned 119877's tiled photographs from a patch of empty sky into the
+    // picture LibreOffice draws.
+    const shape = layoutOf(tiled(blip('<a:tile tx="0" ty="0"/>'))).pages[0]!.commands.find(
+      (c) => c.type === 'shape',
+    );
+    const box = shape?.type === 'shape' ? shape.shape.transform : undefined;
+    expect(box).toBeDefined();
+    expect(Math.min(...drawn.map((d) => d.x))).toBeCloseTo(box![4], 0);
+    expect(drawn.every((d) => d.x >= box![4] - 0.01)).toBe(true);
+  });
+
+  it('…and a stretched one is still the single picture it was', () => {
+    const drawn = images(tiled(blip('<a:stretch><a:fillRect/></a:stretch>')));
+    expect(drawn.length).toBe(1);
+    const only = drawn[0] as unknown as { width: number; height: number };
+    expect(only.width).toBeCloseTo(144, 0);
+    expect(only.height).toBeCloseTo(72, 0);
+  });
+});
+
+// §20.1.8.40 — a shadow falls UNDER the shape it belongs to, and a picture fill
+// leaves the paint passes: the image paints in one and the shape in a later
+// one, so a shadow left on the shape landed on TOP of its own picture.
+describe('a shadow under a picture fill', () => {
+  const shadowed = (withShadow: boolean) =>
+    buildDocxFromBody(
+      `<w:p><w:r><w:drawing>
+        <wp:anchor xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">
+          <wp:extent cx="1828800" cy="914400"/>
+          <wp:positionH relativeFrom="page"><wp:posOffset>635000</wp:posOffset></wp:positionH>
+          <wp:positionV relativeFrom="page"><wp:posOffset>635000</wp:posOffset></wp:positionV>
+          <wp:wrapNone/>
+          <wp:docPr id="9" name="Shadowed"/>
+          <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+            <a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+              <wps:wsp xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">
+                <wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="1828800" cy="914400"/></a:xfrm>
+                  <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+                  <a:blipFill><a:blip r:embed="rId20"/><a:stretch><a:fillRect/></a:stretch></a:blipFill>
+                  ${
+                    withShadow
+                      ? `<a:effectLst><a:outerShdw blurRad="50800" dist="38100">` +
+                        `<a:prstClr val="black"><a:alpha val="40000"/></a:prstClr>` +
+                        `</a:outerShdw></a:effectLst>`
+                      : ''
+                  }
+                </wps:spPr>
+                <wps:bodyPr/>
+              </wps:wsp>
+            </a:graphicData>
+          </a:graphic>
+        </wp:anchor>
+      </w:drawing></w:r></w:p>`,
+      {
+        images: {
+          rId20: {
+            contentType: 'image/png',
+            bytes: buildTinyPng(2, 2, [0, 0, 255, 255]),
+            extension: 'png',
+          },
+        },
+      },
+    );
+
+  it('builds a blurred shadow back up to the transparency it asks for', () => {
+    // §20.1.8.40 — the soft edge is a stack of copies of the same silhouette,
+    // and where they all overlap the colour has to reach what the shadow asked
+    // for. Layers COMPOSITE rather than add, so each carries the root of what
+    // is left, not the quotient: divided instead, a 50% shadow settled at 44%
+    // in its own middle and the shape came out a step light.
+    for (const [alpha, blurPt] of [
+      [0.5, 3],
+      [0.4, 8],
+      [0.25, 16],
+    ] as const) {
+      const { count, alpha: each } = shadowBlurLayers({ blurPt, alpha });
+      expect(count, `${alpha}@${blurPt}`).toBeGreaterThan(1);
+      // n copies at `each` leave 1 - (1 - each)^n of the shadow.
+      expect(1 - (1 - each) ** count, `${alpha}@${blurPt}`).toBeCloseTo(alpha, 10);
+    }
+    // A hard shadow is one copy at its own alpha, untouched.
+    expect(shadowBlurLayers({ blurPt: 0, alpha: 0.4 })).toEqual({ count: 1, alpha: 0.4 });
+  });
+
+  it('draws that shadow at the transparency it asks for, not at full strength', async () => {
+    // The state that carries a shadow's alpha has to be named in the PICTURE
+    // pass as it is in the shape pass. Left out, tdf128596's 50% black under a
+    // nearly transparent tile came out solid.
+    const pdf = await Ream.parse(shadowed(true)).convert('pdf', { fonts: FONTS });
+    const s = Buffer.from(pdf).toString('latin1');
+    // An /ExtGState carrying the per-layer alpha exists…
+    expect(/\/ca 0?\.\d+/u.test(s)).toBe(true);
+    // …and the content stream names one before it paints.
+    expect(/\/GSa\d+ gs/u.test(s)).toBe(true);
+  });
+
+  it('ties the shadow, the picture and the outline into one picture', () => {
+    // Without a shadow nothing is grouped and the passes stay as they were.
+    const plain = layoutOf(shadowed(false)).pages[0]!.commands;
+    expect(plain.every((c) => c.pictureId === undefined)).toBe(true);
+    // With one, all three travel together — and the shadow comes FIRST.
+    const withIt = layoutOf(shadowed(true)).pages[0]!.commands;
+    const group = withIt.filter((c) => c.pictureId !== undefined);
+    expect(group.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(group.map((c) => c.pictureId)).size).toBe(1);
+    const first = group[0];
+    expect(first?.type).toBe('shape');
+    expect(first?.type === 'shape' ? first.shape.shadow : undefined).toBeDefined();
+    expect(group.some((c) => c.type === 'image')).toBe(true);
+    // …and no other item carries the shadow a second time.
+    expect(group.filter((c) => c.type === 'shape' && c.shape.shadow !== undefined)).toHaveLength(1);
+  });
+});

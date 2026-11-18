@@ -1,0 +1,8 @@
+{
+  // tests/integration joins every entry, the template engine included, so it
+  // is checked with that engine's one relaxed option (see src/template/tsconfig.json).
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "types": ["node"], "noUncheckedIndexedAccess": false },
+  "include": ["tests/integration/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

@@ -1,0 +1,203 @@
+// E-PDF EP1 — the document layer: classic xref + trailer + page tree + stream
+// decoding. The honest test is a round-trip — read back PDFs that Ream's own
+// writer produced (a writer-built micro-PDF, and a real docx → pdf conversion).
+
+import { readFileSync } from 'node:fs';
+
+import { describe, expect, it } from 'vitest';
+import { zlibSync } from 'fflate';
+
+import { buildDocxFromBody } from './fixtures/build-docx';
+import type { PdfDict, PdfValue } from '../../src/ream/pdf/objects';
+import { Ream } from '../../src/ream/core/converter/ream';
+import { dict, name, stream } from '../../src/ream/pdf/objects';
+import { PdfDocument } from '../../src/ream/pdf/writer';
+import { PdfFile } from '../../src/ream/pdf-reader/document';
+
+const FONTS = {
+  regular: new Uint8Array(readFileSync('tests/ream/fixtures/fonts/Roboto-Regular.ttf')),
+  bold: new Uint8Array(readFileSync('tests/ream/fixtures/fonts/Roboto-Bold.ttf')),
+};
+
+const dec = (b: Uint8Array): string => new TextDecoder().decode(b);
+
+// A minimal one-page PDF built with the writer — exercises the classic xref the
+// reader must walk, with no fonts or compression in the way.
+function tinyPdf(content: Uint8Array, contentDict: PdfDict): Uint8Array {
+  const doc = new PdfDocument();
+  const contentRef = doc.add(stream(Object.fromEntries(contentDict), content));
+  const page = dict({ Type: name('Page'), MediaBox: [0, 0, 200, 100], Contents: contentRef });
+  const pageRef = doc.add(page);
+  const pagesRef = doc.add(dict({ Type: name('Pages'), Kids: [pageRef], Count: 1 }));
+  page.set('Parent', pagesRef);
+  const catalog = doc.add(dict({ Type: name('Catalog'), Pages: pagesRef }));
+  return doc.build(catalog);
+}
+
+/** The same tiny page, with `/Rotate` stated where `where` says. */
+function rotatedPdf(where: 'page' | 'pages', rotate: number): Uint8Array {
+  const doc = new PdfDocument();
+  const body = new TextEncoder().encode('BT ET');
+  const contentRef = doc.add(stream({ Length: body.length }, body));
+  const page = dict({ Type: name('Page'), MediaBox: [0, 0, 200, 100], Contents: contentRef });
+  if (where === 'page') page.set('Rotate', rotate);
+  const pageRef = doc.add(page);
+  const pages = dict({ Type: name('Pages'), Kids: [pageRef], Count: 1 });
+  if (where === 'pages') pages.set('Rotate', rotate);
+  const pagesRef = doc.add(pages);
+  page.set('Parent', pagesRef);
+  const catalog = doc.add(dict({ Type: name('Catalog'), Pages: pagesRef }));
+  return doc.build(catalog);
+}
+
+const rotateOf = (where: 'page' | 'pages', r: number): number =>
+  PdfFile.parse(rotatedPdf(where, r)).pages()[0]!.rotate;
+
+describe('how far the page turns when it is shown (§14.11.1)', () => {
+  it('reads /Rotate off the page, and normalises the quarter turns', () => {
+    expect(rotateOf('page', 0)).toBe(0);
+    expect(rotateOf('page', 90)).toBe(90);
+    expect(rotateOf('page', 270)).toBe(270);
+    // A file is free to write the turn the long way round, or the other way.
+    expect(rotateOf('page', -90)).toBe(270);
+    expect(rotateOf('page', 450)).toBe(90);
+  });
+
+  it('inherits it down the page tree, as the spec says it may be', () => {
+    expect(rotateOf('pages', 270)).toBe(270);
+  });
+
+  it('takes anything that is not a quarter turn for no turn at all', () => {
+    expect(rotateOf('page', 45)).toBe(0);
+  });
+});
+
+describe('a filter nothing here can undo says so (§7.4)', () => {
+  it('reports the filter by name instead of returning an empty document', () => {
+    // Brotli-Prototype-FileA.pdf compresses its CROSS-REFERENCE stream with
+    // `/BrotliDecode` (PDF 2.0). Undecoded, the page tree never resolves and
+    // all twenty-five pages go missing — with nothing in the report to say why.
+    const content = 'BT ET';
+    const objects = [
+      '<< /Type /Catalog /Pages 2 0 R >>',
+      '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>',
+      `<< /Filter /BrotliDecode /Length ${String(content.length)} >>\nstream\n${content}\nendstream`,
+    ];
+    let pdf = '%PDF-2.0\n';
+    const offsets: Array<number> = [];
+    objects.forEach((body, i) => {
+      offsets.push(pdf.length);
+      pdf += `${String(i + 1)} 0 obj\n${body}\nendobj\n`;
+    });
+    const xref = pdf.length;
+    pdf += `xref\n0 ${String(objects.length + 1)}\n0000000000 65535 f \n`;
+    for (const off of offsets) pdf += `${String(off).padStart(10, '0')} 00000 n \n`;
+    pdf += `trailer\n<< /Size ${String(objects.length + 1)} /Root 1 0 R >>\n`;
+    pdf += `startxref\n${String(xref)}\n%%EOF\n`;
+
+    const file = PdfFile.parse(new TextEncoder().encode(pdf));
+    file.streamData(file.resolve(file.pages()[0]!.dict.get('Contents')!) as never);
+    expect([...file.unknownFilters]).toContain('BrotliDecode');
+  });
+
+  it('uses a decoder the caller supplies, and then has nothing to report', () => {
+    // §7.4 leaves the filter set open. Rather than carry a decoder for every
+    // filter anyone might write — Brotli alone is RFC 7932's context-modelled
+    // Huffman scheme and a 122 KB static dictionary, in every bundle — the
+    // reader takes one from whoever needs the file.
+    const rot13 = (b: Uint8Array): Uint8Array =>
+      b.map((c) =>
+        c >= 65 && c <= 90
+          ? ((c - 65 + 13) % 26) + 65
+          : c >= 97 && c <= 122
+            ? ((c - 97 + 13) % 26) + 97
+            : c,
+      );
+    const file = PdfFile.parse(
+      new TextEncoder().encode('%PDF-1.7\ntrailer\n<< /Size 1 >>\n%%EOF\n'),
+      '',
+      { Rot13Decode: rot13 },
+    );
+    const decoded = file.streamData(
+      stream({ Filter: name('Rot13Decode') }, new TextEncoder().encode('uryyb')),
+    );
+    expect(new TextDecoder().decode(decoded)).toBe('hello');
+    expect([...file.unknownFilters]).toHaveLength(0);
+  });
+
+  it('reports a supplied decoder that throws as one that was never there', () => {
+    const file = PdfFile.parse(
+      new TextEncoder().encode('%PDF-1.7\ntrailer\n<< /Size 1 >>\n%%EOF\n'),
+      '',
+      {
+        Rot13Decode: () => {
+          throw new Error('nope');
+        },
+      },
+    );
+    file.streamData(stream({ Filter: name('Rot13Decode') }, new Uint8Array([1, 2, 3])));
+    expect([...file.unknownFilters]).toContain('Rot13Decode');
+  });
+
+  it('says nothing about the filters it does undo, or leaves to others', () => {
+    const raw = zlibSync(new TextEncoder().encode('BT ET'));
+    const file = PdfFile.parse(
+      new TextEncoder().encode('%PDF-1.7\ntrailer\n<< /Size 1 >>\n%%EOF\n'),
+    );
+    file.streamData(stream({ Filter: name('FlateDecode') }, raw));
+    file.streamData(stream({ Filter: name('DCTDecode') }, raw));
+    expect([...file.unknownFilters]).toHaveLength(0);
+  });
+});
+
+describe('PDF document layer — classic xref + page tree (E-PDF EP1)', () => {
+  it('reads back a writer-produced PDF: pages, MediaBox, content', () => {
+    const body = new TextEncoder().encode('BT /F1 24 Tf 72 60 Td (Hello) Tj ET');
+    const file = PdfFile.parse(tinyPdf(body, new Map([['Length', body.length]])));
+    const pages = file.pages();
+    expect(pages.length).toBe(1);
+    expect(pages[0]!.mediaBox).toEqual([0, 0, 200, 100]);
+    expect(dec(file.pageContent(pages[0]!))).toContain('(Hello) Tj');
+  });
+
+  it('decodes a FlateDecode content stream', () => {
+    const raw = new TextEncoder().encode('BT (compressed) Tj ET');
+    const comp = zlibSync(raw);
+    const file = PdfFile.parse(
+      tinyPdf(
+        comp,
+        new Map<string, PdfValue>([
+          ['Length', comp.length],
+          ['Filter', name('FlateDecode')],
+        ]),
+      ),
+    );
+    expect(dec(file.pageContent(file.pages()[0]!))).toBe('BT (compressed) Tj ET');
+  });
+
+  it('recovers via a brute-force scan when the xref offset is corrupt', () => {
+    const body = new TextEncoder().encode('BT (recovered) Tj ET');
+    const bytes = tinyPdf(body, new Map([['Length', body.length]]));
+    // Corrupt the startxref offset so the classic path fails and recovery kicks in.
+    const sx = dec(bytes).lastIndexOf('startxref');
+    const corrupt = bytes.slice();
+    corrupt[sx + 10] = '9'.charCodeAt(0); // point startxref into nowhere
+    corrupt[sx + 11] = '9'.charCodeAt(0);
+    const file = PdfFile.parse(corrupt);
+    expect(file.pages().length).toBe(1);
+    expect(dec(file.pageContent(file.pages()[0]!))).toContain('(recovered) Tj');
+  });
+
+  it('round-trips a real Ream-written PDF (docx → pdf → read back)', async () => {
+    const docx = buildDocxFromBody('<w:p><w:r><w:t>Round trip</w:t></w:r></w:p>');
+    const pdf = await Ream.parse(docx).convert('pdf', { fonts: FONTS });
+    const file = PdfFile.parse(pdf);
+    const pages = file.pages();
+    expect(pages.length).toBeGreaterThanOrEqual(1);
+    const mb = pages[0]!.mediaBox;
+    expect(mb[2] - mb[0]).toBeGreaterThan(500); // ~A4 width in pt
+    expect(mb[3] - mb[1]).toBeGreaterThan(700); // ~A4 height in pt
+    expect(dec(file.pageContent(pages[0]!))).toContain('BT'); // a real text object
+  });
+});

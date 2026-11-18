@@ -1,0 +1,215 @@
+// E-FONT F2 — which substitute families a document needs, read off the parsed
+// model rather than one format's XML. Before this the answer came from a regex
+// over `w:rFonts`, so every non-docx input was rendered in ONE family: a deck
+// whose theme is Times and whose body is Calibri came out entirely in the
+// default sans, and no per-run resolution could help because only one registry
+// was ever built.
+
+import { readFileSync } from 'node:fs';
+
+import { describe, expect, it } from 'vitest';
+
+import { buildDocxFromBody } from './fixtures/build-docx';
+import { buildXlsx } from './fixtures/build-xlsx';
+import { Ream } from '../../src/ream/core/converter/ream';
+import { familiesInFlow } from '../../src/ream/core/fonts/families';
+import { knowsFamily, resolveFamilyStyle } from '../../src/ream/core/fonts';
+
+const families = (bytes: Uint8Array): Array<string> =>
+  [...familiesInFlow(Ream.parse(bytes).flow)].sort();
+
+/** A workbook whose Normal style names `face`. */
+const workbook = (face: string): Uint8Array =>
+  buildXlsx({
+    rows: [['hello']],
+    stylesXml:
+      `<fonts count="1"><font><sz val="11"/><name val="${face}"/></font></fonts>` +
+      `<fills count="1"><fill><patternFill patternType="none"/></fill></fills>` +
+      `<borders count="1"><border/></borders>` +
+      `<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>` +
+      `<cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>`,
+  });
+
+describe('the families a document names (E-FONT F2)', () => {
+  it('reads a workbook’s own typeface', () => {
+    // §18.8.29 `<name>` — carried for every other property of the font and not
+    // for this one, so a Calibri workbook asked for no family at all.
+    expect(families(workbook('Calibri'))).toEqual(['arimo', 'carlito']);
+    expect(families(workbook('Times New Roman'))).toEqual(['arimo', 'tinos']);
+  });
+
+  it('always keeps the default sans as the fallback', () => {
+    // Unstyled runs, math and chart labels resolve through it.
+    expect(families(workbook('Arial'))).toEqual(['arimo']);
+  });
+});
+
+describe('a family name that also names the face (E-FONT F3)', () => {
+  it('reads the weight off the end of the name', () => {
+    // `Times New Roman Bold` matched no twin whole, so a Times heading fell
+    // through the serif test to the generic sans.
+    expect(resolveFamilyStyle('Times New Roman Bold')).toEqual({ key: 'tinos', bold: true });
+    expect(resolveFamilyStyle('Arial Black')).toEqual({ key: 'arimo', bold: true });
+    expect(resolveFamilyStyle('CenturySchoolbook-Bold')).toMatchObject({ bold: true });
+    expect(resolveFamilyStyle('Arial,Bold')).toMatchObject({ bold: true });
+    expect(resolveFamilyStyle('Frutiger 45 Light')).toEqual({ key: 'arimo' });
+    // No curated family has a condensed cut, so the substitute is squeezed to
+    // the width the named one sets at.
+    expect(resolveFamilyStyle('Arial Narrow')).toEqual({ key: 'arimo', widthScale: 0.82 });
+  });
+
+  it('keeps a family NAMED for a face word whole', () => {
+    // Only a trailing word is the face: Book Antiqua is a family.
+    expect(resolveFamilyStyle('Book Antiqua')).toEqual({ key: 'tinos' });
+    expect(resolveFamilyStyle('Bold')).toEqual({ key: 'arimo' });
+  });
+
+  it('finds the family behind a foundry prefix', () => {
+    expect(resolveFamilyStyle('Adobe Garamond Pro Bold')).toEqual({ key: 'tinos', bold: true });
+  });
+});
+
+describe('the families a PDF names (E-FONT F3)', () => {
+  it('reads the families that are a stem and a size', () => {
+    // A word processor asks for "Times New Roman"; a PDF carries the face it
+    // was SET in, and TeX and PostScript producers name theirs by stem and
+    // size. Matched against the tables whole, every one of them fell through
+    // to the generic sans — so every paper, every preprint, every LaTeX
+    // document came back set in a grotesque. bug1997343.pdf is LMRoman,
+    // comments.pdf and TAMReview.pdf NimbusRomNo9L.
+    expect(resolveFamilyStyle('LMRoman10-Regular').key).toBe('tinos');
+    expect(resolveFamilyStyle('CMR10').key).toBe('tinos');
+    expect(resolveFamilyStyle('NimbusRomNo9L-Regu').key).toBe('tinos');
+    expect(resolveFamilyStyle('LatinModernMath-Regular').key).toBe('tinos');
+    // …and the same families' typewriter and sans cuts are not serif.
+    expect(resolveFamilyStyle('CMTT10').key).toBe('cousine');
+    expect(resolveFamilyStyle('LMSans10-Regular').key).toBe('arimo');
+    expect(resolveFamilyStyle('NimbusSanL-Regu').key).toBe('arimo');
+    // A name that says nothing still says nothing.
+    expect(resolveFamilyStyle('SomeFoundryFace').key).toBe('arimo');
+  });
+});
+
+describe('the sans families a PDF names (E-FONT F3)', () => {
+  it('knows them, so a descriptor’s flags do not outvote the name', () => {
+    // bug898853.pdf flags its FrutigerLTStd-Light Serif; a sans the tables do
+    // not know is indistinguishable from a name that says nothing.
+    expect(knowsFamily('FrutigerLTStd-Light')).toBe(true);
+    expect(knowsFamily('HelveticaNeue-Bold')).toBe(true);
+    expect(knowsFamily('ArialMT')).toBe(true);
+    expect(knowsFamily('Roboto')).toBe(true);
+    expect(resolveFamilyStyle('FrutigerLTStd-Light').key).toBe('arimo');
+    // A name that says nothing still says nothing.
+    expect(knowsFamily('SomeFoundryFace')).toBe(false);
+  });
+
+  it('takes a sans family’s mono or slab cut for the class it names', () => {
+    expect(resolveFamilyStyle('ArialMonospacedMT').key).toBe('cousine');
+    expect(resolveFamilyStyle('FiraSansSlab-Regular').key).toBe('tinos');
+    // A family named for its fixed pitch is a typewriter face, whatever the
+    // descriptor says: bug1539074.pdf's LucidaTypewriter came back a sans.
+    expect(resolveFamilyStyle('Roboto Mono').key).toBe('cousine');
+    expect(resolveFamilyStyle('IBM Plex Mono').key).toBe('cousine');
+    expect(resolveFamilyStyle('LucidaTypewriter-Extend_850').key).toBe('cousine');
+    expect(resolveFamilyStyle('Monospace821BT').key).toBe('cousine');
+    // A whole-name sans is not its slab: that leaves the descriptor its say.
+    expect(knowsFamily('RobotoSlab-Regular')).toBe(false);
+  });
+
+  it('knows the serif families a producer names by stem', () => {
+    // bug1937438_af_from_latex.pdf's STIXTwoText came back a sans, and
+    // bug1811668_reduced.pdf's `Minion Pro` lost the stem it was known by
+    // with its `Pro`.
+    expect(resolveFamilyStyle('STIXTwoText-Bold').key).toBe('tinos');
+    expect(resolveFamilyStyle('Minion Pro').key).toBe('tinos');
+  });
+});
+
+describe('a face the font set does not carry (E-FONT F3)', () => {
+  it('draws the weight and the slant the file has no cut for', async () => {
+    // `FontBytesByVariant` requires only `regular`: a caller who supplies one
+    // file still asks for bold headings and italic quotes, and every one of
+    // them was drawn plain.
+    const styled = buildXlsx({
+      rows: [
+        [
+          { value: 'plain', styleIndex: 0 },
+          { value: 'bold', styleIndex: 1 },
+          { value: 'italic', styleIndex: 2 },
+        ],
+      ],
+      stylesXml:
+        `<fonts count="3"><font><sz val="11"/><name val="Arial"/></font>` +
+        `<font><b/><sz val="11"/><name val="Arial"/></font>` +
+        `<font><i/><sz val="11"/><name val="Arial"/></font></fonts>` +
+        `<fills count="1"><fill><patternFill patternType="none"/></fill></fills>` +
+        `<borders count="1"><border/></borders>` +
+        `<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>` +
+        `<cellXfs count="3">` +
+        `<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>` +
+        `<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>` +
+        `<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>`,
+    });
+    const regular = new Uint8Array(readFileSync('tests/ream/fixtures/fonts/Roboto-Regular.ttf'));
+    const pdf = await Ream.parse(styled).convert('pdf', { fonts: { regular } });
+    const text = Buffer.from(pdf).toString('latin1');
+    // Rendering mode 2 strokes the glyphs as well as filling them…
+    expect(text).toMatch(/2 Tr [\d.]+ w/u);
+    // …and is cleared again for the runs that carry their own face.
+    expect(text).toContain('0 Tr');
+    // …while the italic leans through the text matrix's shear term.
+    expect(text).toMatch(/1 0 0\.21\d* 1 [\d.]+ [\d.]+ Tm/u);
+  });
+
+  it('strokes a faked bold in the colour it fills with', async () => {
+    // The stroke is the glyphs' own weight, not a line round them: a red bold
+    // word was ringed in black, the pen's colour since the page began.
+    const body =
+      '<w:p><w:r><w:rPr><w:b/><w:color w:val="FF0000"/></w:rPr><w:t>red </w:t></w:r>' +
+      '<w:r><w:rPr><w:color w:val="0000FF"/></w:rPr><w:t>blue </w:t></w:r>' +
+      '<w:r><w:rPr><w:b/><w:color w:val="0000FF"/></w:rPr><w:t>bold</w:t></w:r></w:p>';
+    const regular = new Uint8Array(readFileSync('tests/ream/fixtures/fonts/Roboto-Regular.ttf'));
+    const pdf = await Ream.parse(buildDocxFromBody(body)).convert('pdf', { fonts: { regular } });
+    const text = Buffer.from(pdf).toString('latin1');
+    expect(text).toMatch(/2 Tr [\d.]+ w\s+1 0 0 rg 1 0 0 RG\s+[^]*?0 Tr\s+0 0 1 rg\s/u);
+    // The plain blue word fills only; the bold one after it strokes blue too.
+    expect(text).toMatch(/0 0 1 rg\s[^]*?2 Tr [\d.]+ w\s+0 0 1 RG\s/u);
+  });
+
+  it('squeezes a condensed face the substitute has no cut for', async () => {
+    const narrow = buildXlsx({
+      rows: [
+        [
+          { value: 'narrow', styleIndex: 0 },
+          { value: 'normal', styleIndex: 1 },
+        ],
+      ],
+      stylesXml:
+        `<fonts count="2"><font><sz val="11"/><name val="Arial Narrow"/></font>` +
+        `<font><sz val="11"/><name val="Arial"/></font></fonts>` +
+        `<fills count="1"><fill><patternFill patternType="none"/></fill></fills>` +
+        `<borders count="1"><border/></borders>` +
+        `<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>` +
+        `<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>` +
+        `<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/></cellXfs>`,
+    });
+    const regular = new Uint8Array(readFileSync('tests/ream/fixtures/fonts/Roboto-Regular.ttf'));
+    const pdf = await Ream.parse(narrow).convert('pdf', { fonts: { regular } });
+    const text = Buffer.from(pdf).toString('latin1');
+    expect(text).toContain('82 Tz');
+    // …and the next run is set at its own width again.
+    expect(text).toContain('100 Tz');
+  });
+
+  it('asks for nothing when the set has the face', async () => {
+    const plain = buildXlsx([['hello']]);
+    const four = {
+      regular: new Uint8Array(readFileSync('tests/ream/fixtures/fonts/Roboto-Regular.ttf')),
+      bold: new Uint8Array(readFileSync('tests/ream/fixtures/fonts/Roboto-Bold.ttf')),
+      italic: new Uint8Array(readFileSync('tests/ream/fixtures/fonts/Roboto-Italic.ttf')),
+      boldItalic: new Uint8Array(readFileSync('tests/ream/fixtures/fonts/Roboto-BoldItalic.ttf')),
+    };
+    const pdf = await Ream.parse(plain).convert('pdf', { fonts: four });
+    expect(Buffer.from(pdf).toString('latin1')).not.toContain(' Tr');
+  });
+});

@@ -1,0 +1,93 @@
+// Paragraph-of-segments facade over the UAX #9 algorithm (stage 6 / A5).
+//
+// Consumers (layout engines) describe a paragraph as a flat list of segments —
+// plain text runs and atomic objects (inline images, math boxes) — and get
+// back one embedding level per "real" position: one per text code point, one
+// per object. The explicit-formatting protocol stays in here: a segment with
+// `rtl` is wrapped in RLE…PDF (an LTR segment inside an RTL paragraph in
+// LRE…PDF) so run-level direction overrides neutral resolution, and objects
+// participate as U+FFFC (Object Replacement Character).
+
+import { computeBidi } from './algorithm';
+
+const OBJECT_REPLACEMENT = 0xfffc;
+const RLE = 0x202b;
+const PDF_FMT = 0x202c;
+const LRE = 0x202a;
+
+/**
+ * One piece of a paragraph handed to {@link segmentLevels}: a plain text run, or
+ * an atomic object (inline image / math box). A segment may carry a run-level
+ * direction override, applied via explicit RLE/LRE…PDF wrapping.
+ */
+export interface BidiSegment {
+  /** Text content; ignored when `object` is true. */
+  readonly text: string;
+  /** Atomic neutral object (inline image / math box) — counts as ONE position. */
+  readonly object?: boolean;
+  /** Run-level direction override (`w:rtl`). */
+  readonly rtl?: boolean;
+}
+
+/**
+ * Resolve UAX #9 embedding levels for a paragraph described as a flat list of
+ * {@link BidiSegment}s, returning one level per "real" position: one per text
+ * code point, one per object. Carries the explicit-formatting protocol: an `rtl`
+ * segment is wrapped in RLE…PDF (an LTR segment inside an RTL paragraph in
+ * LRE…PDF) so run-level direction overrides neutral resolution, and each object
+ * participates as U+FFFC (Object Replacement Character). The inserted control
+ * characters are not reflected in the output — their levels are projected back
+ * onto the real positions only.
+ *
+ * @param segments The paragraph's segments, in logical order.
+ * @param baseDir  The paragraph base direction.
+ * @returns One embedding level per real position (text code point or object).
+ */
+export function segmentLevels(
+  segments: ReadonlyArray<BidiSegment>,
+  baseDir: 'ltr' | 'rtl',
+): Array<number> {
+  const bidiCps: Array<number> = [];
+  // For each bidi code point, the index of the "real" position it maps to,
+  // or -1 for inserted control characters.
+  const realIndexOfBidi: Array<number> = [];
+  let realCount = 0;
+
+  for (const seg of segments) {
+    const isObject = seg.object === true;
+    // Only a run that STATES its direction overrides the algorithm. Wrapping
+    // every unmarked run of an RTL paragraph in LRE…PDF made its neutrals part
+    // of the Latin run: fdo43093b.docx ends "in M$" inside an RTL paragraph,
+    // and Word and LibreOffice both carry that trailing `$` to the far side of
+    // the line, where the paragraph's own direction puts it.
+    const wrap = seg.rtl === true ? RLE : 0;
+    if (wrap) {
+      bidiCps.push(wrap);
+      realIndexOfBidi.push(-1);
+    }
+    if (isObject) {
+      bidiCps.push(OBJECT_REPLACEMENT);
+      realIndexOfBidi.push(realCount);
+      realCount++;
+    } else {
+      for (const ch of seg.text) {
+        bidiCps.push(ch.codePointAt(0)!);
+        realIndexOfBidi.push(realCount);
+        realCount++;
+      }
+    }
+    if (wrap) {
+      bidiCps.push(PDF_FMT);
+      realIndexOfBidi.push(-1);
+    }
+  }
+
+  const { levels } = computeBidi(bidiCps, baseDir);
+  // Project levels back onto real positions.
+  const realLevels: Array<number> = new Array<number>(realCount).fill(baseDir === 'rtl' ? 1 : 0);
+  for (let i = 0; i < bidiCps.length; i++) {
+    const ri = realIndexOfBidi[i]!;
+    if (ri >= 0) realLevels[ri] = levels[i]!;
+  }
+  return realLevels;
+}

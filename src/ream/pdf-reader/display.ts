@@ -1,0 +1,324 @@
+// §14.11.1 `/Rotate` — the page as it is SHOWN, not as it is stored.
+//
+// A page may be authored one way up and turned another for display: a landscape
+// sheet drawn sideways inside a portrait `/MediaBox`, with `/Rotate 270` to
+// stand it up again. Brotli-Prototype-FileA.pdf is twenty-five of them, and read
+// without the turn every one came back portrait with its words running down the
+// page.
+//
+// The turn belongs at the edge of the reader, not threaded through everything
+// downstream: the marks are mapped into the page's own upright frame as they are
+// lifted, and the rest of the reconstruction sees a page that was never turned.
+
+import type { PathSeg, TextRun } from './content';
+import type { PdfImage } from './images';
+import type { PdfPage } from './document';
+import type { PdfVector } from './vector';
+
+/** A page's shown geometry: how big it is, and how to place a mark on it. */
+export interface Display {
+  /** The shown page's width in points — the `/MediaBox`'s, swapped on a quarter turn. */
+  readonly width: number;
+  /** The shown page's height in points. */
+  readonly height: number;
+  /** How far every mark turns with the page, degrees counter-clockwise. */
+  readonly turnDeg: number;
+  /** Map a `/MediaBox`-space point into the shown page's own y-up frame. */
+  readonly place: (x: number, y: number) => { x: number; y: number };
+  /**
+   * §17.6.20 — present when the page is READ in a frame turned back from the
+   * sheet it is shown on: its words run DOWN the sheet, and they are read in
+   * the frame where they stand upright (see {@link textFrameOf}). `width` and
+   * `height` above are that frame's; these are the sheet's.
+   */
+  readonly sheet?: { readonly width: number; readonly height: number };
+}
+
+/**
+ * The {@link Display} a page's shown box and `/Rotate` describe.
+ *
+ * `/Rotate` turns the page CLOCKWISE when shown, so the content turns with it —
+ * counter-clockwise by the same amount as seen from the content's own frame,
+ * which is what `turnDeg` states.
+ *
+ * @param page The page whose shown geometry is wanted.
+ * @returns Its size, its turn, and the map onto it.
+ */
+export function displayOf(page: PdfPage): Display {
+  // §14.11.2 — what a viewer SHOWS is the crop box, which is the media box
+  // where the page states no other.
+  const [x0, y0, x1, y1] = page.cropBox;
+  const left = Math.min(x0, x1);
+  const bottom = Math.min(y0, y1);
+  const w = Math.abs(x1 - x0);
+  const h = Math.abs(y1 - y0);
+  const quarter = page.rotate === 90 || page.rotate === 270;
+  const place = (x: number, y: number): { x: number; y: number } => {
+    const mx = x - left;
+    const my = y - bottom;
+    switch (page.rotate) {
+      case 90:
+        return { x: my, y: w - mx };
+      case 180:
+        return { x: w - mx, y: h - my };
+      case 270:
+        return { x: h - my, y: mx };
+      default:
+        return { x: mx, y: my };
+    }
+  };
+  return {
+    width: quarter ? h : w,
+    height: quarter ? w : h,
+    turnDeg: page.rotate === 90 ? -90 : page.rotate === 180 ? 180 : page.rotate === 270 ? 90 : 0,
+    place,
+  };
+}
+
+/**
+ * The frame a page whose words run DOWN its sheet is read in: the sheet turned
+ * back a quarter, so the words stand upright in it and every line, paragraph
+ * and margin is found the way it is on any other page.
+ *
+ * A viewer turns such a page with its words, and so does the document it is
+ * read into (§17.6.20 `tbRl`; see {@link wordsTurnOf} for when a page's words
+ * run down it): hello_world_rotated.pdf sets "Hello world"
+ * upright in a portrait box and turns the page by `/Rotate 90`, and read on
+ * the shown sheet the words were set flat across it where every viewer shows
+ * them running down.
+ *
+ * @param shown The page's shown geometry.
+ * @returns The frame, which knows the sheet it was turned back from.
+ */
+export function textFrameOf(shown: Display): Display {
+  return {
+    width: shown.height,
+    height: shown.width,
+    // The frame turns every mark a further quarter counter-clockwise.
+    turnDeg: shown.turnDeg === 270 || shown.turnDeg === -90 ? 0 : shown.turnDeg + 90,
+    place: (x, y) => {
+      const p = shown.place(x, y);
+      return { x: shown.height - p.y, y: p.x };
+    },
+    sheet: { width: shown.width, height: shown.height },
+  };
+}
+
+/**
+ * How a page's words stand on its sheet: the quarter turn, counter-clockwise,
+ * whose words outweigh every other on it together, by their letters at their
+ * size — or 0 where none does. A label set on its side beside the text does
+ * not turn a page; a page of it does.
+ *
+ * @param runs The page's runs, placed on the shown sheet.
+ * @returns 0, 90, 180 or 270; 270 is a page whose words run DOWN it.
+ */
+export function wordsTurnOf(runs: ReadonlyArray<TextRun>): 0 | 90 | 180 | 270 {
+  const by = [0, 0, 0, 0];
+  let all = 0;
+  for (const r of runs) {
+    const letters = r.text.trim().length;
+    if (letters === 0) continue;
+    const weight = letters * (r.fontSizePt || 10);
+    all += weight;
+    const angle = ((Math.round(r.angleDeg ?? 0) % 360) + 360) % 360;
+    if (angle % 90 === 0) by[angle / 90]! += weight;
+  }
+  const most = by.findIndex((w) => w * 2 > all);
+  return most > 0 ? ([90, 180, 270] as const)[most - 1]! : 0;
+}
+
+/**
+ * The same runs, placed on the shown page.
+ *
+ * @param runs The runs as the content stream drew them.
+ * @param d    The page's shown geometry.
+ * @returns The runs in the shown page's frame, each carrying the page's turn.
+ */
+export function placeRuns(runs: ReadonlyArray<TextRun>, d: Display): Array<TextRun> {
+  return runs
+    .map((r) => {
+      const origin = d.place(r.x, r.y);
+      const end = d.place(r.endX, r.endY);
+      const angle = (((r.angleDeg ?? 0) + d.turnDeg) % 360) + 0;
+      const { angleDeg: _was, ...rest } = r;
+      return {
+        ...rest,
+        x: origin.x,
+        y: origin.y,
+        endX: end.x,
+        endY: end.y,
+        ...(Math.abs(angle) > 0.5 ? { angleDeg: angle } : {}),
+      };
+    })
+    .filter((r) =>
+      shows(
+        d,
+        Math.min(r.x, r.endX),
+        Math.min(r.y, r.endY) - r.fontSizePt * 0.25,
+        Math.max(r.x, r.endX),
+        Math.max(r.y, r.endY) + r.fontSizePt * 0.85,
+      ),
+    )
+    .map((r) => cropped(r, d));
+}
+
+/**
+ * §14.11.2 — a run the crop's edge cuts through, as the letters it shows.
+ *
+ * A run that reaches into the shown page was kept whole, which is right where
+ * the crop trims a hair and wrong where it trims a line: endchar.pdf is one
+ * line of a poster, "LE HOLD-UP PLANÉTAIRE", cropped to the fourteen points
+ * that hold its É. Every viewer shows that one letter. Reflowed, the whole
+ * line was re-set into a column fourteen points wide and came back as four
+ * pages of one letter each.
+ *
+ * A letter is kept where any part of it is inside, so a crop that shaves an
+ * edge takes nothing. Where in the run each letter falls is estimated from the
+ * run's own width, which is exact for a face set solid and near enough for one
+ * that is not — the answer is a letter either way.
+ *
+ * @param run The run, already placed on the shown page.
+ * @param d   The page's shown geometry.
+ * @returns The run, or the part of it the page shows.
+ */
+function cropped(run: TextRun, d: Display): TextRun {
+  const from = Math.min(run.x, run.endX);
+  const to = Math.max(run.x, run.endX);
+  const chars = [...run.text];
+  // Nothing to cut: the run sits inside, or is turned (where the estimate
+  // below does not hold), or is a single letter that has nowhere to go.
+  if (from >= 0 && to <= d.width) return run;
+  if (run.angleDeg !== undefined || chars.length < 2 || !(to > from)) return run;
+  const step = (to - from) / chars.length;
+  const first = Math.max(0, Math.floor((0 - from) / step));
+  const last = Math.min(chars.length - 1, Math.ceil((d.width - from) / step) - 1);
+  if (first > last) return run;
+  if (first === 0 && last === chars.length - 1) return run;
+  const backwards = run.endX < run.x;
+  const startX = from + first * step;
+  const endX = from + (last + 1) * step;
+  return {
+    ...run,
+    text: chars.slice(first, last + 1).join(''),
+    x: backwards ? endX : startX,
+    endX: backwards ? startX : endX,
+  };
+}
+
+/**
+ * §14.11.2 — whether a box falls inside the region the page SHOWS.
+ *
+ * The crop box is the region "to which the contents of the page shall be
+ * clipped", and a page cropped to less than its sheet is generally a page with
+ * something outside the crop: freeculture.pdf carries a printer's slug —
+ * "14773_07_347-348_r4jm.qxd 2/10/04 4:45 PM Page 347" — in the 42 points the
+ * crop cuts off the top, and lifted with the rest it stood at the head of the
+ * page and pushed the sheet taller to hold it.
+ */
+function shows(d: Display, minX: number, minY: number, maxX: number, maxY: number): boolean {
+  return maxX > 0 && minX < d.width && maxY > 0 && minY < d.height;
+}
+
+/**
+ * The same pictures, placed on the shown page. A quarter turn swaps a picture's
+ * width and height and leaves it standing on its side, which the caller carries
+ * as the picture's own rotation.
+ *
+ * @param images The pictures as the content stream placed them.
+ * @param d      The page's shown geometry.
+ * @returns The pictures in the shown page's frame.
+ */
+export function placeImages(images: ReadonlyArray<PdfImage>, d: Display): Array<PdfImage> {
+  return images
+    .map((img) => {
+      // The picture's own rectangle, mapped corner to corner: the corners are what
+      // the turn moves, and the box is what is left of them.
+      const corners = [
+        d.place(img.x, img.y),
+        d.place(img.x + img.widthPt, img.y),
+        d.place(img.x + img.widthPt, img.y + img.heightPt),
+        d.place(img.x, img.y + img.heightPt),
+      ];
+      const xs = corners.map((c) => c.x);
+      const ys = corners.map((c) => c.y);
+      const minX = Math.min(...xs);
+      const minY = Math.min(...ys);
+      // The page's own turn adds to the picture's.
+      const turned = (img.rotationDeg ?? 0) + d.turnDeg;
+      return {
+        ...img,
+        x: minX,
+        y: minY,
+        widthPt: Math.max(...xs) - minX,
+        heightPt: Math.max(...ys) - minY,
+        ...(Math.abs(turned) > 0.5 ? { rotationDeg: turned } : {}),
+      };
+    })
+    .filter((img) => shows(d, img.x, img.y, img.x + img.widthPt, img.y + img.heightPt));
+}
+
+/**
+ * The same paths, placed on the shown page. A path is geometry, so every point
+ * of it moves and the bounding box is taken again from what comes out.
+ *
+ * @param vectors The paths as the content stream painted them.
+ * @param d       The page's shown geometry.
+ * @returns The paths in the shown page's frame.
+ */
+export function placeVectors(vectors: ReadonlyArray<PdfVector>, d: Display): Array<PdfVector> {
+  return vectors
+    .map((v) => {
+      const segs: Array<PathSeg> = v.segs.map((s): PathSeg => {
+        switch (s.op) {
+          case 'move':
+          case 'line': {
+            const p = d.place(s.x, s.y);
+            return { op: s.op, x: p.x, y: p.y };
+          }
+          case 'cubic': {
+            const c1 = d.place(s.x1, s.y1);
+            const c2 = d.place(s.x2, s.y2);
+            const p = d.place(s.x, s.y);
+            return { op: 'cubic', x1: c1.x, y1: c1.y, x2: c2.x, y2: c2.y, x: p.x, y: p.y };
+          }
+          case 'close':
+            return s;
+        }
+      });
+      const xs: Array<number> = [];
+      const ys: Array<number> = [];
+      for (const s of segs) {
+        if (s.op === 'close') continue;
+        xs.push(s.x);
+        ys.push(s.y);
+        if (s.op === 'cubic') (xs.push(s.x1, s.x2), ys.push(s.y1, s.y2));
+      }
+      // §8.7.4.5.3 — a gradient's axis is on the page too, and moves with it.
+      const g = v.gradient;
+      const moved =
+        g?.axis !== undefined
+          ? {
+              gradient: {
+                ...g,
+                axis: ((a): typeof a => {
+                  const p0 = d.place(a.x0, a.y0);
+                  const p1 = d.place(a.x1, a.y1);
+                  return { x0: p0.x, y0: p0.y, x1: p1.x, y1: p1.y };
+                })(g.axis),
+              },
+            }
+          : {};
+      if (xs.length === 0) return { ...v, ...moved, segs };
+      return {
+        ...v,
+        ...moved,
+        segs,
+        minX: Math.min(...xs),
+        minY: Math.min(...ys),
+        maxX: Math.max(...xs),
+        maxY: Math.max(...ys),
+      };
+    })
+    .filter((v) => shows(d, v.minX, v.minY, v.maxX, v.maxY));
+}

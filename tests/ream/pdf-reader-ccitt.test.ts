@@ -1,0 +1,492 @@
+// E-PDF EP15 — CCITT Group 3 / Group 4 fax decode. The decoder is exercised
+// three ways: the run/mode codes are checked to be a valid prefix set; two
+// hand-computed bitstreams anchor the run + mode codes independently of the
+// encoder; and an in-test encoder (built from the same exported code tables, but
+// the standard mode-selection algorithm) round-trips varied bitmaps through the
+// real decoder, including the end-to-end image pipeline.
+
+import { readFileSync } from 'node:fs';
+
+import { unzlibSync } from 'fflate';
+import { beforeAll, describe, expect, it } from 'vitest';
+
+import { buildDocxFromBody } from './fixtures/build-docx';
+import type { BitmapContexts } from '../../src/ream/pdf-reader/jbig2';
+import { prepareImage } from '../../src/ream/core/images';
+import { Ream } from '../../src/ream/core/converter/ream';
+import {
+  BLACK_CODES,
+  MODE_CODES,
+  SHARED_MAKEUP,
+  WHITE_CODES,
+  decodeCcitt,
+  decodeCcittPlanes,
+} from '../../src/ream/pdf-reader/ccitt';
+import { PdfFile } from '../../src/ream/pdf-reader/document';
+import {
+  newContexts,
+  standardTableCodes,
+  startingContexts,
+  symbolCodeLength,
+} from '../../src/ream/pdf-reader/jbig2';
+import { decodePdfImage } from '../../src/ream/pdf-reader/image-decode';
+import { dict, name, stream } from '../../src/ream/pdf/objects';
+
+const FONTS = {
+  regular: new Uint8Array(readFileSync('tests/ream/fixtures/fonts/Roboto-Regular.ttf')),
+  bold: new Uint8Array(readFileSync('tests/ream/fixtures/fonts/Roboto-Bold.ttf')),
+};
+
+// --- an independent encoder (mode selection is the standard G4 algorithm) -----
+
+class BitWriter {
+  private bits: Array<number> = [];
+  str(s: string): void {
+    for (const c of s) this.bits.push(c === '1' ? 1 : 0);
+  }
+  bytes(): Uint8Array {
+    const out = new Uint8Array((this.bits.length + 7) >> 3);
+    for (let i = 0; i < this.bits.length; i++) if (this.bits[i]) out[i >> 3]! |= 0x80 >> (i & 7);
+    return out;
+  }
+}
+
+const runBits = (codes: ReadonlyArray<readonly [number, string]>): Map<number, string> =>
+  new Map([...codes, ...SHARED_MAKEUP].map(([run, s]) => [run, s]));
+const WHITE = runBits(WHITE_CODES);
+const BLACK = runBits(BLACK_CODES);
+const modeBits = (kind: string, d: number): string =>
+  MODE_CODES.find(([, m]) => m.kind === kind && m.d === d)![0];
+
+function writeRun(bw: BitWriter, map: Map<number, string>, run: number): void {
+  if (run >= 64) {
+    const makeup = Math.floor(run / 64) * 64;
+    bw.str(map.get(makeup)!);
+    run -= makeup;
+  }
+  bw.str(map.get(run)!);
+}
+
+// Changing elements of one bitmap row (1 = black), starting white, with the two
+// `width` sentinels the decoder also appends.
+function changesOf(bitmap: Uint8Array, y: number, width: number): Array<number> {
+  const ch: Array<number> = [];
+  let color = 0;
+  for (let x = 0; x < width; x++) {
+    const p = bitmap[y * width + x]!;
+    if (p !== color) {
+      ch.push(x);
+      color = p;
+    }
+  }
+  ch.push(width, width);
+  return ch;
+}
+
+const firstGreater = (arr: Array<number>, v: number): number =>
+  arr.find((a) => a > v) ?? arr[arr.length - 1]!;
+
+// b1/b2 — must match the decoder's reference-line scan.
+function findB(ref: Array<number>, a0: number, color: number, width: number): [number, number] {
+  let i = 0;
+  while (i < ref.length && ref[i]! <= a0) i++;
+  const wantEven = color === 0;
+  if (i < ref.length && (i % 2 === 0) !== wantEven) i++;
+  return [i < ref.length ? ref[i]! : width, i + 1 < ref.length ? ref[i + 1]! : width];
+}
+
+function encodeG4(bitmap: Uint8Array, width: number, height: number): Uint8Array {
+  const bw = new BitWriter();
+  let ref: Array<number> = [width, width];
+  for (let y = 0; y < height; y++) {
+    const cur = changesOf(bitmap, y, width);
+    let a0 = -1;
+    let color = 0;
+    while (a0 < width) {
+      const a1 = firstGreater(cur, a0);
+      const [b1, b2] = findB(ref, a0, color, width);
+      if (b2 < a1) {
+        bw.str(modeBits('pass', 0));
+        a0 = b2;
+      } else if (a1 - b1 >= -3 && a1 - b1 <= 3) {
+        bw.str(modeBits('vertical', a1 - b1));
+        a0 = a1;
+        color ^= 1;
+      } else {
+        const a2 = firstGreater(cur, a1);
+        const start = a0 < 0 ? 0 : a0;
+        bw.str(modeBits('horizontal', 0));
+        writeRun(bw, color === 0 ? WHITE : BLACK, a1 - start);
+        writeRun(bw, color === 0 ? BLACK : WHITE, a2 - a1);
+        a0 = a2;
+      }
+    }
+    ref = cur;
+  }
+  return bw.bytes();
+}
+
+function encode1D(bitmap: Uint8Array, width: number, height: number): Uint8Array {
+  const bw = new BitWriter();
+  for (let y = 0; y < height; y++) {
+    let x = 0;
+    let color = 0;
+    while (x < width) {
+      let run = 0;
+      while (x < width && bitmap[y * width + x] === color) {
+        run++;
+        x++;
+      }
+      writeRun(bw, color === 0 ? WHITE : BLACK, run);
+      color ^= 1;
+    }
+  }
+  return bw.bytes();
+}
+
+// Group 3 mixed: every other line one-dimensional, the rest two-dimensional,
+// each preceded by its tag bit — and, where `eol` says so, by an end-of-line.
+function encodeMixed(bitmap: Uint8Array, width: number, height: number, eol: boolean): Uint8Array {
+  const bw = new BitWriter();
+  let ref: Array<number> = [width, width];
+  for (let y = 0; y < height; y++) {
+    const oneDimensional = y % 2 === 0;
+    if (eol) bw.str('000000000001');
+    bw.str(oneDimensional ? '1' : '0');
+    const cur = changesOf(bitmap, y, width);
+    if (oneDimensional) {
+      let x = 0;
+      let color = 0;
+      while (x < width) {
+        let run = 0;
+        while (x < width && bitmap[y * width + x] === color) {
+          run++;
+          x++;
+        }
+        writeRun(bw, color === 0 ? WHITE : BLACK, run);
+        color ^= 1;
+      }
+    } else {
+      let a0 = -1;
+      let color = 0;
+      while (a0 < width) {
+        const a1 = firstGreater(cur, a0);
+        const [b1, b2] = findB(ref, a0, color, width);
+        if (b2 < a1) {
+          bw.str(modeBits('pass', 0));
+          a0 = b2;
+        } else if (a1 - b1 >= -3 && a1 - b1 <= 3) {
+          bw.str(modeBits('vertical', a1 - b1));
+          a0 = a1;
+          color ^= 1;
+        } else {
+          const a2 = firstGreater(cur, a1);
+          const start = a0 < 0 ? 0 : a0;
+          bw.str(modeBits('horizontal', 0));
+          writeRun(bw, color === 0 ? WHITE : BLACK, a1 - start);
+          writeRun(bw, color === 0 ? BLACK : WHITE, a2 - a1);
+          a0 = a2;
+        }
+      }
+    }
+    ref = cur;
+  }
+  return bw.bytes();
+}
+
+// Unpack the decoder's packed bitmap (bit 1 = black) to a 0/1 array.
+function unpackBitmap(packed: Uint8Array, width: number, height: number): Uint8Array {
+  const rowBytes = (width + 7) >> 3;
+  const out = new Uint8Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      out[y * width + x] = (packed[y * rowBytes + (x >> 3)]! >> (7 - (x & 7))) & 1;
+    }
+  }
+  return out;
+}
+
+// A deterministic bilevel pattern (1 = black).
+function pattern(width: number, height: number): Uint8Array {
+  const b = new Uint8Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      b[y * width + x] = (x * 7 + y * 13 + ((x * y) >> 2)) % 3 === 0 ? 1 : 0;
+    }
+  }
+  return b;
+}
+
+describe('CCITT fax decode (E-PDF EP15)', () => {
+  it('the run and mode codes form a valid prefix set', () => {
+    const prefixFree = (codes: ReadonlyArray<string>): boolean =>
+      codes.every((a, i) => codes.every((b, j) => i === j || !b.startsWith(a)));
+    const white = [...WHITE_CODES, ...SHARED_MAKEUP].map(([, s]) => s);
+    const black = [...BLACK_CODES, ...SHARED_MAKEUP].map(([, s]) => s);
+    expect(prefixFree(white)).toBe(true);
+    expect(prefixFree(black)).toBe(true);
+    expect(prefixFree(MODE_CODES.map(([s]) => s))).toBe(true);
+    // anchors against the published T.4 / T.6 codes
+    expect(new Map(WHITE_CODES).get(0)).toBe('00110101');
+    expect(new Map(BLACK_CODES).get(0)).toBe('0000110111');
+    expect(MODE_CODES.find(([, m]) => m.kind === 'vertical' && m.d === 0)![0]).toBe('1');
+  });
+
+  it('decodes a hand-built all-white Group 4 row (V0)', () => {
+    // a single vertical-zero code paints the imaginary white reference line.
+    const packed = decodeCcitt(Uint8Array.of(0b10000000), {
+      k: -1,
+      columns: 8,
+      rows: 1,
+      byteAlign: false,
+    });
+    expect(packed && [...packed]).toEqual([0x00]); // no black bits
+  });
+
+  it('decodes a hand-built all-black Group 4 row (Horizontal: white 0 + black 8)', () => {
+    // 001 (horizontal) · 00110101 (white run 0) · 000101 (black run 8)
+    const packed = decodeCcitt(Uint8Array.of(0x26, 0xa2, 0x80), {
+      k: -1,
+      columns: 8,
+      rows: 1,
+      byteAlign: false,
+    });
+    expect(packed && [...packed]).toEqual([0xff]); // all 8 pixels black
+  });
+
+  it('round-trips varied bitmaps through Group 4', () => {
+    for (const [w, h] of [
+      [8, 4],
+      [16, 5],
+      [40, 12],
+      [33, 7],
+    ] as const) {
+      const bitmap = pattern(w, h);
+      const packed = decodeCcitt(encodeG4(bitmap, w, h), {
+        k: -1,
+        columns: w,
+        rows: h,
+        byteAlign: false,
+      });
+      expect(packed).toBeDefined();
+      expect([...unpackBitmap(packed!, w, h)]).toEqual([...bitmap]);
+    }
+  });
+
+  it('round-trips a bitmap through Group 3 one-dimensional', () => {
+    const [w, h] = [48, 9];
+    const bitmap = pattern(w, h);
+    const packed = decodeCcitt(encode1D(bitmap, w, h), {
+      k: 0,
+      columns: w,
+      rows: h,
+      byteAlign: false,
+    });
+    expect(packed).toBeDefined();
+    expect([...unpackBitmap(packed!, w, h)]).toEqual([...bitmap]);
+  });
+
+  it('round-trips a bitmap through Group 3 MIXED coding (K > 0)', () => {
+    // T.4 §4.2.1 — under mixed coding every line says which of the two it is:
+    // an end-of-line, then one bit, 1 for one-dimensional and 0 for two.
+    // ccitt_EndOfBlock_false.pdf draws the same word six times — `/K -1`,
+    // `/K 0`, `/K 1`, each twice — and the two `/K 1` panels were the only
+    // ones missing from the page.
+    const [w, h] = [48, 9];
+    const bitmap = pattern(w, h);
+    for (const eol of [true, false]) {
+      const packed = decodeCcitt(encodeMixed(bitmap, w, h, eol), {
+        k: 1,
+        columns: w,
+        rows: h,
+        byteAlign: false,
+      });
+      expect(packed).toBeDefined();
+      expect([...unpackBitmap(packed!, w, h)]).toEqual([...bitmap]);
+    }
+  });
+});
+
+describe('CCITT image XObject decode (E-PDF EP15)', () => {
+  let file: PdfFile;
+  beforeAll(async () => {
+    const pdf = await Ream.parse(buildDocxFromBody('<w:p><w:r><w:t>x</w:t></w:r></w:p>')).convert(
+      'pdf',
+      { fonts: FONTS },
+    );
+    file = PdfFile.parse(pdf);
+  });
+
+  it('decodes a Group 4 fax image XObject to a DeviceGray PNG', () => {
+    const w = 24;
+    const h = 16;
+    const bitmap = pattern(w, h);
+    const xobj = stream(
+      {
+        Width: w,
+        Height: h,
+        ColorSpace: name('DeviceGray'),
+        BitsPerComponent: 1,
+        Filter: name('CCITTFaxDecode'),
+        DecodeParms: dict({ K: -1, Columns: w, Rows: h }),
+      },
+      encodeG4(bitmap, w, h),
+    );
+    const decoded = decodePdfImage(file, xobj);
+    expect(decoded.ok).toBe(true);
+    if (!decoded.ok) return;
+    expect(decoded.format).toBe('png');
+    // The PNG's gray samples: black → 0, white → 255.
+    const gray = unzlibSync(prepareImage(decoded.bytes).data);
+    const expected = Uint8Array.from(bitmap, (b) => (b ? 0 : 255));
+    expect([...gray]).toEqual([...expected]);
+  });
+});
+
+describe('the bitplanes of a grey-scale image (ISO/IEC 14492 §C.5)', () => {
+  /** One plane's worth of pixels, distinct enough to tell the planes apart. */
+  const plane = (width: number, height: number, seed: number): Uint8Array => {
+    const px = new Uint8Array(width * height);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) px[y * width + x] = (x + y * seed) % 3 === 0 ? 1 : 0;
+    }
+    return px;
+  };
+
+  it('reads plane after plane out of ONE stream', () => {
+    // MMR codes every plane into one stream, one after another, and nothing
+    // says how many BYTES a plane took: the reader has to carry its place
+    // across them. Advancing by the size of what came OUT left every plane
+    // after the first reading from the middle of the one before it, and
+    // bitmap-halftone-10bpp-mmr.pdf came back as three specks.
+    const width = 24;
+    const height = 8;
+    const planes = [plane(width, height, 1), plane(width, height, 2), plane(width, height, 3)];
+    const parts: Array<Uint8Array> = [];
+    for (const p of planes) {
+      const bw = new BitWriter();
+      bw.str(bitsOf(encodeG4(p, width, height)));
+      // §C.5 — an EOFB closes a plane and the next starts on a byte boundary.
+      bw.str('000000000001000000000001');
+      parts.push(bw.bytes());
+    }
+    const stream = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+    let at = 0;
+    for (const p of parts) {
+      stream.set(p, at);
+      at += p.length;
+    }
+    const read = decodeCcittPlanes(stream, width, height, planes.length);
+    expect(read).toBeDefined();
+    expect(read).toHaveLength(planes.length);
+    const rowBytes = (width + 7) >> 3;
+    read!.forEach((packed, i) => {
+      const got = new Uint8Array(width * height);
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          got[y * width + x] = (packed[y * rowBytes + (x >> 3)]! >> (7 - (x & 7))) & 1;
+        }
+      }
+      expect([...got]).toEqual([...planes[i]!]);
+    });
+  });
+});
+
+/** The bits of a byte string, so a plane can be written before its EOFB. */
+function bitsOf(bytes: Uint8Array): string {
+  let out = '';
+  for (const b of bytes) out += b.toString(2).padStart(8, '0');
+  return out;
+}
+
+describe('how a text region names one of its symbols (§6.4.5)', () => {
+  it('spends no bits at all where there is only one symbol', () => {
+    // SBSYMCODELEN is ceil(log2(SBNUMSYMS)), and for ONE symbol that is zero:
+    // there is nothing to choose. Rounded up to one, the decoder takes a bit
+    // belonging to the next field and reads the id as 1, which is no symbol at
+    // all — bitmap-symbol-big-segmentid.pdf places one instance of one symbol
+    // in each of two regions, and both came back empty.
+    expect(symbolCodeLength(1)).toBe(0);
+    expect(symbolCodeLength(2)).toBe(1);
+    expect(symbolCodeLength(3)).toBe(2);
+    expect(symbolCodeLength(4)).toBe(2);
+    expect(symbolCodeLength(5)).toBe(3);
+    expect(symbolCodeLength(256)).toBe(8);
+    // A region with no symbols reads nothing either.
+    expect(symbolCodeLength(0)).toBe(0);
+  });
+});
+
+describe('the standard Huffman tables (§B.5)', () => {
+  const line = (n: number, low: number): { prefix: string; rangeLen: number } | undefined =>
+    standardTableCodes(n).find((l) => l.rangeLow === low && l.kind !== 'lower');
+
+  it('writes every line of B.7 with the prefix the spec prints for it', () => {
+    // A text region reads its first S through B.7. Transcribed with four of
+    // its lines missing, every value past 31 decoded as another, and
+    // bitmap-symbol-symhuffB5B3-texthuffB7B9B12.pdf set its shapes all over
+    // the sheet.
+    expect(line(7, -512)).toEqual({ prefix: '000', rangeLen: 8, rangeLow: -512 });
+    expect(line(7, 0)).toMatchObject({ prefix: '1011', rangeLen: 5 });
+    expect(line(7, 32)).toMatchObject({ prefix: '11100', rangeLen: 5 });
+    expect(line(7, 64)).toMatchObject({ prefix: '11101', rangeLen: 6 });
+    expect(line(7, 128)).toMatchObject({ prefix: '1100', rangeLen: 7 });
+    expect(line(7, 256)).toMatchObject({ prefix: '001', rangeLen: 8 });
+    expect(line(7, 1024)).toMatchObject({ prefix: '011', rangeLen: 10 });
+    expect(line(7, 2048)).toMatchObject({ prefix: '11111', rangeLen: 32 });
+  });
+
+  it('writes the long lines of B.10 in six bits', () => {
+    expect(line(10, 134)).toMatchObject({ prefix: '111000', rangeLen: 6 });
+    expect(line(10, 1094)).toMatchObject({ prefix: '111100', rangeLen: 10 });
+    expect(line(10, 2118)).toMatchObject({ prefix: '1111101', rangeLen: 11 });
+  });
+
+  it('leaves no string of bits unread in any of the fifteen', () => {
+    // A prefix code the tables fill completely: its lengths sum to exactly one
+    // by Kraft. A line missing or a length wrong leaves a hole, which is how
+    // both of the broken tables above could have been found.
+    for (let n = 1; n <= 15; n++) {
+      const sum = standardTableCodes(n).reduce((s, l) => s + 2 ** -l.prefix.length, 0);
+      expect(sum, `B.${String(n)}`).toBe(1);
+    }
+  });
+});
+
+describe('the statistics a symbol dictionary starts from (§7.4.3.2)', () => {
+  const left = (state: number): BitmapContexts => {
+    const generic = newContexts(1 << 16);
+    const refine = newContexts(1 << 13);
+    generic.i[0] = state;
+    refine.i[0] = state;
+    return { generic, refine };
+  };
+
+  it('starts from nothing unless its flags say it uses the context', () => {
+    const kept = new Map([[1, left(7)]]);
+    expect(startingContexts(false, [1], kept).generic.i[0]).toBe(0);
+  });
+
+  it('starts from what the LAST dictionary it names was left with', () => {
+    // bitmap-symbol-context-reuse.pdf's last dictionary names the three before
+    // it, and it is the third's statistics its bitmaps were coded against.
+    const kept = new Map([
+      [1, left(7)],
+      [3, left(9)],
+    ]);
+    expect(startingContexts(true, [1, 2, 3], kept).generic.i[0]).toBe(9);
+    expect(startingContexts(true, [1, 2, 3], kept).refine.i[0]).toBe(9);
+    // A dictionary that kept nothing is passed over for one that did.
+    expect(startingContexts(true, [3, 2], kept).generic.i[0]).toBe(9);
+    expect(startingContexts(true, [2], kept).generic.i[0]).toBe(0);
+  });
+
+  it('starts from a copy, which the next to start there does not see', () => {
+    // Two dictionaries start from the first one's statistics; the first of
+    // them does not keep its own, and the second must not begin where it ended.
+    const kept = new Map([[1, left(7)]]);
+    const first = startingContexts(true, [1], kept);
+    first.generic.i[0] = 30;
+    expect(startingContexts(true, [1], kept).generic.i[0]).toBe(7);
+  });
+});

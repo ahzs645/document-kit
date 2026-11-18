@@ -1,0 +1,751 @@
+// §9.6.6 — a composite font read by glyph index says nothing about its
+// characters: `/Encoding /Identity-H` makes every code a CID, a subset program
+// has had its `cmap` stripped, and `/ToUnicode` is absent or unusable. There is
+// no text to recover and there is a shape, so the glyph is DRAWN.
+//
+// Eleven files of the pdf.js corpus are exactly this and every one of them came
+// back a blank sheet — complex_ttf_font.pdf is eight lines of Arabic.
+
+import { readFileSync } from 'node:fs';
+
+import { describe, expect, it } from 'vitest';
+
+import { EMPTY_TO_UNICODE, numberedProgram, robotoGlyph } from './fixtures/numbered-truetype';
+import type { PdfDict } from '../../src/ream/pdf/objects';
+import type { ContentFont, PathSeg } from '../../src/ream/pdf-reader/content';
+import { createConverter } from '../../src/ream/core/converter/facade';
+import { Ream } from '../../src/ream/core/converter/ream';
+import { PdfFile } from '../../src/ream/pdf-reader/document';
+import { readPdf } from '../../src/ream/pdf-reader/reader';
+import { buildContentFont } from '../../src/ream/pdf-reader/font';
+import { extractPageText } from '../../src/ream/pdf-reader/text';
+import { cffOutlineSource } from '../../src/ream/pdf-reader/cff-outline';
+import { type1Font } from '../../src/ream/pdf-reader/type1-outline';
+import { outlineSource, postGlyphNames } from '../../src/ream/pdf-reader/glyf-outline';
+import { macGlyphName } from '../../src/ream/pdf-reader/encodings';
+import { parseTtf } from '../../src/ream/core/font';
+
+const ROBOTO = new Uint8Array(readFileSync('tests/ream/fixtures/fonts/Roboto-Regular.ttf'));
+
+/** How many contours a letter of the face is drawn in. */
+const contoursOf = (letter: string): number =>
+  (
+    outlineSource(ROBOTO)?.path(parseTtf(ROBOTO).glyphForCodepoint(letter.codePointAt(0)!)) ?? []
+  ).filter((seg) => seg.op === 'move').length;
+
+/** How many contours the page's traced shapes hold between them. */
+const contours = (blocks: ReadonlyArray<{ kind: string }>): number =>
+  blocks
+    .flatMap((b) => {
+      const shape = (
+        b as { shape?: { geometry?: { custom?: { commands: Array<{ cmd: string }> } } } }
+      ).shape;
+      return shape?.geometry?.custom?.commands ?? [];
+    })
+    .filter((c) => c.cmd === 'move').length;
+
+/**
+ * The same program with its `cmap` renamed out of reach — which is what a
+ * subsetter leaves behind, and the whole reason a code can reach no character.
+ */
+function withoutCmap(): Uint8Array {
+  const out = Uint8Array.from(ROBOTO);
+  const count = (out[4]! << 8) | out[5]!;
+  for (let i = 0; i < count; i++) {
+    const at = 12 + i * 16;
+    if (String.fromCharCode(out[at]!, out[at + 1]!, out[at + 2]!, out[at + 3]!) !== 'cmap')
+      continue;
+    out[at] = 'z'.charCodeAt(0);
+    break;
+  }
+  return out;
+}
+
+/** The glyph index Roboto uses for one character. */
+function glyphFor(ch: string): number {
+  return parseTtf(ROBOTO).glyphForCodepoint(ch.codePointAt(0)!);
+}
+
+describe('glyph outlines (§9.6.6)', () => {
+  it('reads a glyph as contours in a one-unit em', () => {
+    const source = outlineSource(ROBOTO);
+    expect(source).toBeDefined();
+    const path = source?.path(glyphFor('A'));
+    expect(path).toBeDefined();
+    if (!path) return;
+    // A capital A is one closed outline plus the counter inside it.
+    expect(path.filter((s) => s.op === 'move').length).toBeGreaterThanOrEqual(2);
+    expect(path[0]?.op).toBe('move');
+    expect(path[path.length - 1]?.op).toBe('close');
+    const xs = path.flatMap((s) => (s.op === 'close' ? [] : [s.x]));
+    const ys = path.flatMap((s) => (s.op === 'close' ? [] : [s.y]));
+    // In a one-unit em an upper-case letter stands about 0.7 high and rests on
+    // the baseline; anything outside 0..1.2 means the scaling went wrong.
+    expect(Math.max(...ys)).toBeGreaterThan(0.55);
+    expect(Math.max(...ys)).toBeLessThan(1.2);
+    expect(Math.min(...ys)).toBeGreaterThan(-0.1);
+    expect(Math.max(...xs)).toBeLessThan(1.2);
+  });
+
+  it('gives nothing for a glyph the program does not hold', () => {
+    expect(outlineSource(ROBOTO)?.path(999999)).toBeUndefined();
+  });
+
+  it('is not offered for a program with no outlines this reads', () => {
+    // A CFF program under `/FontFile2` parses as an sfnt and carries no
+    // `glyf`/`loca` pair; its charstrings are a separate reading.
+    const header = Uint8Array.from([0x4f, 0x54, 0x54, 0x4f, 0, 0, 0, 0, 0, 0, 0, 0]);
+    expect(outlineSource(header)).toBeUndefined();
+  });
+
+  it('draws the glyphs of a font that cannot say what its characters are', () => {
+    const pdf = identityPdf(`<${hex4(glyphFor('A'))}${hex4(glyphFor('B'))}> Tj`);
+    const doc = Ream.parse(pdf);
+    const shapes = doc.flow.body.filter((b) => b.kind === 'shape');
+    // Both glyphs, every contour of each — drawn as the one word they stand in.
+    expect(contours(shapes)).toBe(contoursOf('A') + contoursOf('B'));
+    // Set at 40pt, a capital stands around 28pt tall.
+    for (const shape of shapes) {
+      expect(shape.shape.height).toBeGreaterThan(20);
+      expect(shape.shape.height).toBeLessThan(40);
+    }
+    // And it is drawn BECAUSE the text could not be read, which the
+    // reconstruction still says out loud.
+    expect(doc.losses.some((l) => /map to no character/u.test(l.detail))).toBe(true);
+  });
+
+  it('runs a CFF charstring for a face whose outlines are a program', () => {
+    // Adobe TN 5177 — a CFF glyph is not a table of points but a program on a
+    // stack machine, so reading one means running it.
+    // cff_bluescale_small_zones.pdf sets "Public Mobile" in one and came back a
+    // blank sheet.
+    const path = cffOutlineSource(squareCff())?.path(1);
+    expect(path).toBeDefined();
+    if (!path) return;
+    expect(path[0]?.op).toBe('move');
+    const xs = path.flatMap((seg) => (seg.op === 'close' ? [] : [seg.x]));
+    const ys = path.flatMap((seg) => (seg.op === 'close' ? [] : [seg.y]));
+    // The charstring draws a 500-unit square whose corner is at (100, 100),
+    // and a one-unit em divides all four by a thousand.
+    expect(Math.min(...xs)).toBeCloseTo(0.1, 6);
+    expect(Math.max(...xs)).toBeCloseTo(0.6, 6);
+    expect(Math.min(...ys)).toBeCloseTo(0.1, 6);
+    expect(Math.max(...ys)).toBeCloseTo(0.6, 6);
+  });
+
+  it('draws the two curves hflex and hflex1 state (TN 5177 §4.2)', () => {
+    // freeculture.pdf sets its page numbers in Caslon, whose "1" draws its
+    // foot serif with hflex: its second curve lost dx5, and every point after
+    // it stood 136 units left, the figure drawn in the left of its cell.
+    const small = (...vs: Array<number>): Array<number> => vs.map((v) => v + 139);
+    const run = (op: number, args: Array<number>): Array<PathSeg> =>
+      cffOutlineSource(
+        cffWith(Uint8Array.from([...small(100, 100), 21, ...small(...args), 12, op, 14])),
+      )?.path(1) ?? [];
+    const curves = (path: Array<PathSeg>) =>
+      path.flatMap((s) =>
+        s.op === 'cubic'
+          ? [[s.x1, s.y1, s.x2, s.y2, s.x, s.y].map((v) => Math.round(v * 1000))]
+          : [],
+      );
+    // hflex: dx1 dx2 dy2 dx3 dx4 dx5 dx6 — the second curve dx4 0, dx5 -dy2, dx6 0.
+    expect(curves(run(34, [10, 20, 30, 40, 50, 60, 70]))).toEqual([
+      [110, 100, 130, 130, 170, 130],
+      [220, 130, 280, 100, 350, 100],
+    ]);
+    // hflex1: dx1 dy1 dx2 dy2 dx3 dx4 dx5 dy5 dx6 — the second curve dx4 0,
+    // dx5 dy5, and dx6 back down to the line it began on.
+    expect(curves(run(36, [10, 5, 20, 15, 30, 40, 50, -10, 60]))).toEqual([
+      [110, 105, 130, 120, 160, 120],
+      [200, 120, 250, 110, 310, 100],
+    ]);
+  });
+
+  it('draws the glyphs of a CFF face embedded in a PDF', () => {
+    const pdf = identityPdf('<0001> Tj', undefined, squareCff(), 'FontFile3');
+    const doc = Ream.parse(pdf);
+    const shapes = doc.flow.body.filter((b) => b.kind === 'shape');
+    expect(shapes).toHaveLength(1);
+    // Half an em square, set at 40pt.
+    expect(shapes[0]?.shape.width).toBeCloseTo(20, 1);
+    expect(shapes[0]?.shape.height).toBeCloseTo(20, 1);
+  });
+
+  it('runs a Type 1 charstring out from under its two layers of encryption', () => {
+    // Adobe "Type 1 Font Format" §6–7 — `eexec` hides the private dictionary
+    // and every charstring inside it is encrypted again on its own, so reading
+    // one means undoing both and then running it.
+    const face = type1Font(squareType1());
+    expect(face).toBeDefined();
+    const path = face?.path('square');
+    expect(path).toBeDefined();
+    if (!path) return;
+    const xs = path.flatMap((seg) => (seg.op === 'close' ? [] : [seg.x]));
+    const ys = path.flatMap((seg) => (seg.op === 'close' ? [] : [seg.y]));
+    // `hsbw` puts the origin at the sidebearing, so the square drawn 100 to the
+    // right of a 50-unit sidebearing stands at 150, and its far side at 650.
+    expect(Math.min(...xs)).toBeCloseTo(0.15, 6);
+    expect(Math.max(...xs)).toBeCloseTo(0.65, 6);
+    expect(Math.min(...ys)).toBeCloseTo(0.1, 6);
+    expect(Math.max(...ys)).toBeCloseTo(0.6, 6);
+    // And the program's own `/Encoding` is read, which is all a face with no
+    // `/Differences` says about its codes.
+    expect(face?.encoding?.get(65)).toBe('square');
+  });
+
+  it('reads a code through the program’s own encoding where the font states none', () => {
+    // §9.6.6.1 — bug859204.pdf embeds a Type 1 News Gothic under
+    // `/Encoding /NULL`, which is no encoding there is, and its program puts
+    // `bullet` at 0x95. Read as Latin-1 that code was a control character, and
+    // every item of the page's list lost its bullet.
+    expect(type1Code('/Encoding /NULL', 0x95, squareType1('bullet', 0x95))).toBe('•');
+    // An encoding the font DOES state still has the say over the program's.
+    expect(type1Code('/Encoding /WinAnsiEncoding', 0x41, squareType1('bullet', 0x41))).toBe('A');
+  });
+
+  it('takes the glyph index out of a name that carries one', () => {
+    // A subsetter that drops a font's `cmap` renames its glyphs after their
+    // INDEX. bug1151216.pdf writes them `g24` and bug1027533.pdf `g0024`, which
+    // is the same number in hexadecimal — read as decimal its eight letters
+    // came back as eight different ones.
+    const gid = glyphFor('A');
+    for (const name of [`g${String(gid)}`, `g${gid.toString(16).padStart(4, '0')}`]) {
+      const doc = Ream.parse(simpleTruetypePdf(name));
+      const shapes = doc.flow.body.filter((b) => b.kind === 'shape');
+      expect(shapes).toHaveLength(1);
+      // A capital set at 40pt stands around 28pt tall.
+      expect(shapes[0]?.shape.height).toBeGreaterThan(20);
+      expect(shapes[0]?.shape.height).toBeLessThan(40);
+    }
+  });
+
+  it('reads four digits the way the font’s other index names read', () => {
+    // bug1151216.pdf names its glyphs `g24`, `g381` and `g1004`: decimal, all
+    // of them. Read as hexadecimal, `g1004` is glyph 4100, which its subset
+    // does not hold — five of its codes drew nothing and fell back to Latin-1.
+    const doc = Ream.parse(simpleTruetypePdf('g1004', '66 /g24'));
+    expect(doc.flow.body.filter((b) => b.kind === 'shape')).toHaveLength(1);
+  });
+
+  it('reaches a legacy eight-bit face by the NAME its program gives the glyph', () => {
+    // §9.6.6.4 — a TrueType with no `cmap` cannot be reached by character at
+    // all. What is left is the encoding's glyph NAME and the program's `post`
+    // table: TrueType_without_cmap.pdf is Masis, an Armenian face whose `i`
+    // draws ի. Read as text its line came back "'>in"; drawn by name it is the
+    // four letters the page shows.
+    const file = PdfFile.parse(legacyTruetypePdf());
+    const fonts = file.get(file.pages()[0]!.resources!, 'Font');
+    if (!(fonts instanceof Map)) throw new Error('the page has a font');
+    const font = buildContentFont(file, file.resolve(fonts.get('F0')!) as PdfDict);
+    // The name says `A` and the shape is whatever the foundry put there, so
+    // there is no text to recover…
+    expect(font.decode([65])).toBe('�');
+    // …and the shape is the one the program holds under that name.
+    expect(font.outline?.path(65)).toEqual(outlineSource(withoutCmap())?.path(glyphFor('A')));
+  });
+
+  it('knows the standard order a post index below 258 stands for', () => {
+    expect(macGlyphName(0)).toBe('.notdef');
+    expect(macGlyphName(36)).toBe('A');
+    expect(macGlyphName(76)).toBe('i');
+    expect(macGlyphName(257)).toBe('dcroat');
+    expect(macGlyphName(258)).toBeUndefined();
+    // …and the table itself, read out of a program that states names.
+    expect(postGlyphNames(ROBOTO)?.get('A')).toBe(glyphFor('A'));
+  });
+
+  it('reads a blank glyph as the space it is', () => {
+    // A subsetter names the space glyph after its index like every other, so
+    // its name says nothing and the glyph draws nothing — and dropped as
+    // unreadable it took the gaps between the words with it. TAMReview.pdf's
+    // figure labels came back "SystemFeatures".
+    const file = PdfFile.parse(simpleTruetypePdf(`g${String(glyphFor(' '))}`));
+    const fonts = file.get(file.pages()[0]!.resources!, 'Font');
+    expect(fonts).toBeInstanceOf(Map);
+    if (!(fonts instanceof Map)) return;
+    const font = buildContentFont(file, file.resolve(fonts.get('F0')!) as PdfDict);
+    expect(font.decode([65])).toBe(' ');
+    // A space is not artwork: nothing is drawn for it.
+    expect(font.outline?.path(65)).toBeUndefined();
+  });
+
+  it('keeps two bytes to a code under Identity-H whatever a /ToUnicode says', () => {
+    // §9.7.6.2 — the CMap the font NAMES says how wide a code is; a
+    // `/ToUnicode` is a second mapping and has no vote.
+    // issue11549_reduced.pdf ships one truncated mid-stream, and read as one
+    // byte every code split in half: each glyph came out preceded by the
+    // `.notdef` box that the leading zero drew.
+    const toUnicode =
+      '/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n' +
+      '1 begincodespacerange\n<00><ff>\nendcodespacerange\nendcmap end end';
+    const pdf = identityPdf(`<${hex4(glyphFor('A'))}${hex4(glyphFor('B'))}> Tj`, toUnicode);
+    const doc = Ream.parse(pdf);
+    // Two codes, so two glyphs — not four, and no `.notdef` among them.
+    expect(contours(doc.flow.body.filter((b) => b.kind === 'shape'))).toBe(
+      contoursOf('A') + contoursOf('B'),
+    );
+  });
+});
+
+describe('a page of drawn letters, in Markdown (§9.6.6)', () => {
+  /**
+   * TAMReview.pdf in small: four lines of letters the file names no character
+   * for — drawn, and a page for them — over a paragraph set in a face that
+   * names its own.
+   */
+  function drawnLettersPdf(): Uint8Array {
+    const word = [...'ABCDEFGH'].map((ch) => hex4(glyphFor(ch))).join('');
+    const drawn = [150, 130, 110, 90]
+      .map((y) => `BT /F0 12 Tf 20 ${String(y)} Td <${word}> Tj ET`)
+      .join('\n');
+    const prose =
+      'BT /F1 10 Tf 20 250 Td (The first line of a paragraph set in a face) Tj ' +
+      '0 -12 Td (that names its characters.) Tj ET';
+    const content = `${prose}\n${drawn}`;
+    return assemble([
+      '<< /Type /Catalog /Pages 2 0 R >>',
+      '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R ' +
+        '/Resources << /Font << /F0 5 0 R /F1 9 0 R >> >> >>',
+      `<< /Length ${String(content.length)} >>\nstream\n${content}\nendstream`,
+      '<< /Type /Font /Subtype /Type0 /BaseFont /Roboto /Encoding /Identity-H ' +
+        '/DescendantFonts [6 0 R] >>',
+      '<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Roboto /DW 600 ' +
+        '/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> ' +
+        '/FontDescriptor 7 0 R /CIDToGIDMap /Identity >>',
+      '<< /Type /FontDescriptor /FontName /Roboto /Flags 4 /ItalicAngle 0 /StemV 80 ' +
+        '/Ascent 900 /Descent -200 /CapHeight 700 /FontBBox [-500 -300 1500 1000] /FontFile2 8 0 R >>',
+      fontStreamObject(withoutCmap()),
+      '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    ]);
+  }
+  const reading = (losses: ReadonlyArray<{ detail: string }>): Array<string> =>
+    losses.filter((l) => /^PDF read as/u.test(l.detail)).map((l) => l.detail);
+
+  it('reads the page as the document it is without them', async () => {
+    // A page of drawn letters is kept where they stand, the only place a
+    // medium that shows them can put them. Markdown shows none — and from the
+    // page it had the readable lines left over a line to a paragraph:
+    // TAMReview.pdf's abstract came back cut at every line.
+    const doc = Ream.parse(drawnLettersPdf());
+    expect(reading(doc.losses)).toEqual([expect.stringMatching(/read as a PAGE/u)]);
+    const { bytes, losses } = await doc.convertWithReport('md');
+    const md = new TextDecoder().decode(bytes);
+    expect(md).toContain('The first line of a paragraph set in a face that names its characters.');
+    // The report names the reading the Markdown came from, and only that one.
+    expect(reading(losses)).toEqual([expect.stringMatching(/keeps only the text/u)]);
+    // The converter facade reads it the same way.
+    const viaFacade = await createConverter().convert(drawnLettersPdf(), { to: 'md' });
+    expect(new TextDecoder().decode(viaFacade.bytes)).toBe(md);
+  });
+
+  it('keeps the page for every medium that shows the letters', async () => {
+    const doc = Ream.parse(drawnLettersPdf());
+    expect(readPdf(drawnLettersPdf()).flowing).toBeTypeOf('function');
+    await doc.convert('md');
+    // Asking for Markdown changes nothing the document already is.
+    expect(reading(doc.losses)).toEqual([expect.stringMatching(/read as a PAGE/u)]);
+    const html = await doc.convertWithReport('html');
+    expect(reading(html.losses)).toEqual([expect.stringMatching(/read as a PAGE/u)]);
+  });
+});
+
+/**
+ * What `code` reads as in a simple Type 1 font whose dictionary carries
+ * `encoding` and whose `/FontFile` is `program`.
+ */
+function type1Code(encoding: string, code: number, program: Uint8Array): string {
+  const file = PdfFile.parse(
+    assemble([
+      '<< /Type /Catalog /Pages 2 0 R >>',
+      '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F0 4 0 R >> >> >>',
+      `<< /Type /Font /Subtype /Type1 /BaseFont /NewsGothicStd-Bold ${encoding} /FontDescriptor 5 0 R >>`,
+      '<< /Type /FontDescriptor /FontName /NewsGothicStd-Bold /Flags 32 /ItalicAngle 0 /StemV 80 ' +
+        '/Ascent 900 /Descent -200 /CapHeight 700 /FontBBox [0 0 1000 1000] /FontFile 6 0 R >>',
+      fontStreamObject(program),
+    ]),
+  );
+  const fonts = file.get(file.pages()[0]!.resources!, 'Font');
+  if (!(fonts instanceof Map)) throw new Error('the page has a font');
+  return buildContentFont(file, file.resolve(fonts.get('F0')!) as PdfDict).decode([code]);
+}
+
+/**
+ * A one-page PDF setting code 65 in a SIMPLE TrueType font whose `/Differences`
+ * name that code `name` — the shape of a subset whose `cmap` was dropped.
+ */
+function simpleTruetypePdf(name: string, more = ''): Uint8Array {
+  const content = 'BT /F0 40 Tf 20 40 Td (A) Tj ET';
+  return assemble([
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 4 0 R ' +
+      '/Resources << /Font << /F0 5 0 R >> >> >>',
+    `<< /Length ${String(content.length)} >>\nstream\n${content}\nendstream`,
+    '<< /Type /Font /Subtype /TrueType /BaseFont /Roboto /FirstChar 65 /LastChar 65 ' +
+      `/Widths [600] /FontDescriptor 6 0 R /Encoding << /Type /Encoding /Differences [65 /${name} ${more}] >> >>`,
+    '<< /Type /FontDescriptor /FontName /Roboto /Flags 4 /ItalicAngle 0 /StemV 80 ' +
+      '/Ascent 900 /Descent -200 /CapHeight 700 /FontBBox [-500 -300 1500 1000] /FontFile2 7 0 R >>',
+    fontStreamObject(withoutCmap()),
+  ]);
+}
+
+/**
+ * A one-page PDF setting code 65 in a SIMPLE TrueType whose program carries no
+ * `cmap` and which names nothing of its own — the shape of a legacy eight-bit
+ * face, reachable only through its encoding's glyph names.
+ */
+function legacyTruetypePdf(): Uint8Array {
+  const content = 'BT /F0 40 Tf 20 40 Td (A) Tj ET';
+  return assemble([
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 4 0 R ' +
+      '/Resources << /Font << /F0 5 0 R >> >> >>',
+    `<< /Length ${String(content.length)} >>\nstream\n${content}\nendstream`,
+    '<< /Type /Font /Subtype /TrueType /BaseFont /Masis /FirstChar 65 /LastChar 65 ' +
+      '/Widths [600] /FontDescriptor 6 0 R /Encoding /WinAnsiEncoding >>',
+    '<< /Type /FontDescriptor /FontName /Masis /Flags 32 /ItalicAngle 0 /StemV 80 ' +
+      '/Ascent 900 /Descent -200 /CapHeight 700 /FontBBox [-500 -300 1500 1000] /FontFile2 7 0 R >>',
+    fontStreamObject(withoutCmap()),
+  ]);
+}
+
+/**
+ * A Type 1 program of one glyph, `name`, drawing a 500-unit box — the smallest
+ * thing the charstring interpreter can be asked to run. Its own `/Encoding`
+ * puts the glyph at `code`.
+ */
+function squareType1(name = 'square', code = 65): Uint8Array {
+  const encrypt = (data: Uint8Array, key: number, lead: number): Uint8Array => {
+    let r = key;
+    const out = new Uint8Array(data.length + lead);
+    const plain = new Uint8Array(out.length);
+    plain.set(data, lead);
+    for (let i = 0; i < plain.length; i++) {
+      const p = plain[i]!;
+      const c = p ^ (r >> 8);
+      out[i] = c & 0xff;
+      r = ((out[i]! + r) * 52845 + 22719) & 0xffff;
+    }
+    return out;
+  };
+  const num = (v: number): Array<number> =>
+    v >= -107 && v <= 107
+      ? [v + 139]
+      : [255, (v >> 24) & 0xff, (v >> 16) & 0xff, (v >> 8) & 0xff, v & 0xff];
+  const charstring = Uint8Array.from([
+    ...num(50),
+    ...num(600),
+    13, // 50 600 hsbw — sidebearing, then the width
+    ...num(100),
+    ...num(100),
+    21, // 100 100 rmoveto
+    ...num(500),
+    6, // 500 hlineto
+    ...num(500),
+    7, // 500 vlineto
+    ...num(-500),
+    6, // -500 hlineto
+    9, // closepath
+    14, // endchar
+  ]);
+  const glyph = encrypt(charstring, 4330, 4);
+  const encoder = new TextEncoder();
+  const priv = [
+    ...encoder.encode('XXXXdup /Private 8 dict dup begin\n/lenIV 4 def\n/Subrs 0 array ND\n'),
+    ...encoder.encode(`/CharStrings 1 dict dup begin\n/${name} ${String(glyph.length)} RD `),
+    ...glyph,
+    ...encoder.encode(' ND\nend end\n'),
+  ];
+  // The first four bytes of the eexec plaintext are discarded on the way back.
+  const body = encrypt(Uint8Array.from(priv.slice(4)), 55665, 4);
+  const head = encoder.encode(
+    '%!PS-AdobeFont-1.0: Square\n/FontMatrix [0.001 0 0 0.001 0 0] readonly def\n' +
+      `/Encoding 256 array\ndup ${String(code)} /${name} put\nreadonly def\ncurrentdict end\ncurrentfile eexec\n`,
+  );
+  const out = new Uint8Array(head.length + body.length);
+  out.set(head, 0);
+  out.set(body, head.length);
+  return out;
+}
+
+/** Four hex digits, as a two-byte code is written in a shown string. */
+function hex4(code: number): string {
+  return code.toString(16).padStart(4, '0');
+}
+
+/**
+ * A one-page PDF setting `content` in Roboto through an `Identity-H` composite
+ * font — the shape of every file this feature exists for.
+ */
+function identityPdf(
+  show: string,
+  toUnicode?: string,
+  program?: Uint8Array,
+  key: 'FontFile2' | 'FontFile3' = 'FontFile2',
+): Uint8Array {
+  const content = `BT /F0 40 Tf 20 40 Td ${show} ET`;
+  const objects: Array<string | Uint8Array> = [
+    '<< /Type /Catalog /Pages 2 0 R >>',
+    '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+    '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 4 0 R ' +
+      '/Resources << /Font << /F0 5 0 R >> >> >>',
+    `<< /Length ${String(content.length)} >>\nstream\n${content}\nendstream`,
+    '<< /Type /Font /Subtype /Type0 /BaseFont /Roboto /Encoding /Identity-H ' +
+      `/DescendantFonts [6 0 R]${toUnicode !== undefined ? ' /ToUnicode 8 0 R' : ''} >>`,
+    '<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Roboto /DW 600 ' +
+      '/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> ' +
+      '/FontDescriptor 7 0 R /CIDToGIDMap /Identity >>',
+    '<< /Type /FontDescriptor /FontName /Roboto /Flags 4 /ItalicAngle 0 /StemV 80 ' +
+      `/Ascent 900 /Descent -200 /CapHeight 700 /FontBBox [-500 -300 1500 1000] /${key} 9 0 R >>`,
+    toUnicode !== undefined
+      ? `<< /Length ${String(toUnicode.length)} >>\nstream\n${toUnicode}\nendstream`
+      : '<< >>',
+    fontStreamObject(program ?? withoutCmap()),
+  ];
+  return assemble(objects);
+}
+
+/** The font-program object, whose body is the face's own bytes. */
+function fontStreamObject(program: Uint8Array): Uint8Array {
+  const head = new TextEncoder().encode(
+    `<< /Length ${String(program.length)} /Length1 ${String(program.length)} >>\nstream\n`,
+  );
+  const tail = new TextEncoder().encode('\nendstream');
+  const out = new Uint8Array(head.length + program.length + tail.length);
+  out.set(head, 0);
+  out.set(program, head.length);
+  out.set(tail, head.length + program.length);
+  return out;
+}
+
+/**
+ * A CFF program of two glyphs: `.notdef`, and one charstring drawing a
+ * 500-unit square at (100, 100) — the smallest thing the interpreter can run.
+ */
+function squareCff(): Uint8Array {
+  const int16 = (v: number): Array<number> => [28, (v >> 8) & 0xff, v & 0xff];
+  return cffWith(
+    Uint8Array.from([
+      ...[100 + 139, 100 + 139, 21], // 100 100 rmoveto
+      ...int16(500),
+      139,
+      5, // 500 0 rlineto
+      139,
+      ...int16(500),
+      5, // 0 500 rlineto
+      ...int16(-500),
+      139,
+      5, // -500 0 rlineto
+      14, // endchar
+    ]),
+  );
+}
+
+/** A CFF program of two glyphs: `.notdef`, and the one charstring given. */
+function cffWith(glyph: Uint8Array): Uint8Array {
+  const charStrings = index([Uint8Array.from([14]), glyph]);
+  const name = index([new TextEncoder().encode('Square')]);
+  const strings = index([]);
+  const gsubrs = index([]);
+  // The Top DICT holds one entry — `CharStrings` (operator 17) — written as a
+  // five-byte integer so its own size does not depend on the value.
+  const header = 4;
+  const dictSize = 6;
+  const top = index([new Uint8Array(dictSize)]);
+  const charStringsAt = header + name.length + top.length + strings.length + gsubrs.length;
+  const dict = Uint8Array.from([
+    29,
+    (charStringsAt >> 24) & 0xff,
+    (charStringsAt >> 16) & 0xff,
+    (charStringsAt >> 8) & 0xff,
+    charStringsAt & 0xff,
+    17,
+  ]);
+  const out = new Uint8Array(charStringsAt + charStrings.length);
+  out.set([1, 0, header, 1], 0);
+  out.set(name, header);
+  out.set(index([dict]), header + name.length);
+  out.set(strings, header + name.length + top.length);
+  out.set(gsubrs, header + name.length + top.length + strings.length);
+  out.set(charStrings, charStringsAt);
+  return out;
+}
+
+/** TN 5176 §5 — an INDEX over the given items, with one-byte offsets. */
+function index(items: ReadonlyArray<Uint8Array>): Uint8Array {
+  if (items.length === 0) return Uint8Array.from([0, 0]);
+  const offsets: Array<number> = [1];
+  for (const item of items) offsets.push((offsets[offsets.length - 1] ?? 1) + item.length);
+  const head = [items.length >> 8, items.length & 0xff, 1, ...offsets];
+  const body = items.reduce<Array<number>>((acc, item) => [...acc, ...item], []);
+  return Uint8Array.from([...head, ...body]);
+}
+
+/** Numbered objects, an xref built over their offsets, and a trailer. */
+function assemble(objects: ReadonlyArray<string | Uint8Array>): Uint8Array {
+  const encoder = new TextEncoder();
+  const parts: Array<Uint8Array> = [encoder.encode('%PDF-1.7\n')];
+  const offsets: Array<number> = [];
+  let at = parts[0]!.length;
+  objects.forEach((body, i) => {
+    offsets.push(at);
+    const open = encoder.encode(`${String(i + 1)} 0 obj\n`);
+    const bytes = typeof body === 'string' ? encoder.encode(body) : body;
+    const close = encoder.encode('\nendobj\n');
+    parts.push(open, bytes, close);
+    at += open.length + bytes.length + close.length;
+  });
+  let tail = `xref\n0 ${String(objects.length + 1)}\n0000000000 65535 f \n`;
+  for (const off of offsets) tail += `${String(off).padStart(10, '0')} 00000 n \n`;
+  tail += `trailer\n<< /Size ${String(objects.length + 1)} /Root 1 0 R >>\nstartxref\n${String(at)}\n%%EOF\n`;
+  parts.push(encoder.encode(tail));
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) {
+    out.set(p, off);
+    off += p.length;
+  }
+  return out;
+}
+
+describe('a TrueType program whose subsetter zeroed the glyphs it dropped', () => {
+  /** Roboto with the `loca` entry after `gid` written as zero, as TCPDF writes a dropped glyph's. */
+  const zeroedAfter = (gid: number): Uint8Array => {
+    const out = Uint8Array.from(ROBOTO);
+    const view = new DataView(out.buffer);
+    const count = view.getUint16(4);
+    const table = (tag: string): number => {
+      for (let i = 0; i < count; i++) {
+        const at = 12 + i * 16;
+        if (String.fromCharCode(...out.subarray(at, at + 4)) === tag) return view.getUint32(at + 8);
+      }
+      throw new Error(`no ${tag}`);
+    };
+    const long = view.getInt16(table('head') + 50) === 1;
+    const at = table('loca') + (gid + 1) * (long ? 4 : 2);
+    if (long) view.setUint32(at, 0);
+    else view.setUint16(at, 0);
+    return out;
+  };
+
+  it('reads a kept glyph to the next entry past its start', () => {
+    // bug1650302_reduced.pdf's dotless i and caron were read as empty, and
+    // with them the stem of its í and the whole of its ř.
+    const gid = glyphFor('A');
+    const whole = outlineSource(ROBOTO)?.path(gid);
+    expect(outlineSource(zeroedAfter(gid))?.path(gid)).toEqual(whole);
+  });
+});
+
+describe('a composite font whose CIDs are characters (§9.7.4.2)', () => {
+  /**
+   * "AB A" set as CIDs `cid(ch)`, which a `/CIDToGIDMap` stream routes onto
+   * Roboto's glyphs — the program's own `cmap` removed, as a subset leaves it.
+   */
+  const routed = (cid: (ch: string) => number): Uint8Array => {
+    const text = 'AB A';
+    const cids = [...text].map(cid);
+    const map = new Uint8Array((Math.max(...cids) + 1) * 2);
+    for (const ch of new Set(text)) {
+      const gid = glyphFor(ch);
+      map[cid(ch) * 2] = gid >> 8;
+      map[cid(ch) * 2 + 1] = gid & 0xff;
+    }
+    const shown = cids.map((c) => c.toString(16).padStart(4, '0')).join('');
+    const content = `BT /F0 12 Tf 20 40 Td <${shown}> Tj ET`;
+    const head = new TextEncoder().encode(`<< /Length ${String(map.length)} >>\nstream\n`);
+    const tail = new TextEncoder().encode('\nendstream');
+    const mapObject = new Uint8Array(head.length + map.length + tail.length);
+    mapObject.set(head, 0);
+    mapObject.set(map, head.length);
+    mapObject.set(tail, head.length + map.length);
+    return assemble([
+      '<< /Type /Catalog /Pages 2 0 R >>',
+      '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 4 0 R ' +
+        '/Resources << /Font << /F0 5 0 R >> >> >>',
+      `<< /Length ${String(content.length)} >>\nstream\n${content}\nendstream`,
+      '<< /Type /Font /Subtype /Type0 /BaseFont /Roboto /Encoding /Identity-H /DescendantFonts [6 0 R] >>',
+      '<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Roboto /DW 600 ' +
+        '/CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> ' +
+        '/FontDescriptor 7 0 R /CIDToGIDMap 9 0 R >>',
+      '<< /Type /FontDescriptor /FontName /Roboto /Flags 4 /FontFile2 8 0 R >>',
+      fontStreamObject(withoutCmap()),
+      mapObject,
+    ]);
+  };
+  const text = (pdf: Uint8Array): string => {
+    const file = PdfFile.parse(pdf);
+    return extractPageText(file, file.pages()[0]!)
+      .map((r) => r.text)
+      .join('');
+  };
+
+  it('reads them as the characters they are where U+0020 is the blank glyph', () => {
+    // TCPDF makes the CID the character's own Unicode value, and
+    // bug1650302_reduced.pdf's "Výbava na přání" came back as drawings.
+    expect(text(routed((ch) => ch.codePointAt(0)!))).toBe('AB A');
+  });
+
+  it('leaves them unread where the CIDs are glyph indices', () => {
+    // The space at 3, as the fonts such a producer subsets place it: read as
+    // characters, complex_ttf_font.pdf's Arabic would come back as `$&')`.
+    expect(text(routed((ch) => (ch === ' ' ? 3 : glyphFor(ch))))).toContain('\uFFFD');
+  });
+});
+
+describe('a TrueType program that numbers its glyphs (§9.6.6.4)', () => {
+  /** Codes 33–36 shown at 40pt in a simple TrueType over `program`, its `/ToUnicode` mapping nothing. */
+  const numberedPdf = (program: Uint8Array): Uint8Array => {
+    const content = 'BT /F0 40 Tf 20 40 Td <21222324> Tj ET';
+    return assemble([
+      '<< /Type /Catalog /Pages 2 0 R >>',
+      '<< /Type /Pages /Kids [3 0 R] /Count 1 >>',
+      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Contents 4 0 R ' +
+        '/Resources << /Font << /F0 5 0 R >> >> >>',
+      `<< /Length ${String(content.length)} >>\nstream\n${content}\nendstream`,
+      '<< /Type /Font /Subtype /TrueType /BaseFont /BTMOLE+Calibri /FirstChar 33 /LastChar 36 ' +
+        '/Widths [400 330 226 350] /FontDescriptor 6 0 R /ToUnicode 8 0 R >>',
+      '<< /Type /FontDescriptor /FontName /BTMOLE+Calibri /Flags 4 /ItalicAngle 0 /StemV 80 ' +
+        '/Ascent 900 /Descent -200 /CapHeight 700 /FontBBox [-500 -300 1500 1000] /FontFile2 7 0 R >>',
+      fontStreamObject(program),
+      `<< /Length ${String(EMPTY_TO_UNICODE.length)} >>\nstream\n${EMPTY_TO_UNICODE}\nendstream`,
+    ]);
+  };
+  const fontIn = (pdf: Uint8Array): ContentFont => {
+    const file = PdfFile.parse(pdf);
+    const fonts = file.get(file.pages()[0]!.resources!, 'Font');
+    if (!(fonts instanceof Map)) throw new Error('the page has a font');
+    return buildContentFont(file, file.resolve(fonts.get('F0')!) as PdfDict);
+  };
+
+  it('reads no character from its codes, and draws the glyph each one reaches', () => {
+    // comments.pdf's charts set their labels in Calibri subsets numbered so,
+    // under a `/ToUnicode` that maps nothing. Read as Latin-1,
+    // "string-validate-input" came back "=<6>?J+B:F>*:</+>?7-<".
+    const program = numberedProgram('st r');
+    const font = fontIn(numberedPdf(program));
+    expect(font.decode([33, 34, 35, 36])).toBe('\uFFFD'.repeat(4));
+    const source = outlineSource(program);
+    expect(font.outline?.path(33)).toEqual(source?.path(robotoGlyph('s')));
+    expect(font.outline?.path(36)).toEqual(source?.path(robotoGlyph('r')));
+    // Its space draws nothing, and nothing is traced for it.
+    expect(font.outline?.path(35)).toBeUndefined();
+    const doc = Ream.parse(numberedPdf(program));
+    const shapes = doc.flow.body.filter((b) => b.kind === 'shape');
+    expect(contours(shapes)).toBe(contoursOf('s') + contoursOf('t') + contoursOf('r'));
+    expect(doc.losses.some((l) => /map to no character/u.test(l.detail))).toBe(true);
+  });
+
+  it('reads Latin-1 where the program keeps its space at 32', () => {
+    expect(fontIn(numberedPdf(numberedProgram(' st r', 32))).decode([33])).toBe('!');
+  });
+
+  it('reads Latin-1 where the program names its glyphs', () => {
+    expect(fontIn(numberedPdf(numberedProgram('st r', 33, true))).decode([33])).toBe('!');
+  });
+});

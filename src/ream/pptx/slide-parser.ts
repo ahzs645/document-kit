@@ -1,0 +1,1544 @@
+// E-PPTX PX1–PX5 — slide shapes → positioned FlowDoc elements.
+//
+// A PresentationML slide (p:cSld/p:spTree) is a canvas of shapes. Under Route A
+// (epics.md) each shape becomes a floating element anchored at its EMU position,
+// reusing the docx drawing model and DrawingML readers.
+//   * PX1/PX2 — p:sp text boxes: own a:xfrm + direct a:rPr, else the placeholder
+//     cascade (geometry + master p:txStyles) for a p:ph with no own transform.
+//   * PX3 — p:pic floating images; p:sp visible geometry/fill/stroke (p:spPr).
+//   * PX4 — p:graphicFrame: a c:chart floating ChartBlock or an a:tbl Table.
+//   * PX5 — colours via the deck theme resolver; p:grpSp groups (a child→slide
+//     transform). Backgrounds + theme wiring live in pptx-reader.
+// Bullets/levels/alignment/anchor/autofit + hyperlinks come in PX6.
+
+import type {
+  Alignment,
+  BodyElement,
+  Border,
+  CellBorders,
+  CellMerge,
+  ChartBlock,
+  FloatAnchor,
+  ImageBlock,
+  Paragraph,
+  ParagraphProperties,
+  Run,
+  RunProperties,
+  ShapeBlock,
+  ShapeFill,
+  ShapeGeometry,
+  ShapeLine,
+  ShapeTextBody,
+  Table,
+  TableCell,
+  TableRow,
+} from '../core/document-model';
+import type { ColorResolver } from '../core/drawingml/colors';
+import type { ThemeFonts } from '../core/drawingml/theme-parser';
+import type { Loss, Pt, ResourceId } from '../core/ir';
+import type { PoNode } from '../core/po-helpers';
+import type { LevelBullet, PlaceholderCascade } from './placeholder-cascade';
+import type { PlaceholderRef, ShapeBoxEmu } from './sp-helpers';
+
+import type { TableStyleTheme } from './table-style';
+import { defaultColorResolver, placeholderColors, resolveColorNode } from '../core/drawingml/colors';
+import { isTextWarp } from '../core/drawingml/text-warp';
+import { FEATURES, emuToPt, pt } from '../core/ir';
+import {
+  poAttr,
+  poChildren,
+  poFindDescendant,
+  poIntAttr,
+  poIs,
+  poTag,
+  poText,
+} from '../core/po-helpers';
+import {
+  colorChangeOf,
+  parseCustGeom,
+  parseFill,
+  parseLine,
+  parsePrstGeom,
+  parseShadow,
+  parseSrcRect,
+  parseXfrm,
+  statesFill,
+  styleRefFill,
+  styleRefFontColor,
+  styleRefLine,
+  withStatedDirection,
+} from '../word/drawing-parser';
+import {
+  lineSpacing,
+  parseBullet,
+  spacingFractions,
+  spacingFromLineFraction,
+} from './placeholder-cascade';
+import { boxFromXfrm, parsePh, parseXfrmBox, rPrToRunProps } from './sp-helpers';
+import {
+  cellStyle,
+  lineBorder,
+  tableStyleFlags,
+  tableStyleId,
+  withCellStyle,
+  withoutFill,
+} from './table-style';
+
+const CHART_URI = 'http://schemas.openxmlformats.org/drawingml/2006/chart';
+const OLE_URI = 'http://schemas.openxmlformats.org/presentationml/2006/ole';
+const TABLE_URI = 'http://schemas.openxmlformats.org/drawingml/2006/table';
+const DIAGRAM_URI = 'http://schemas.openxmlformats.org/drawingml/2006/diagram';
+
+/**
+ * Per-slide parsing context: the placeholder cascade (PX2), an image resolver
+ * that turns a slide-scoped relationship id (`a:blip @r:embed`) into a
+ * {@link ResourceId} (PX3a), and a chart resolver that parses a referenced chart
+ * part (`c:chart @r:id`) and returns its document-unique key (PX4a). All optional
+ * — a bare slide needs none.
+ */
+export interface SlideContext {
+  readonly cascade?: PlaceholderCascade;
+  /** A slide-scoped blip relationship id (`a:blip @r:embed`) → a stored resource (PX3a). */
+  readonly resolveImage?: (relId: string) => ResourceId | undefined;
+  /** The deck theme's fill style lists, for a `p:bgRef` on this slide. */
+  readonly themeFills?: ThemeFillStyles;
+  /**
+   * §20.1.4.1.16 — the two typefaces the deck's theme names. A run states its
+   * own by TOKEN (`+mn-lt`) more often than by name.
+   */
+  readonly themeFonts?: ThemeFonts;
+  /** §20.1.4.1.21 `a:lnStyleLst` — the widths an `a:lnRef` indexes, in points. */
+  readonly themeLineWidths?: ReadonlyArray<number>;
+  /**
+   * §19.3.1.43 — the slide's own background fill, which a shape marked
+   * `useBgFill` is painted with.
+   */
+  readonly backgroundFill?: ShapeFill;
+  /** The slide's size, which says WHERE that background lies under a shape. */
+  readonly slideSize?: { readonly widthPt: Pt; readonly heightPt: Pt };
+  /**
+   * §19.3.2.4 — the picture an embedded object shows, by the `@spid` of its
+   * shape in the slide's legacy VML drawing.
+   */
+  readonly resolveOlePreview?: (spid: string) => ResourceId | undefined;
+  /**
+   * §20.1.4.2.24 — the `a:tblStyle` a table names by GUID, from the deck's
+   * `tableStyles.xml`. A table that names none wears none.
+   */
+  readonly resolveTableStyle?: (styleId: string | undefined) => PoNode | undefined;
+  /** A chart relationship id (`c:chart @r:id`) → its document-unique key (PX4a). */
+  readonly resolveChart?: (relId: string) => string | undefined;
+  /**
+   * The deck's colour resolver (master theme palette, PX5); defaults to the
+   * Office palette when absent.
+   */
+  readonly colors?: ColorResolver;
+  /** A run hyperlink (`a:hlinkClick @r:id`) → its external URL (PX6). */
+  readonly resolveHyperlink?: (relId: string) => string | undefined;
+  /**
+   * A SmartArt data relationship (`dgm:relIds @r:dm`) → the diagram's pre-rendered
+   * drawing override (its `dsp:spTree`), or `undefined` when the file ships no
+   * override (E-SMARTART SA0).
+   */
+  readonly resolveDiagram?: (
+    relId: string,
+    frame: { readonly cx: number; readonly cy: number },
+  ) => PoNode | undefined;
+  /**
+   * Sink for graceful-degradation notices (E-SMARTART SA3): a SmartArt that
+   * declares a diagram but ships no drawing override records a dropped-feature
+   * {@link Loss} here rather than vanishing without a trace.
+   */
+  readonly onLoss?: (loss: Loss) => void;
+}
+
+type LinkResolver = ((relId: string) => string | undefined) | undefined;
+
+const ALGN_TO_ALIGNMENT: Readonly<Record<string, Alignment>> = {
+  l: 'left',
+  ctr: 'center',
+  r: 'right',
+  just: 'both',
+  dist: 'distribute',
+};
+
+const RECT_GEOMETRY: ShapeGeometry = { kind: 'preset', preset: 'rect', adjust: new Map() };
+
+// A group transform maps a child-space EMU box to slide-space EMU (PX5c): a
+// p:grpSp positions its children in its own coordinate frame (a:chOff/a:chExt),
+// which scales + offsets onto the group's slide box (a:off/a:ext).
+type GroupTransform = (box: ShapeBoxEmu) => ShapeBoxEmu;
+const IDENTITY_TRANSFORM: GroupTransform = (box) => box;
+
+/**
+ * Walk a shape container (`p:spTree` or a `p:grpSp`), turning each `p:sp` into a
+ * floating text/graphic shape, each `p:pic` into a floating image, each
+ * `p:graphicFrame` into a chart/table, and recursing into nested `p:grpSp` groups
+ * (composing their transforms).
+ *
+ * @param container The shape container node.
+ * @param ctx       The per-slide parsing context.
+ * @param transform Maps child-space boxes to the slide (identity at the top level).
+ * @returns The container's shapes as positioned {@link BodyElement}s.
+ */
+export function parseSlideShapes(
+  container: PoNode,
+  ctx: SlideContext = {},
+  transform: GroupTransform = IDENTITY_TRANSFORM,
+  skipPlaceholders = false,
+): Array<BodyElement> {
+  const out: Array<BodyElement> = [];
+  for (const child of poChildren(container)) {
+    // On a master or a layout, a placeholder is a PROTOTYPE — the geometry and
+    // text properties a slide's own placeholder inherits (PX2), and its text is
+    // the prompt PowerPoint shows while editing. Drawn as a shape it would put
+    // "Click to edit Master title style" on every slide.
+    if (skipPlaceholders && isPlaceholder(child)) continue;
+    // §19.3.1.19 `p:cxnSp` — a connector is a shape without text: the same
+    // `p:spPr` and `p:style`, so the same path draws it. Anything drawn with
+    // PowerPoint's line and arrow tools is one, and skipped it left a diagram's
+    // boxes with nothing between them.
+    if (poIs(child, 'p:sp') || poIs(child, 'p:cxnSp')) {
+      const shape = parseSp(child, ctx, transform);
+      if (shape) out.push({ kind: 'shape', shape });
+    } else if (poIs(child, 'p:pic')) {
+      // §19.3.1.37 — a picture may name a GEOMETRY of its own, and then it is
+      // CLIPPED to it: crop-to-shape.pptx is one photograph in an ellipse. That
+      // is the same thing as a shape wearing a picture fill, and the shape path
+      // already draws one, so the picture is handed to it rather than given a
+      // clip of its own. Drawn as a plain rectangle the ellipse was square.
+      const clipped = pictureAsShape(child);
+      const shape = clipped ? parseSp(clipped, ctx, transform) : undefined;
+      if (shape) {
+        out.push({ kind: 'shape', shape });
+      } else {
+        const image = parsePic(child, ctx, transform);
+        if (image) out.push({ kind: 'image', image });
+      }
+    } else if (poIs(child, 'p:graphicFrame')) {
+      out.push(...parseGraphicFrame(child, ctx, transform));
+    } else if (poIs(child, 'p:grpSp')) {
+      out.push(
+        ...parseSlideShapes(child, ctx, composeGroupTransform(child, transform), skipPlaceholders),
+      );
+    }
+  }
+  return out;
+}
+
+/**
+ * A `p:pic` that names a geometry of its own, rewritten as the `p:sp` it is.
+ *
+ * A picture holds its `p:blipFill` BESIDE `p:spPr`; a shape holds its fill
+ * INSIDE it, under the drawing namespace. Moving the one into the other is the
+ * whole difference, and it buys the shape path entire — the geometry, the
+ * outline, the crop, the recolour — instead of a second clipper that would
+ * drift from it.
+ *
+ * @param pic The `p:pic` node.
+ * @returns The equivalent `p:sp`, or undefined when the picture is a plain
+ *          rectangle and wants no clipping at all.
+ */
+function pictureAsShape(pic: PoNode): PoNode | undefined {
+  const spPr = poChildren(pic).find((c) => poIs(c, 'p:spPr'));
+  const prst = spPr ? poChildren(spPr).find((c) => poIs(c, 'a:prstGeom')) : undefined;
+  const custom = spPr ? poChildren(spPr).find((c) => poIs(c, 'a:custGeom')) : undefined;
+  const shape = poAttr(prst, 'prst');
+  // A rectangle is what a picture is drawn in anyway, and the plain image path
+  // measures and embeds one far more directly than a filled shape would.
+  if (custom === undefined && (shape === undefined || shape === 'rect')) return undefined;
+  const blipFill = poChildren(pic).find((c) => poIs(c, 'p:blipFill'));
+  if (!blipFill || !spPr) return undefined;
+  const nv = poChildren(pic).find((c) => poIs(c, 'p:nvPicPr'));
+  return {
+    'p:sp': [
+      ...(nv ? [{ 'p:nvSpPr': poChildren(nv) } as PoNode] : []),
+      { 'p:spPr': [{ 'a:blipFill': poChildren(blipFill) } as PoNode, ...poChildren(spPr)] },
+    ],
+  };
+}
+
+/** Whether a shape properties node has an `a:ln` that states its own fill. */
+function statesLineFill(spPr: PoNode): boolean {
+  const ln = poChildren(spPr).find((c) => poIs(c, 'a:ln'));
+  return (
+    ln !== undefined &&
+    poChildren(ln).some(
+      (c) =>
+        poIs(c, 'a:noFill') ||
+        poIs(c, 'a:solidFill') ||
+        poIs(c, 'a:gradFill') ||
+        poIs(c, 'a:pattFill'),
+    )
+  );
+}
+
+/** A line's stated properties, ready to spread over the ones it inherits. */
+function definedProps(line: ShapeLine): Partial<ShapeLine> {
+  return Object.fromEntries(Object.entries(line).filter(([, v]) => v !== undefined));
+}
+
+/**
+ * Whether a shape is a placeholder — `p:ph` in its OWN non-visual properties.
+ * Read as "anywhere below", a group holding one would take the whole group
+ * with it.
+ */
+function isPlaceholder(shape: PoNode): boolean {
+  const nv = poChildren(shape).find((c) => poTag(c)?.startsWith('p:nv') === true);
+  const nvPr = nv ? poChildren(nv).find((c) => poIs(c, 'p:nvPr')) : undefined;
+  return nvPr !== undefined && poChildren(nvPr).some((c) => poIs(c, 'p:ph'));
+}
+
+// p:grpSpPr/a:xfrm → a child→slide transform composed under the parent's. No (or
+// degenerate) xfrm leaves the parent transform unchanged.
+function composeGroupTransform(grpSp: PoNode, parent: GroupTransform): GroupTransform {
+  const grpSpPr = poChildren(grpSp).find((c) => poIs(c, 'p:grpSpPr'));
+  const xfrm = grpSpPr ? poChildren(grpSpPr).find((c) => poIs(c, 'a:xfrm')) : undefined;
+  if (!xfrm) return parent;
+  const off = poChildren(xfrm).find((c) => poIs(c, 'a:off'));
+  const ext = poChildren(xfrm).find((c) => poIs(c, 'a:ext'));
+  const chOff = poChildren(xfrm).find((c) => poIs(c, 'a:chOff'));
+  const chExt = poChildren(xfrm).find((c) => poIs(c, 'a:chExt'));
+  const extCx = ext ? poIntAttr(ext, 'cx') : undefined;
+  const extCy = ext ? poIntAttr(ext, 'cy') : undefined;
+  const chExtCx = chExt ? poIntAttr(chExt, 'cx') : undefined;
+  const chExtCy = chExt ? poIntAttr(chExt, 'cy') : undefined;
+  if (!extCx || !extCy || !chExtCx || !chExtCy) return parent;
+  const offX = (off ? poIntAttr(off, 'x') : undefined) ?? 0;
+  const offY = (off ? poIntAttr(off, 'y') : undefined) ?? 0;
+  const chOffX = (chOff ? poIntAttr(chOff, 'x') : undefined) ?? 0;
+  const chOffY = (chOff ? poIntAttr(chOff, 'y') : undefined) ?? 0;
+  const sx = extCx / chExtCx;
+  const sy = extCy / chExtCy;
+  return (box) =>
+    parent({
+      x: offX + (box.x - chOffX) * sx,
+      y: offY + (box.y - chOffY) * sy,
+      cx: box.cx * sx,
+      cy: box.cy * sy,
+    });
+}
+
+// A page-absolute float anchor at the shape's EMU offset (the slide is the page).
+function floatAt(box: ShapeBoxEmu): FloatAnchor {
+  return {
+    wrap: 'none',
+    posH: { relativeFrom: 'page', offsetPt: emuToPt(box.x) },
+    posV: { relativeFrom: 'page', offsetPt: emuToPt(box.y) },
+  };
+}
+
+// p:sp or p:cxnSp → a floating shape: its geometry, fill and stroke (PX3), plus a text body
+// (PX1/PX2). The box comes from the shape's own a:xfrm, else (for a placeholder)
+// the cascade. Undefined when there is no geometry, or the shape is entirely
+// invisible (no fill, no stroke, no text).
+function parseSp(sp: PoNode, ctx: SlideContext, transform: GroupTransform): ShapeBlock | undefined {
+  const ph = parsePh(sp);
+  const colors = ctx.colors ?? defaultColorResolver;
+  const spPr = poChildren(sp).find((c) => poIs(c, 'p:spPr'));
+  let own: ShapeBoxEmu | undefined = parseXfrmBox(spPr);
+  if (!own && ph && ctx.cascade) own = ctx.cascade.geometryFor(ph);
+  if (!own) return undefined;
+  const box = transform(own);
+
+  // §20.1.4.2.10/§20.1.4.2.19/§20.1.4.2.14 — a shape drawn from a gallery keeps
+  // its fill, its outline and the colour of its TEXT in `p:style` and carries
+  // none of them in `spPr`: customGeo's title banner and the ellipse under it
+  // are a theme gradient each, and read from `spPr` alone they were an empty
+  // outline and nothing at all.
+  const style = poChildren(sp).find((c) => poIs(c, 'p:style'));
+  const txBody = poChildren(sp).find((c) => poIs(c, 'p:txBody'));
+  // The style's colour is read BEFORE the text, because it belongs UNDER the
+  // run's own and OVER the deck's default: themes.pptx's green box asks for
+  // `lt1`, and stamped on afterwards it lost to the `tx1` every run inherits
+  // from `p:defaultTextStyle` — white text drawn black on green.
+  const styleColor = style ? styleRefFontColor(style, colors) : undefined;
+  const text = txBody
+    ? parseTxBody(txBody, ph, ctx.cascade, colors, ctx.resolveHyperlink, styleColor, ctx.themeFonts)
+    : undefined;
+
+  // Geometry/fill/stroke from p:spPr via the shared DrawingML readers, resolving
+  // colours through the deck's theme palette (PX5).
+  // A placeholder inherits what it does not state — its geometry, its fill and
+  // its outline — from the prototype in the layout, else the master.
+  // tdf95932's slide holds one placeholder with a word in it; the green
+  // rounded panel it sits on, and the white the word is written in, are both
+  // the layout's, and without the panel the word was white on white.
+  const protos = ph && ctx.cascade ? ctx.cascade.shapePropsFor(ph) : [];
+  // Per PROPERTY, nearest first: the shape's own, then the layout's prototype,
+  // then the master's. A prototype that states a box and nothing else must not
+  // stop the search for a fill.
+  const from = (states: (n: PoNode) => boolean): PoNode | undefined =>
+    spPr && states(spPr) ? spPr : (protos.find(states) ?? spPr);
+  /** What the shape states ITSELF, before anything is inherited. */
+  const stated = (states: (n: PoNode) => boolean): PoNode | undefined =>
+    spPr && states(spPr) ? spPr : undefined;
+  /** …and what a prototype lends it, nearest first. */
+  const lent = (states: (n: PoNode) => boolean): PoNode | undefined => protos.find(states);
+  const geomFrom = from(statesGeometry);
+  const geometry = parseGeometry(geomFrom);
+  // §19.3.1.43 `p:sp@useBgFill` — the shape is filled with the SLIDE's
+  // background, which is how a deck cuts a hole in the decoration above it:
+  // tdf93868's master lays a white rectangle over the whole slide and then a
+  // rounded one on top that lets the slide's black gradient back through.
+  const useBgFill = poAttr(sp, 'useBgFill') === '1';
+  const themeStyles = ctx.themeFills
+    ? { fills: ctx.themeFills.fills, bgFills: ctx.themeFills.backgrounds }
+    : undefined;
+  // §19.3.1.36 — what the shape says about itself outranks what it inherits,
+  // and its `p:style` reference is one of the things it SAYS: customGeo's title
+  // names a blue gallery fill while the master's prototype is grey, and reading
+  // the prototype first painted it grey.
+  const ownFill = stated(statesFill);
+  const styleFill = style ? styleRefFill(style, colors, themeStyles) : undefined;
+  const lentFill = lent(statesFill);
+  const resolved: ShapeFill = useBgFill
+    ? backgroundThrough(ctx.backgroundFill, box, ctx.slideSize)
+    : ownFill
+      ? parseFill(ownFill, colors, ctx.resolveImage)
+      : styleFill && styleFill.kind !== 'none'
+        ? styleFill
+        : lentFill
+          ? parseFill(lentFill, colors, ctx.resolveImage)
+          : spPr
+            ? parseFill(spPr, colors, ctx.resolveImage)
+            : { kind: 'none' };
+  // …and whichever of those it came from, a bare `a:gradFill` on the shape
+  // turns it: the colours are the style's, the direction is the shape's.
+  const styled = withStatedDirection(resolved, spPr);
+  const lineFrom = from((n) => poChildren(n).some((c) => poIs(c, 'a:ln')));
+  let line = lineFrom ? parseLine(lineFrom, colors) : undefined;
+  const fromStyle = style ? styleRefLine(style, colors, ctx.themeLineWidths) : undefined;
+  if (fromStyle) {
+    line = line ? { ...fromStyle, ...definedProps(line) } : fromStyle;
+  } else if (line && lineFrom && !statesLineFill(lineFrom)) {
+    // §20.1.2.2.24 — an `a:ln` with no fill of its own, such as a bare width, says
+    // nothing about the colour. It comes from further up, and with nothing up
+    // there the shape has no outline: drawn anyway, it came out black.
+    const lentLine = protos.find(statesLineFill);
+    const lentProps = lentLine ? parseLine(lentLine, colors) : undefined;
+    line = lentProps ? { ...lentProps, ...definedProps(line) } : undefined;
+  }
+  // §20.1.8.40 `a:outerShdw` — the shadow a shape casts, which the pptx path
+  // read for a diagram's nodes and nowhere else: 547 of them across 37 decks
+  // went undrawn. It inherits like the fill does — tdf104015's title casts the
+  // master's.
+  const shadowFrom = from((n) => poChildren(n).some((c) => poIs(c, 'a:effectLst')));
+  const shadow = shadowFrom ? parseShadow(shadowFrom, colors) : undefined;
+  const visibleLine = line !== undefined && line.fill !== 'none';
+  if (!text && styled.kind === 'none' && !visibleLine) return undefined;
+
+  // §20.1.7.6 — a shape may be turned or mirrored in its box, and a slide says
+  // so on the same `a:xfrm` its position comes from. Unread, the blue triangle
+  // ArtisticEffectSample's layout stands on its side (`rot="5400000"`) pointed
+  // up instead of right.
+  const xfrm = spPr ? poChildren(spPr).find((c) => poIs(c, 'a:xfrm')) : undefined;
+  const spin = xfrm ? parseXfrm(xfrm) : undefined;
+
+  return {
+    float: floatAt(box),
+    width: emuToPt(box.cx),
+    height: emuToPt(box.cy),
+    geometry,
+    fill: styled,
+    ...(line ? { line } : {}),
+    ...(shadow ? { shadow } : {}),
+    ...(spin && Object.keys(spin).length > 0 ? { transform: spin } : {}),
+    ...(text ? { text } : {}),
+    paragraphProperties: {},
+  };
+}
+
+// p:graphicFrame → floating chart (c:chart, PX4a), table (a:tbl, PX4b) or a
+// SmartArt diagram's shapes (dgm, E-SMARTART SA0). Returns an array because a
+// diagram expands to many shapes; chart/table yield one element. The frame's
+// transform is p:xfrm (a:off + a:ext), not the a:xfrm of a shape.
+function parseGraphicFrame(
+  gf: PoNode,
+  ctx: SlideContext,
+  transform: GroupTransform,
+): Array<BodyElement> {
+  const own = boxFromXfrm(poChildren(gf).find((c) => poIs(c, 'p:xfrm')));
+  if (!own) return [];
+  const box = transform(own);
+  const graphicData = poFindDescendant(gf, 'a:graphicData');
+  const uri = graphicData ? poAttr(graphicData, 'uri') : undefined;
+
+  if (uri === CHART_URI) {
+    const cChart = poFindDescendant(gf, 'c:chart');
+    const relId = cChart ? poAttr(cChart, 'id') : undefined; // r:id
+    const key = relId !== undefined ? ctx.resolveChart?.(relId) : undefined;
+    if (key === undefined) return [];
+    const chart: ChartBlock = {
+      float: floatAt(box),
+      chartRelId: key,
+      width: emuToPt(box.cx),
+      height: emuToPt(box.cy),
+      paragraphProperties: {},
+    };
+    return [{ kind: 'chart', chart }];
+  }
+
+  if (uri === TABLE_URI) {
+    // §19.3.1.19 — a slide table stands where its FRAME says, like every other
+    // graphic on the slide: the same float anchor a docx floating table uses.
+    // Flowing it in-block put every table on the corpus at the top-left corner,
+    // over the title (table_test2, and two conference decks besides).
+    const tbl = poFindDescendant(gf, 'a:tbl');
+    if (!tbl) return [];
+    const table = parseTable(tbl, ctx.colors ?? defaultColorResolver, ctx.resolveTableStyle, {
+      ...(ctx.themeFills ? { fills: ctx.themeFills.fills } : {}),
+      ...(ctx.themeLineWidths ? { lineWidths: ctx.themeLineWidths } : {}),
+    });
+    return [
+      {
+        kind: 'table',
+        table: { ...table, properties: { ...table.properties, float: floatAt(box) } },
+      },
+    ];
+  }
+
+  // §19.3.2.4 — an embedded OLE object shows a snapshot of itself. Modern decks
+  // put a `p:pic` inside the `p:oleObj`; older ones point at a shape in the
+  // slide's VML drawing with `@spid`, and the picture hangs off that.
+  if (uri === OLE_URI) {
+    const oleObj = poFindDescendant(gf, 'p:oleObj');
+    if (!oleObj) return [];
+    const pic = poChildren(oleObj).find((c) => poIs(c, 'p:pic'));
+    if (pic) {
+      const image = parsePic(pic, ctx, transform);
+      return image ? [{ kind: 'image', image }] : [];
+    }
+    const spid = poAttr(oleObj, 'spid');
+    const resource = spid !== undefined ? ctx.resolveOlePreview?.(spid) : undefined;
+    if (resource === undefined) {
+      ctx.onLoss?.({
+        severity: 'dropped',
+        feature: FEATURES.images,
+        detail: 'embedded object with no preview picture — the object is not drawn',
+      });
+      return [];
+    }
+    return [
+      {
+        kind: 'image',
+        image: {
+          float: floatAt(box),
+          resource,
+          width: emuToPt(box.cx),
+          height: emuToPt(box.cy),
+          paragraphProperties: {},
+        },
+      },
+    ];
+  }
+
+  // SmartArt: render the pre-rendered drawing override (dsp:spTree) as floating
+  // shapes positioned within the frame box. No override ⇒ no shapes (SA0).
+  if (uri === DIAGRAM_URI) {
+    const relIds = poFindDescendant(gf, 'dgm:relIds');
+    const dmRelId = relIds ? poAttr(relIds, 'dm') : undefined; // r:dm → data part
+    // The frame the slide gives the diagram is what a layout computed from the
+    // data has to fill: how many boxes fit across it is the frame's question.
+    const spTree =
+      dmRelId !== undefined ? ctx.resolveDiagram?.(dmRelId, { cx: box.cx, cy: box.cy }) : undefined;
+    if (!spTree) {
+      // SmartArt is declared but ships no pre-rendered drawing override; record
+      // a graceful loss instead of silently dropping the diagram (SA3).
+      if (dmRelId !== undefined) ctx.onLoss?.(noDiagramOverrideLoss());
+      return [];
+    }
+    const drawn = parseDiagramDrawing(
+      spTree,
+      diagramTransform(spTree, box),
+      floatAt,
+      ctx.colors ?? defaultColorResolver,
+      ctx.resolveHyperlink,
+    );
+    // A drawing override that holds no shapes is a stub — the producer left the
+    // layout to the reader, which is the same position as having none at all.
+    if (drawn.length === 0) ctx.onLoss?.(noDiagramOverrideLoss());
+    return drawn.map((shape) => ({ kind: 'shape', shape }));
+  }
+  return [];
+}
+
+/**
+ * The diagram's child shapes live in the spTree's own coordinate space
+ * (`dsp:grpSpPr/a:xfrm` `chOff`/`chExt`); map that onto a target box (the frame on
+ * a slide, or the inline/anchored box in docx). Usually the child space equals
+ * the box, so the scale is 1. Shared by pptx and docx (E-SMARTART).
+ *
+ * @param spTree The diagram drawing's `dsp:spTree`.
+ * @param frame  The target box the diagram is placed into.
+ * @returns A transform mapping diagram-space boxes onto `frame`.
+ */
+export function diagramTransform(spTree: PoNode, frame: ShapeBoxEmu): GroupTransform {
+  const grpSpPr = poChildren(spTree).find((c) => poIs(c, 'dsp:grpSpPr'));
+  const xfrm = grpSpPr ? poChildren(grpSpPr).find((c) => poIs(c, 'a:xfrm')) : undefined;
+  const chOff = xfrm ? poChildren(xfrm).find((c) => poIs(c, 'a:chOff')) : undefined;
+  const chExt = xfrm ? poChildren(xfrm).find((c) => poIs(c, 'a:chExt')) : undefined;
+  const chExtCx = chExt ? poIntAttr(chExt, 'cx') : undefined;
+  const chExtCy = chExt ? poIntAttr(chExt, 'cy') : undefined;
+  const chOffX = (chOff ? poIntAttr(chOff, 'x') : undefined) ?? 0;
+  const chOffY = (chOff ? poIntAttr(chOff, 'y') : undefined) ?? 0;
+  const sx = chExtCx && chExtCx > 0 ? frame.cx / chExtCx : 1;
+  const sy = chExtCy && chExtCy > 0 ? frame.cy / chExtCy : 1;
+  return (b) => ({
+    x: frame.x + (b.x - chOffX) * sx,
+    y: frame.y + (b.y - chOffY) * sy,
+    cx: b.cx * sx,
+    cy: b.cy * sy,
+  });
+}
+
+/**
+ * A {@link Loss} for a SmartArt diagram that declares its data part but ships no
+ * pre-rendered drawing override (older files, or a generator that omitted the
+ * fallback). Ream renders the override rather than executing Office's layout
+ * engine, so without it the diagram can't be drawn — this records the gap as a
+ * dropped feature instead of letting it vanish. Shared by pptx and docx
+ * (E-SMARTART SA3).
+ *
+ * @param where Optional location tag for the loss report (e.g. `slide 3`).
+ */
+export function noDiagramOverrideLoss(where?: string): Loss {
+  return {
+    severity: 'dropped',
+    feature: FEATURES.smartArt,
+    detail:
+      'SmartArt diagram has no pre-rendered drawing override; its layout is not reconstructed',
+    ...(where ? { where } : {}),
+  };
+}
+
+/** One SmartArt node: the box it occupies in the target space, and its shape. */
+export interface DiagramNode {
+  readonly box: ShapeBoxEmu;
+  readonly shape: ShapeBlock;
+}
+
+/**
+ * Read a SmartArt drawing override (a `dsp:spTree`) into its nodes. The `dsp:`
+ * wrapper holds an ordinary `a:` `spPr`/`txBody`, so the shared DrawingML
+ * readers apply unchanged. Shared by pptx and docx (E-SMARTART); diagrams carry
+ * no placeholder cascade.
+ *
+ * @param spTree       The diagram drawing's `dsp:spTree`.
+ * @param transform    Maps each shape's diagram-space box to the target space.
+ * @param colors       The colour resolver for the shapes' fills/strokes/text.
+ * @param resolveLink  A run hyperlink resolver, or `undefined`.
+ * @param resolveImage Resolves a picture fill's `r:embed` against the DRAWING
+ *                     part's own relationships, or `undefined`.
+ * @returns The diagram's visible nodes, in drawing order.
+ */
+export function parseDiagramNodes(
+  spTree: PoNode,
+  transform: GroupTransform,
+  colors: ColorResolver,
+  resolveLink: LinkResolver,
+  resolveImage?: (relId: string) => ResourceId | undefined,
+): Array<DiagramNode> {
+  const out: Array<DiagramNode> = [];
+  for (const sp of poChildren(spTree)) {
+    if (!poIs(sp, 'dsp:sp')) continue;
+    const spPr = poChildren(sp).find((c) => poIs(c, 'dsp:spPr'));
+    const own = parseXfrmBox(spPr);
+    if (!own) continue;
+    const box = transform(own);
+
+    const txBody = poChildren(sp).find((c) => poIs(c, 'dsp:txBody'));
+    const parsed = txBody
+      ? parseTxBody(txBody, undefined, undefined, colors, resolveLink)
+      : undefined;
+    // §20.1.4.2.14 — a diagram node states its text colour nowhere in the runs;
+    // it is in the node's `dsp:style/a:fontRef`, and for the stock SmartArt
+    // galleries that is `lt1`. smartart.docx puts white labels on three blue
+    // boxes and we drew them black.
+    const geometry = parseGeometry(spPr);
+    const fill: ShapeFill = spPr ? parseFill(spPr, colors, resolveImage) : { kind: 'none' };
+    const text = parsed ? withDiagramFontColor(parsed, sp, colors, fill) : undefined;
+    const line = spPr ? parseLine(spPr, colors) : undefined;
+    const shadow = spPr ? parseShadow(spPr, colors) : undefined;
+    const visibleLine = line !== undefined && line.fill !== 'none';
+    if (!text && fill.kind === 'none' && !visibleLine) continue;
+
+    // §20.1.7.6 — a node may be turned in its box. fdo87488 stands one panel on
+    // end with `rot="5400000"` and we drew it lying down, twice as wide as the
+    // page. The LABEL does not turn with it: Word states the text's own frame
+    // in `dsp:txXfrm` precisely so it stays upright, so a turned node hands its
+    // text to a second, unturned box.
+    const xfrm = spPr ? poChildren(spPr).find((c) => poIs(c, 'a:xfrm')) : undefined;
+    const spin = xfrm ? parseXfrm(xfrm) : undefined;
+    const turned = (spin?.rotation60k ?? 0) % 21600000 !== 0;
+    const txBox = turned
+      ? boxFromXfrm(poChildren(sp).find((c) => poIs(c, 'dsp:txXfrm')))
+      : undefined;
+
+    out.push({
+      box,
+      shape: {
+        width: emuToPt(box.cx),
+        height: emuToPt(box.cy),
+        geometry,
+        fill,
+        ...(line ? { line } : {}),
+        ...(text && !txBox ? { text } : {}),
+        ...(spin && Object.keys(spin).length > 0 ? { transform: spin } : {}),
+        ...(shadow ? { shadow } : {}),
+        paragraphProperties: {},
+      },
+    });
+    if (text && txBox) {
+      const placed = transform(txBox);
+      out.push({
+        box: placed,
+        shape: {
+          width: emuToPt(placed.cx),
+          height: emuToPt(placed.cy),
+          geometry: RECT_GEOMETRY,
+          fill: { kind: 'none' },
+          text,
+          paragraphProperties: {},
+        },
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * The same nodes as free-standing floating shapes — what a slide wants, where
+ * every shape is anchored to the page.
+ *
+ * @param spTree      The diagram drawing's `dsp:spTree`.
+ * @param transform   Maps each shape's diagram-space box to the target space.
+ * @param makeFloat   Anchors a node's box.
+ * @param colors      The colour resolver for the shapes' fills/strokes/text.
+ * @param resolveLink A run hyperlink resolver, or `undefined`.
+ * @returns The diagram's visible shapes as positioned {@link ShapeBlock}s.
+ */
+export function parseDiagramDrawing(
+  spTree: PoNode,
+  transform: GroupTransform,
+  makeFloat: (box: ShapeBoxEmu) => FloatAnchor,
+  colors: ColorResolver,
+  resolveLink: LinkResolver,
+): Array<ShapeBlock> {
+  return parseDiagramNodes(spTree, transform, colors, resolveLink).map(({ box, shape }) => ({
+    ...shape,
+    float: makeFloat(box),
+  }));
+}
+
+// The text body with the node's `dsp:style/a:fontRef` colour filled in wherever
+// a run declares none.
+//
+// The font reference belongs to the STYLE, and its colour is chosen to sit on
+// the fill the style's `a:fillRef` names — white lettering for a filled node.
+// A node that paints itself something else keeps the colour anyway, EXCEPT
+// where the two are the same: tdf149551's gears state a white fill and a white
+// font reference, and the labels inside them were white on white.
+function withDiagramFontColor(
+  text: ShapeTextBody,
+  sp: PoNode,
+  colors: ColorResolver,
+  fill: ShapeFill,
+): ShapeTextBody {
+  const style = poChildren(sp).find((c) => poIs(c, 'dsp:style'));
+  const ref = style ? poChildren(style).find((c) => poIs(c, 'a:fontRef')) : undefined;
+  const child = ref ? poChildren(ref).find((c) => poTag(c) !== undefined) : undefined;
+  const colorHex = child ? resolveColorNode(child, colors) : undefined;
+  if (colorHex === undefined) return text;
+  if (fill.kind === 'solid' && fill.colorHex === colorHex) return text;
+  return {
+    ...text,
+    content: text.content.map((block) =>
+      block.kind === 'paragraph'
+        ? {
+            ...block,
+            paragraph: {
+              ...block.paragraph,
+              runs: block.paragraph.runs.map((run) =>
+                run.properties.colorHex === undefined
+                  ? { ...run, properties: { ...run.properties, colorHex } }
+                  : run,
+              ),
+            },
+          }
+        : block,
+    ),
+  };
+}
+
+/**
+ * The theme fill styles a `p:bgRef` indexes into (§19.3.1.2), as the raw nodes
+ * the fill readers take.
+ */
+export interface ThemeFillStyles {
+  /** `a:fillStyleLst` — what an index of 1…999 names. */
+  readonly fills: ReadonlyArray<PoNode>;
+  /** `a:bgFillStyleLst` — what an index past 1000 names, 1001 being the first. */
+  readonly backgrounds: ReadonlyArray<PoNode>;
+  /**
+   * A picture named inside a style belongs to the THEME part: the Office
+   * "Berlin" background is a photograph the theme carries and its `r:embed`
+   * means nothing in the master's relationships (corpus: tdf123684, where it
+   * resolved to a different image entirely).
+   */
+  readonly resolveImage?: (relId: string) => ResourceId | undefined;
+}
+
+/**
+ * `p:bg` → the background fill, or `undefined` when it declares none.
+ *
+ * Two spellings. `p:bgPr` carries the fill itself — solid, gradient, or a
+ * PICTURE, which needs the owning part's image resolver since the blip's
+ * relationship is scoped to the part the background is written in. `p:bgRef`
+ * (§19.3.1.2) carries no fill at all: an index into the theme's style lists and
+ * the colour to put wherever that style says `phClr`. Read as its colour alone
+ * — which is all this did — a deck whose theme opens with a black-to-grey
+ * gradient came out flat, and one whose first background slot is a picture came
+ * out a single colour.
+ *
+ * Used for the slide's own background and the inherited layout/master one (PX5b).
+ *
+ * @param bg           The `p:bg` node.
+ * @param colors       The deck's colour resolver.
+ * @param resolveImage Resolver for a picture background's relationship, scoped
+ *                     to the part this `p:bg` is written in.
+ * @param theme        The theme's fill style lists, for a `p:bgRef`.
+ */
+export function parseBackgroundFill(
+  bg: PoNode,
+  colors: ColorResolver,
+  resolveImage?: (relId: string) => ResourceId | undefined,
+  theme?: ThemeFillStyles,
+): ShapeFill | undefined {
+  const bgPr = poChildren(bg).find((c) => poIs(c, 'p:bgPr'));
+  if (bgPr) {
+    const fill = parseFill(bgPr, colors, resolveImage);
+    return fill.kind !== 'none' ? fill : undefined;
+  }
+  const bgRef = poChildren(bg).find((c) => poIs(c, 'p:bgRef'));
+  if (!bgRef) return undefined;
+  const child = poChildren(bgRef).find((c) => poTag(c) !== undefined);
+  const hex = child ? resolveColorNode(child, colors) : undefined;
+  const idx = poIntAttr(bgRef, 'idx');
+  const slot =
+    idx === undefined
+      ? undefined
+      : idx > 1000
+        ? theme?.backgrounds[idx - 1001]
+        : theme?.fills[idx - 1];
+  if (slot) {
+    // The slot is a whole fill in the theme's own vocabulary; read it with the
+    // shared reader, under a resolver where `phClr` is the colour named here.
+    const themed = parseFill(
+      { 'a:spPr': [slot] },
+      hex === undefined ? colors : placeholderColors(colors, hex),
+      theme?.resolveImage ?? resolveImage,
+    );
+    if (themed.kind !== 'none') return themed;
+  }
+  return hex === undefined ? undefined : { kind: 'solid', colorHex: hex };
+}
+
+/**
+ * A full-slide backdrop element for a background fill: a rectangle covering the
+ * page, anchored behind the content (PX5b).
+ *
+ * @param fill     The resolved background fill.
+ * @param widthPt  The page width in points.
+ * @param heightPt The page height in points.
+ */
+export function backdropElement(fill: ShapeFill, widthPt: Pt, heightPt: Pt): BodyElement {
+  return {
+    kind: 'shape',
+    shape: {
+      float: {
+        wrap: 'none',
+        behind: true,
+        posH: { relativeFrom: 'page', offsetPt: emuToPt(0) },
+        posV: { relativeFrom: 'page', offsetPt: emuToPt(0) },
+      },
+      width: widthPt,
+      height: heightPt,
+      geometry: RECT_GEOMETRY,
+      fill,
+      paragraphProperties: {},
+    },
+  };
+}
+
+// §19.3.1.43 — a shape that wears the slide's background wears the PIECE of it
+// that lies under the shape, not a copy squeezed into its box. A picture
+// background is stretched over the whole slide, so the destination rect is the
+// SLIDE stated in fractions of the shape (§20.1.8.30 `a:fillRect`, where a
+// negative inset reaches outside the box and the shape's own outline clips it
+// back). Squeezed, tdf123684's text box drew a little diagonal of its own.
+function backgroundThrough(
+  bg: ShapeFill | undefined,
+  box: ShapeBoxEmu,
+  slide: { readonly widthPt: Pt; readonly heightPt: Pt } | undefined,
+): ShapeFill {
+  if (!bg) return { kind: 'none' };
+  if (bg.kind !== 'picture' || !slide || box.cx <= 0 || box.cy <= 0) return bg;
+  const [x, y] = [emuToPt(box.x), emuToPt(box.y)];
+  const [w, h] = [emuToPt(box.cx), emuToPt(box.cy)];
+  return {
+    ...bg,
+    imageFillRect: {
+      left: -x / w,
+      top: -y / h,
+      right: -(slide.widthPt - x - w) / w,
+      bottom: -(slide.heightPt - y - h) / h,
+    },
+  };
+}
+
+/**
+ * The same element, painted BEHIND the slide's own content.
+ *
+ * §19.3.1 — a slide's shape tree is drawn over its layout's, and that over the
+ * master's; nothing a deck states once can bury what a slide puts on it. Our
+ * page paints by KIND (every image, then every shape), so without this a
+ * layout's white card landed on top of the photograph the slide is made of —
+ * themes.pptx's fifth slide is one picture and it vanished under the card.
+ *
+ * @param el The inherited element.
+ * @returns The element with its float sunk to the backdrop layer.
+ */
+export function asBackdrop(el: BodyElement): BodyElement {
+  const sink = <T extends { readonly float?: FloatAnchor }>(item: T): T =>
+    item.float ? { ...item, float: { ...item.float, behind: true } } : item;
+  switch (el.kind) {
+    case 'shape':
+      return { ...el, shape: sink(el.shape) };
+    case 'image':
+      return { ...el, image: sink(el.image) };
+    case 'table':
+      return { ...el, table: { ...el.table, properties: sink(el.table.properties) } };
+    case 'chart':
+      return { ...el, chart: sink(el.chart) };
+    default:
+      return el;
+  }
+}
+
+/**
+ * `p:spPr` geometry: `a:prstGeom` (preset) or `a:custGeom` (custom path), default
+ * rect. Exported for sheet shapes (E-SHEET W2), whose `xdr:spPr` carries the same
+ * `a:` children.
+ */
+/** Whether an `spPr` states a geometry of its own, rather than inheriting one. */
+function statesGeometry(spPr: PoNode): boolean {
+  return poChildren(spPr).some((c) => poIs(c, 'a:prstGeom') || poIs(c, 'a:custGeom'));
+}
+
+export function parseGeometry(spPr: PoNode | undefined): ShapeGeometry {
+  if (!spPr) return RECT_GEOMETRY;
+  const prst = poChildren(spPr).find((c) => poIs(c, 'a:prstGeom'));
+  if (prst) return parsePrstGeom(prst);
+  const cust = poChildren(spPr).find((c) => poIs(c, 'a:custGeom'));
+  if (cust) return parseCustGeom(cust);
+  return RECT_GEOMETRY;
+}
+
+// p:pic → a floating image. The bytes come from p:blipFill/a:blip @r:embed,
+// resolved against the slide's relationships (PX3a); geometry from p:spPr/a:xfrm,
+// or — for a picture that fills a PLACEHOLDER — from the layout, exactly as a
+// shape's does. customshape-bitmapfill-srcrect.pptx is one `p:pic` with an empty
+// `p:spPr` and it drew nothing at all.
+function parsePic(
+  pic: PoNode,
+  ctx: SlideContext,
+  transform: GroupTransform,
+): ImageBlock | undefined {
+  const spPr = poChildren(pic).find((c) => poIs(c, 'p:spPr'));
+  const ph = parsePh(pic);
+  let own = parseXfrmBox(spPr);
+  if (!own && ph && ctx.cascade) own = ctx.cascade.geometryFor(ph);
+  if (!own) return undefined;
+  const box = transform(own);
+
+  const blipFill = poChildren(pic).find((c) => poIs(c, 'p:blipFill'));
+  const blip = blipFill ? poChildren(blipFill).find((c) => poIs(c, 'a:blip')) : undefined;
+  const relId = blip ? poAttr(blip, 'embed') : undefined;
+  const resource = relId !== undefined ? ctx.resolveImage?.(relId) : undefined;
+  // §20.1.8.16 — a picture may declare one of its colours away, which is how a
+  // logo drawn on white sits on a dark slide.
+  const colorChange = blip ? colorChangeOf(blip, ctx.colors ?? defaultColorResolver) : undefined;
+  // §20.1.8.4 `a:alphaModFix` — how opaque the picture is DRAWN. A layout that
+  // lays a photograph behind its title sets it low (ArtisticEffectSample's
+  // cover shows one at 52%), and drawn full-strength the words are unreadable.
+  const fixed = blip ? poChildren(blip).find((c) => poIs(c, 'a:alphaModFix')) : undefined;
+  const amt = fixed ? poIntAttr(fixed, 'amt') : undefined;
+  const alpha = amt === undefined ? undefined : Math.min(1, Math.max(0, amt / 100000));
+
+  // §20.1.8.55 `a:srcRect` — the picture's own edges, cut away before it is
+  // stretched into its frame. Unread, every one of 54542_cropped_bitmap.pptx's
+  // six cuts of the same logo came out as the whole logo squeezed into a frame
+  // shaped for a corner of it.
+  const crop = parseSrcRect(blipFill ? poFindDescendant(blipFill, 'a:srcRect') : undefined);
+  // §20.1.7.6 — a picture turns and mirrors in its frame exactly as a shape
+  // does, and states it in the same `a:xfrm`.
+  const xfrm = spPr ? poChildren(spPr).find((c) => poIs(c, 'a:xfrm')) : undefined;
+  const rot = xfrm ? poIntAttr(xfrm, 'rot') : undefined;
+
+  const altText = picAltText(pic);
+  return {
+    float: floatAt(box),
+    ...(resource !== undefined ? { resource } : {}),
+    ...(colorChange ? { colorChange } : {}),
+    ...(alpha !== undefined && alpha < 1 ? { alpha } : {}),
+    ...(crop ? { crop } : {}),
+    ...(rot !== undefined && rot !== 0 ? { rotation60k: rot } : {}),
+    ...(poAttr(xfrm, 'flipH') === '1' ? { flipH: true } : {}),
+    ...(poAttr(xfrm, 'flipV') === '1' ? { flipV: true } : {}),
+    width: emuToPt(box.cx),
+    height: emuToPt(box.cy),
+    paragraphProperties: {},
+    ...(altText ? { altText } : {}),
+  };
+}
+
+// p:nvPicPr/p:cNvPr @descr (preferred) or @title → the picture's alternate text.
+function picAltText(pic: PoNode): string | undefined {
+  const nvPicPr = poChildren(pic).find((c) => poIs(c, 'p:nvPicPr'));
+  const cNvPr = nvPicPr ? poChildren(nvPicPr).find((c) => poIs(c, 'p:cNvPr')) : undefined;
+  const descr = cNvPr ? poAttr(cNvPr, 'descr') : undefined;
+  const title = cNvPr ? poAttr(cNvPr, 'title') : undefined;
+  return (descr ?? title)?.trim() || undefined;
+}
+
+// a:txBody → its paragraphs as BodyElements (shared by shape text bodies and
+// table cells). Runs inherit the placeholder defaults when a cascade is given,
+// and resolve colours through the deck's palette.
+function txBodyParagraphs(
+  txBody: PoNode,
+  ph: PlaceholderRef | undefined,
+  cascade: PlaceholderCascade | undefined,
+  colors: ColorResolver,
+  resolveLink: LinkResolver,
+  styleColor?: string,
+  themeFonts?: ThemeFonts,
+): Array<BodyElement> {
+  const content: Array<BodyElement> = [];
+  const counters: Array<number> = []; // per-level a:buAutoNum counters (PX6b)
+  for (const child of poChildren(txBody)) {
+    if (!poIs(child, 'a:p')) continue;
+    content.push({
+      kind: 'paragraph',
+      paragraph: parseSlideParagraph(
+        child,
+        ph,
+        cascade,
+        colors,
+        resolveLink,
+        counters,
+        styleColor,
+        themeFonts,
+      ),
+    });
+  }
+  return content;
+}
+
+/**
+ * `p:txBody` → {@link ShapeTextBody}. `a:bodyPr` carries the insets and the
+ * vertical anchor (PX6: anchor `t`/`ctr`/`b`). Exported for sheet shapes
+ * (E-SHEET W2) — like SmartArt, they pass no placeholder cascade, so runs use
+ * their direct `a:rPr` formatting.
+ *
+ * @param txBody      The `p:txBody` node.
+ * @param ph          The owning placeholder ref, when this is a placeholder shape.
+ * @param cascade     The placeholder cascade supplying inherited run defaults.
+ * @param colors      The colour resolver for run colours.
+ * @param resolveLink A run hyperlink resolver, or `undefined`.
+ * @returns The text body, or `undefined` when it holds no paragraphs.
+ */
+export function parseTxBody(
+  txBody: PoNode,
+  ph: PlaceholderRef | undefined,
+  cascade: PlaceholderCascade | undefined,
+  colors: ColorResolver,
+  resolveLink: LinkResolver,
+  styleColor?: string,
+  themeFonts?: ThemeFonts,
+): ShapeTextBody | undefined {
+  const content = txBodyParagraphs(
+    txBody,
+    ph,
+    cascade,
+    colors,
+    resolveLink,
+    styleColor,
+    themeFonts,
+  );
+  if (content.length === 0) return undefined;
+
+  const bodyPr = poChildren(txBody).find((c) => poIs(c, 'a:bodyPr'));
+  // §21.1.2.1.2 `a:normAutofit` — the shrink PowerPoint already worked out and
+  // wrote down: `@fontScale` is the percentage every run is set at, and
+  // `@lnSpcReduction` the percentage taken off the line spacing. A bare
+  // `<a:normAutofit/>` states the rule and no result — that shrink is ours to
+  // compute, and until we do there is nothing to apply.
+  const fitted = fitToBody(content, bodyPr);
+  const lIns = bodyPr ? poIntAttr(bodyPr, 'lIns') : undefined;
+  const tIns = bodyPr ? poIntAttr(bodyPr, 'tIns') : undefined;
+  const rIns = bodyPr ? poIntAttr(bodyPr, 'rIns') : undefined;
+  const bIns = bodyPr ? poIntAttr(bodyPr, 'bIns') : undefined;
+  const a = bodyPr ? poAttr(bodyPr, 'anchor') : undefined;
+  // §20.1.10.42 — a `normAutofit` that carries no scale of its own is a box
+  // whose text has never been fitted; the layout measures it and shrinks it.
+  const autofit = bodyPr ? poChildren(bodyPr).find((c) => poIs(c, 'a:normAutofit')) : undefined;
+  const shrink = autofit !== undefined && poIntAttr(autofit, 'fontScale') === undefined;
+  const warp = bodyPr ? textWarp(bodyPr) : undefined;
+  // §20.1.10.83 `vert` — text set along the box's long axis. The docx side has
+  // read this for as long as it has had text boxes; the slide side never did,
+  // and shape-text-rotate.pptx's word lay flat across a pentagon that both
+  // references set on its side. The East-Asian stacked modes read top-to-bottom
+  // the way `vert` does; only the quarter turn differs.
+  const v = bodyPr ? poAttr(bodyPr, 'vert') : undefined;
+  const vertical: ShapeTextBody['vertical'] | undefined =
+    v === 'vert270' ? 'vert270' : v !== undefined && v !== 'horz' ? 'vert' : undefined;
+  // §20.1.10.55 — the words stay level however far the shape is turned.
+  const upright = bodyPr ? poAttr(bodyPr, 'upright') === '1' : false;
+  // A placeholder that states no anchor of its own sits where its prototype
+  // says: a master title anchored `ctr` centres the slide's title in its box.
+  const anchor: ShapeTextBody['anchor'] | undefined =
+    a === 'ctr' || a === 'b' || a === 't' ? a : ph && cascade ? cascade.anchorFor(ph) : undefined;
+  return {
+    content: fitted,
+    ...(lIns !== undefined ? { insetLeft: emuToPt(lIns) } : {}),
+    ...(tIns !== undefined ? { insetTop: emuToPt(tIns) } : {}),
+    ...(rIns !== undefined ? { insetRight: emuToPt(rIns) } : {}),
+    ...(bIns !== undefined ? { insetBottom: emuToPt(bIns) } : {}),
+    ...(anchor ? { anchor } : {}),
+    ...(vertical ? { vertical } : {}),
+    ...(upright ? { upright } : {}),
+    ...(shrink ? { shrinkToFit: true } : {}),
+    ...(warp ? { warp } : {}),
+  };
+}
+
+/**
+ * §20.1.9.10 `a:prstTxWarp` — the WordArt curve a body's text is bent through,
+ * with the `a:avLst` `adj` guide when it states one. Unread, tdf114848's eight
+ * pieces of WordArt were set as eight ordinary paragraphs, each wrapped onto
+ * three lines of upright type where both references draw one bent line.
+ *
+ * @param bodyPr The body's `a:bodyPr`.
+ * @returns The preset and its adjustment, or `undefined` when the body states
+ *          no warp or states the enumeration's `textNoShape`.
+ */
+function textWarp(bodyPr: PoNode): ShapeTextBody['warp'] {
+  const node = poChildren(bodyPr).find((c) => poIs(c, 'a:prstTxWarp'));
+  const preset = node ? poAttr(node, 'prst') : undefined;
+  if (node === undefined || preset === undefined || !isTextWarp(preset)) return undefined;
+  const avLst = poChildren(node).find((c) => poIs(c, 'a:avLst'));
+  const adj = avLst
+    ? poChildren(avLst).find((c) => poIs(c, 'a:gd') && poAttr(c, 'name') === 'adj')
+    : undefined;
+  const value = adj ? /^val\s+(-?\d+)$/u.exec(poAttr(adj, 'fmla') ?? '')?.[1] : undefined;
+  return {
+    preset,
+    ...(value !== undefined ? { adjust: Number(value) } : {}),
+  };
+}
+
+/**
+ * §21.1.2.1.2 — the body's text at the size the autofit settled on.
+ *
+ * The scale is a property of the BODY that reaches every run in it, so it is
+ * applied here rather than carried down: a run in the model already holds the
+ * size it inherited, and the shrink multiplies exactly that. Unread, the text
+ * PowerPoint squeezed to 62% of its style overflowed the placeholder it was
+ * squeezed to fit.
+ *
+ * @param content The body's paragraphs.
+ * @param bodyPr  The body's `a:bodyPr`, which carries the autofit.
+ * @returns The paragraphs, scaled; the same array when nothing is stated.
+ */
+function fitToBody(content: Array<BodyElement>, bodyPr: PoNode | undefined): Array<BodyElement> {
+  const fit = bodyPr ? poChildren(bodyPr).find((c) => poIs(c, 'a:normAutofit')) : undefined;
+  const scale = fit ? poIntAttr(fit, 'fontScale') : undefined;
+  const reduction = fit ? poIntAttr(fit, 'lnSpcReduction') : undefined;
+  const fontScale = scale !== undefined && scale > 0 ? scale / 100000 : undefined;
+  const lineScale =
+    reduction !== undefined && reduction > 0 ? 1 - Math.min(reduction, 100000) / 100000 : undefined;
+  if (fontScale === undefined && lineScale === undefined) return content;
+  return content.map((el) => {
+    if (el.kind !== 'paragraph') return el;
+    const p = el.paragraph;
+    // §17.3.1.33 — the model states "single" as 12pt under the `auto` rule
+    // (240 twips), so a fifth off the spacing is 9.6pt of the same unit.
+    const line =
+      lineScale === undefined ? undefined : pt((p.properties.spacingLine ?? 12) * lineScale);
+    return {
+      ...el,
+      paragraph: {
+        ...p,
+        properties: {
+          ...p.properties,
+          ...(line !== undefined ? { spacingLine: line, spacingLineRule: 'auto' as const } : {}),
+        },
+        runs:
+          fontScale === undefined
+            ? p.runs
+            : p.runs.map((run) =>
+                run.properties.fontSizePt === undefined
+                  ? run
+                  : {
+                      ...run,
+                      properties: {
+                        ...run.properties,
+                        fontSizePt: pt(run.properties.fontSizePt * fontScale),
+                      },
+                    },
+              ),
+      },
+    };
+  });
+}
+
+// a:p → Paragraph. The outline level (a:pPr @lvl) selects the placeholder's
+// default run formatting; @algn sets the alignment; @marL/@indent (else a
+// per-level default) the indent; a:buChar/a:buAutoNum a materialized list marker
+// run (PX6). Runs come from a:r and a:fld (a text field's cached a:t).
+function parseSlideParagraph(
+  aP: PoNode,
+  ph: PlaceholderRef | undefined,
+  cascade: PlaceholderCascade | undefined,
+  colors: ColorResolver,
+  resolveLink: LinkResolver,
+  counters: Array<number>,
+  styleColor?: string,
+  themeFonts?: ThemeFonts,
+): Paragraph {
+  const pPr = poChildren(aP).find((c) => poIs(c, 'a:pPr'));
+  const level = (pPr ? poIntAttr(pPr, 'lvl') : undefined) ?? 0;
+  const defaults: RunProperties = {
+    ...(cascade ? cascade.defaultsFor(ph, level) : {}),
+    ...(styleColor !== undefined ? { colorHex: styleColor } : {}),
+  };
+  // What the deck, the master and the prototypes say this paragraph looks like
+  // — the paragraph's own pPr states only where it differs.
+  const inherited: ParagraphProperties = cascade ? cascade.paragraphDefaultsFor(ph, level) : {};
+  const algn = pPr ? poAttr(pPr, 'algn') : undefined;
+  const alignment = algn !== undefined ? ALGN_TO_ALIGNMENT[algn] : undefined;
+
+  const runs: Array<Run> = [];
+  for (const child of poChildren(aP)) {
+    // §21.1.2.2.1 `a:br` — the break the author typed inside a paragraph. Read
+    // as nothing, the two halves ran together and the box broke the result
+    // wherever it fell: smartart-font-size's node reads "Max size(65 / pt)"
+    // where every reader has "Max size / (65 pt)".
+    if (poIs(child, 'a:br')) {
+      const last = runs[runs.length - 1];
+      if (last) runs[runs.length - 1] = { ...last, text: `${last.text}\n` };
+      continue;
+    }
+    if (poIs(child, 'a:r') || poIs(child, 'a:fld')) {
+      const run = parseSlideRun(child, defaults, colors, resolveLink, themeFonts);
+      if (run) runs.push(run);
+    }
+  }
+  // §21.1.2.2.7 — marL is the text's left margin, @indent the first-line/hang.
+  // Absent: indent nested levels by a default 0.5" per level (457200 EMU).
+  const marL = pPr ? poIntAttr(pPr, 'marL') : undefined;
+  const indent = pPr ? poIntAttr(pPr, 'indent') : undefined;
+  const indentLeft =
+    marL !== undefined ? emuToPt(marL) : level > 0 ? emuToPt(level * 457200) : undefined;
+  const hanging = (indent !== undefined ? emuToPt(indent) : (inherited.indentFirstLine ?? 0)) < 0;
+  // Each part of a bullet inherits on its own: the paragraph may restate the
+  // size and leave the character to its level.
+  const bullet: LevelBullet | undefined = {
+    ...cascade?.bulletFor(ph, level),
+    ...parseBullet(pPr, colors),
+  };
+  const marker = bulletMarker(bullet, level, counters);
+  if (marker !== undefined) {
+    // §21.1.2.4.2/.3 — a bullet is drawn at the size of the TEXT IT LEADS,
+    // scaled by `a:buSzPct` or overruled by `a:buSzPts`. Drawn at the level's
+    // inherited size instead, ArtisticEffectSample's dots came out 48pt in
+    // front of 18pt text and every line stood three times too tall.
+    const base = runs[0]?.properties ?? defaults;
+    runs.unshift({
+      // §17.3.1.12 — a hanging indent is itself a tab stop, and the tab after
+      // the marker is what carries the text out to the body indent. Written as
+      // two spaces the words began wherever the dot happened to end.
+      text: marker + (hanging ? '\t' : '  '),
+      properties: bulletProps(base, bullet),
+      listMarker: true,
+    });
+  }
+
+  // §21.1.2.2.3 `a:endParaRPr` — the properties of the paragraph MARK. On a
+  // paragraph with no runs it is the only thing that says how tall the line is,
+  // and a blank line that measures the layout's default instead of the size the
+  // file names is the wrong height: shape-macro-ext-ref.xlsx opens its button's
+  // text with an empty 14pt paragraph, and collapsing it drew the caption 12pt
+  // above where both references put it.
+  const endRPr = poChildren(aP).find((c) => poIs(c, 'a:endParaRPr'));
+  const endSz = endRPr ? poIntAttr(endRPr, 'sz') : undefined;
+  // §21.1.2.2.3 `a:endParaRPr` — the properties of the paragraph MARK, which on
+  // a paragraph with no runs is the only thing that says how tall the line is.
+  // They belong to the PARAGRAPH (§17.3.1.31 `w:pPr/w:rPr` is the same idea):
+  // an empty run carries no token, so a blank line took the layout's 12pt
+  // default rather than the size its level gives it — and a deck that spaces
+  // its bullets with blank lines set them a third too close (GeomLec1).
+  const markProps: RunProperties | undefined =
+    runs.length > 0
+      ? undefined
+      : {
+          ...defaults,
+          ...(endSz !== undefined && endSz > 0 ? { fontSizePt: pt(endSz / 100) } : {}),
+        };
+
+  return {
+    properties: {
+      ...inherited,
+      ...(alignment ? { alignment } : {}),
+      ...(indentLeft !== undefined ? { indentLeft } : {}),
+      ...(indent !== undefined ? { indentFirstLine: emuToPt(indent) } : {}),
+      // §21.1.2.2.5/.9/.10 — the paragraph's own line height and the space
+      // around it, including the spelling that states a FRACTION of a line:
+      // that fraction is of THIS paragraph's text, whose size is settled here.
+      ...lineSpacing(pPr),
+      ...ownSpacing(pPr, runs[0]?.properties.fontSizePt ?? defaults.fontSizePt),
+      ...(markProps && markProps.fontSizePt !== undefined ? { runProperties: markProps } : {}),
+    },
+    runs,
+  };
+}
+
+// The paragraph's own `a:spcBef`/`a:spcAft`, whichever spelling it uses: the
+// distance as stated, the fraction resolved against the size just settled.
+function ownSpacing(pPr: PoNode | undefined, sizePt: number | undefined): ParagraphProperties {
+  const fractions = spacingFractions(pPr);
+  const before = spacingFromLineFraction(fractions?.before, sizePt);
+  const after = spacingFromLineFraction(fractions?.after, sizePt);
+  const points = (tag: string): Pt | undefined => {
+    const holder = pPr ? poChildren(pPr).find((c) => poIs(c, tag)) : undefined;
+    const node = holder ? poChildren(holder).find((c) => poIs(c, 'a:spcPts')) : undefined;
+    const val = node ? poIntAttr(node, 'val') : undefined;
+    return val === undefined ? undefined : pt(val / 100);
+  };
+  const [beforePt, afterPt] = [points('a:spcBef') ?? before, points('a:spcAft') ?? after];
+  return {
+    ...(beforePt !== undefined ? { spacingBefore: beforePt } : {}),
+    ...(afterPt !== undefined ? { spacingAfter: afterPt } : {}),
+  };
+}
+
+// §21.1.2.4 — the marker's own formatting: the size of the text it leads (a
+// percentage of it, or a size stated outright) and the colour the paragraph
+// gives it.
+function bulletProps(base: RunProperties, bullet: LevelBullet): RunProperties {
+  const sizePt =
+    bullet.sizePts ??
+    (bullet.sizePct !== undefined && base.fontSizePt !== undefined
+      ? base.fontSizePt * bullet.sizePct
+      : undefined);
+  return {
+    ...base,
+    ...(sizePt !== undefined ? { fontSizePt: pt(sizePt) } : {}),
+    ...(bullet.colorHex !== undefined ? { colorHex: bullet.colorHex } : {}),
+  };
+}
+
+// a:pPr bullet → the marker text to prepend, or undefined for no bullet (the
+// gap after it is the caller's, since only a hanging indent earns a tab).
+// a:buNone suppresses; a:buChar is literal; a:buAutoNum advances the per-level
+// counter and formats it (PX6b).
+function bulletMarker(
+  bullet: LevelBullet | undefined,
+  level: number,
+  counters: Array<number>,
+): string | undefined {
+  // A paragraph states a bullet only where it differs from the one its level
+  // already carries — from the prototype, the master's family style or the
+  // deck's default. Read as "no bullet unless this paragraph draws one", every
+  // list that leaves its dot to the master came out flat (themes.pptx writes
+  // one bare line on its second slide and the dot in front of it is nine
+  // levels up).
+  if (!bullet || bullet.kind === 'none' || bullet.kind === undefined) return undefined;
+  if (bullet.kind === 'char') return bullet.char ?? '•';
+  const prev = counters[level];
+  const n = (prev === undefined ? (bullet.startAt ?? 1) - 1 : prev) + 1;
+  counters[level] = n;
+  counters.length = level + 1; // deeper levels restart
+  return `${n}${autoNumSuffix(bullet.type ?? 'arabicPeriod')}`;
+}
+
+// The trailing punctuation of an a:buAutoNum type (…Period → '.', …ParenR/Both →
+// ')', …Plain → ''). v1 numbers arabic; alpha/roman folds onto arabic.
+function autoNumSuffix(type: string): string {
+  if (type.endsWith('ParenR') || type.endsWith('ParenBoth')) return ')';
+  if (type.endsWith('Period')) return '.';
+  return '';
+}
+
+// a:r / a:fld → Run. The placeholder defaults sit under the run's own a:rPr, so
+// direct formatting always wins. a:rPr/a:hlinkClick @r:id resolves to a run href
+// (PX6).
+function parseSlideRun(
+  node: PoNode,
+  defaults: RunProperties,
+  colors: ColorResolver,
+  resolveLink: LinkResolver,
+  themeFonts?: ThemeFonts,
+): Run | undefined {
+  const t = poChildren(node).find((c) => poIs(c, 'a:t'));
+  const text = t ? poText(t) : '';
+  if (text.length === 0) return undefined;
+  const rPr = poChildren(node).find((c) => poIs(c, 'a:rPr'));
+  const hlink = rPr ? poChildren(rPr).find((c) => poIs(c, 'a:hlinkClick')) : undefined;
+  const linkId = hlink ? poAttr(hlink, 'id') : undefined; // r:id
+  const href = linkId !== undefined ? resolveLink?.(linkId) : undefined;
+  return {
+    text,
+    properties: { ...defaults, ...rPrToRunProps(rPr, colors, themeFonts) },
+    ...(href ? { href } : {}),
+  };
+}
+
+// §21.1.3 a:tbl → a FlowDoc Table: grid column widths (a:tblGrid/a:gridCol @w),
+// rows (a:tr) and cells (a:tc) with their text and merge state.
+function parseTable(
+  tbl: PoNode,
+  colors: ColorResolver,
+  resolveTableStyle?: (styleId: string | undefined) => PoNode | undefined,
+  theme?: TableStyleTheme,
+): Table {
+  const grid: Array<Pt> = [];
+  const tblGrid = poChildren(tbl).find((c) => poIs(c, 'a:tblGrid'));
+  if (tblGrid) {
+    for (const col of poChildren(tblGrid)) {
+      if (poIs(col, 'a:gridCol')) grid.push(emuToPt(poIntAttr(col, 'w') ?? 0));
+    }
+  }
+  const rows: Array<TableRow> = [];
+  // The cells kept beside the parsed rows: the style a cell wears depends on
+  // what the cell's own `a:tcPr` says, which the FlowDoc cell no longer carries.
+  const sources: Array<Array<PoNode>> = [];
+  for (const tr of poChildren(tbl)) {
+    if (!poIs(tr, 'a:tr')) continue;
+    const cells = rowCells(tr);
+    sources.push(cells);
+    rows.push(parseTableRow(tr, cells, colors));
+  }
+  // §20.1.4.2.24 — almost everything a table LOOKS like is in the style it
+  // names: the header's fill, the banding, the rules between the cells.
+  const tblPr = poChildren(tbl).find((c) => poIs(c, 'a:tblPr'));
+  const style = resolveTableStyle?.(tableStyleId(tblPr));
+  if (!style) return { properties: {}, grid, rows };
+  const flags = tableStyleFlags(tblPr);
+  const styled = rows.map((row, r) => ({
+    ...row,
+    cells: row.cells.map((cell, c) => {
+      const at = { row: r, rowCount: rows.length, col: c, colCount: grid.length };
+      const part = cellStyle(style, flags, at, colors, theme);
+      const tc = sources[r]?.[c];
+      return withCellStyle(cell, tc && cellSaysNoFill(tc) ? withoutFill(part) : part);
+    }),
+  }));
+  return { properties: {}, grid, rows: styled };
+}
+
+// The cells a row HAS: a horizontal-merge continuation is covered by the
+// gridSpan origin, so it is dropped and the origin's colSpan carries the width
+// (the FlowDoc model omits placeholder cells for spanned columns).
+function rowCells(tr: PoNode): Array<PoNode> {
+  return poChildren(tr).filter((tc) => poIs(tc, 'a:tc') && poAttr(tc, 'hMerge') !== '1');
+}
+
+function parseTableRow(tr: PoNode, cells: Array<PoNode>, colors: ColorResolver): TableRow {
+  const h = poIntAttr(tr, 'h');
+  // §21.1.3.18 `a:tr@h` — the height the row asks for, which it keeps unless
+  // its own text needs more. Stated without a rule it was ignored entirely, and
+  // every slide table came out as tight as its text (table_test2's rows are
+  // 36pt, 29pt, 15pt and we drew four equal thin ones).
+  return {
+    properties: { ...(h !== undefined ? { height: emuToPt(h), heightRule: 'atLeast' } : {}) },
+    cells: cells.map((tc) => parseTableCell(tc, colors)),
+  };
+}
+
+function parseTableCell(tc: PoNode, colors: ColorResolver): TableCell {
+  const txBody = poChildren(tc).find((c) => poIs(c, 'a:txBody'));
+  const content = txBody ? txBodyParagraphs(txBody, undefined, undefined, colors, undefined) : [];
+  const gridSpan = poIntAttr(tc, 'gridSpan');
+  const rowSpan = poIntAttr(tc, 'rowSpan');
+  // Vertical merge: the origin carries @rowSpan (→ 'start'); a continuation cell
+  // carries @vMerge="1" (→ 'middle') and is kept so the column slot stays filled.
+  const merge: CellMerge | undefined =
+    rowSpan !== undefined && rowSpan > 1
+      ? 'start'
+      : poAttr(tc, 'vMerge') === '1'
+        ? 'middle'
+        : undefined;
+  const tcPr = poChildren(tc).find((c) => poIs(c, 'a:tcPr'));
+  const shadingHex = tcPr ? cellFillHex(tcPr, colors) : undefined;
+  const borders = tcPr ? cellOwnBorders(tcPr, colors) : undefined;
+  // §21.1.3.17 `@vert` — the cell's text turned a quarter. `eaVert` is the East
+  // Asian spelling of the same clockwise turn; the WordArt variants stack
+  // upright glyphs, which is not a turn and is left flat.
+  const vert = tcPr ? poAttr(tcPr, 'vert') : undefined;
+  const textDirection =
+    vert === 'vert' || vert === 'eaVert' || vert === 'mongolianVert'
+      ? ('vert' as const)
+      : vert === 'vert270'
+        ? ('vert270' as const)
+        : undefined;
+  return {
+    properties: {
+      ...(gridSpan !== undefined && gridSpan > 1 ? { colSpan: gridSpan } : {}),
+      ...(merge ? { merge } : {}),
+      ...(shadingHex ? { shading: { colorHex: shadingHex } } : {}),
+      ...(borders ? { borders } : {}),
+      ...(textDirection ? { textDirection } : {}),
+    },
+    content,
+  };
+}
+
+// §21.1.3.17 — a cell states its own four rules as `a:lnL`/`a:lnR`/`a:lnT`/
+// `a:lnB`, each an ordinary `a:ln`, and they beat the table style's. tdf164936
+// is one empty cell with three blue rules and a fourth at zero alpha.
+const CELL_LINES: ReadonlyArray<readonly [string, keyof CellBorders]> = [
+  ['a:lnL', 'left'],
+  ['a:lnR', 'right'],
+  ['a:lnT', 'top'],
+  ['a:lnB', 'bottom'],
+];
+
+function cellOwnBorders(tcPr: PoNode, colors: ColorResolver): CellBorders | undefined {
+  const out: { -readonly [K in keyof CellBorders]?: Border } = {};
+  for (const [tag, side] of CELL_LINES) {
+    const ln = poChildren(tcPr).find((c) => poIs(c, tag));
+    if (ln) out[side] = lineBorder(ln, colors);
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+// §20.1.8.44 `a:noFill` on the cell — the cell is transparent BY ITS OWN WORD,
+// which is not the same as saying nothing: the table style's fill applies to
+// the silent one and not to this one.
+function cellSaysNoFill(tc: PoNode): boolean {
+  const tcPr = poChildren(tc).find((c) => poIs(c, 'a:tcPr'));
+  return tcPr !== undefined && poChildren(tcPr).some((c) => poIs(c, 'a:noFill'));
+}
+
+// a:tcPr/a:solidFill → the cell background hex (srgb or theme scheme colour).
+function cellFillHex(tcPr: PoNode, colors: ColorResolver): string | undefined {
+  const solidFill = poChildren(tcPr).find((c) => poIs(c, 'a:solidFill'));
+  if (!solidFill) return undefined;
+  for (const c of poChildren(solidFill)) {
+    const hex = resolveColorNode(c, colors);
+    if (hex) return hex;
+  }
+  return undefined;
+}

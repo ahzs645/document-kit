@@ -1,0 +1,9 @@
+{
+  // The kit's own tests, type-checked under the same strict options as src.
+  // The vendored engines' tests (tests/ream, tests/template) keep their own
+  // upstream style and are checked by running them.
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "types": ["node"], "lib": ["ES2022", "WebWorker"] },
+  "include": ["src/**/*.ts", "tests/model/**/*.ts", "tests/docx/**/*.ts", "tests/layout/**/*.ts"],
+  "exclude": ["node_modules", "dist", "src/template"]
+}

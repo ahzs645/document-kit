@@ -1,0 +1,1022 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
+
+import { describe, expect, it } from 'vitest';
+
+import { buildDocxFromBody } from './fixtures/build-docx';
+import { eighthPtToPt, emuToPt, halfPtToPt, twipsToPt } from '../../src/ream/core/ir';
+
+import { convertDocxToPdfSync } from '../../src/ream/core/converter';
+import { defaultColorResolver } from '../../src/ream/core/drawingml/colors';
+import { buildChartScene } from '../../src/ream/core/drawingml/chart-geometry';
+import { MOST_CHART_POINTS, parseChart, pointsPerSeries } from '../../src/ream/core/drawingml/chart-parser';
+import { OpcPackage } from '../../src/ream/core/opc';
+import { parseDocument } from '../../src/ream/word';
+import { readDocx } from '../../src/ream/word/docx-reader';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const FONTS = {
+  regular: new Uint8Array(readFileSync(resolve(here, 'fixtures/fonts/Roboto-Regular.ttf'))),
+};
+const latin1 = new TextDecoder('latin1');
+const asLatin1 = (b: Uint8Array): string => latin1.decode(b);
+const enc = new TextEncoder();
+
+const C_NS =
+  'xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" ' +
+  'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" ' +
+  'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"';
+
+const BAR_CHART = `<c:chartSpace ${C_NS}>
+  <c:chart>
+    <c:title><c:tx><c:rich><a:bodyPr/><a:p><a:r><a:t>Quarterly Sales</a:t></a:r></a:p></c:rich></c:tx></c:title>
+    <c:plotArea>
+      <c:barChart>
+        <c:barDir val="col"/>
+        <c:grouping val="clustered"/>
+        <c:ser>
+          <c:idx val="0"/><c:order val="0"/>
+          <c:tx><c:strRef><c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>2023</c:v></c:pt></c:strCache></c:strRef></c:tx>
+          <c:spPr><a:solidFill><a:srgbClr val="4472C4"/></a:solidFill></c:spPr>
+          <c:cat><c:strRef><c:strCache><c:ptCount val="3"/><c:pt idx="0"><c:v>Q1</c:v></c:pt><c:pt idx="1"><c:v>Q2</c:v></c:pt><c:pt idx="2"><c:v>Q3</c:v></c:pt></c:strCache></c:strRef></c:cat>
+          <c:val><c:numRef><c:numCache><c:ptCount val="3"/><c:pt idx="0"><c:v>10</c:v></c:pt><c:pt idx="1"><c:v>20</c:v></c:pt><c:pt idx="2"><c:v>15</c:v></c:pt></c:numCache></c:numRef></c:val>
+        </c:ser>
+        <c:ser>
+          <c:idx val="1"/><c:order val="1"/>
+          <c:tx><c:strRef><c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>2024</c:v></c:pt></c:strCache></c:strRef></c:tx>
+          <c:spPr><a:solidFill><a:srgbClr val="ED7D31"/></a:solidFill></c:spPr>
+          <c:val><c:numRef><c:numCache><c:ptCount val="3"/><c:pt idx="0"><c:v>12</c:v></c:pt><c:pt idx="1"><c:v>18</c:v></c:pt><c:pt idx="2"><c:v>25</c:v></c:pt></c:numCache></c:numRef></c:val>
+        </c:ser>
+        <c:axId val="111"/><c:axId val="222"/>
+      </c:barChart>
+      <c:catAx><c:axId val="111"/></c:catAx>
+      <c:valAx><c:axId val="222"/></c:valAx>
+    </c:plotArea>
+    <c:legend><c:legendPos val="b"/></c:legend>
+    <c:plotVisOnly val="1"/>
+  </c:chart>
+</c:chartSpace>`;
+
+function chartDrawing(rId: string, cx = 5486400, cy = 3200400): string {
+  return `<w:p><w:r><w:drawing>
+    <wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing">
+      <wp:extent cx="${cx}" cy="${cy}"/>
+      <wp:docPr id="1" name="Chart 1"/>
+      <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+        <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/chart">
+          <c:chart xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"
+                   xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+                   r:id="${rId}"/>
+        </a:graphicData>
+      </a:graphic>
+    </wp:inline>
+  </w:drawing></w:r></w:p>`;
+}
+
+describe('parseChart', () => {
+  it('reads a clustered column chart with two series', () => {
+    const chart = parseChart(enc.encode(BAR_CHART), defaultColorResolver);
+    expect(chart).not.toBeNull();
+    expect(chart!.type).toBe('bar');
+    expect(chart!.barDir).toBe('col');
+    expect(chart!.grouping).toBe('clustered');
+    expect(chart!.title).toBe('Quarterly Sales');
+    expect(chart!.categories).toEqual(['Q1', 'Q2', 'Q3']);
+    expect(chart!.hasLegend).toBe(true);
+    expect(chart!.legendPos).toBe('b');
+    expect(chart!.series).toHaveLength(2);
+    expect(chart!.series[0]).toMatchObject({
+      name: '2023',
+      values: [10, 20, 15],
+      colorHex: '4472C4',
+    });
+    expect(chart!.series[1]).toMatchObject({
+      name: '2024',
+      values: [12, 18, 25],
+      colorHex: 'ED7D31',
+    });
+  });
+
+  it('keeps the value-axis ends the author fixed (§21.2.2.157)', () => {
+    // A chart whose cells all read zero still has the axis its author pinned.
+    // Scaling to the data drew shape-macro-ext-ref.xlsx's axis 0…1 where every
+    // reader draws 0…300.
+    const withScaling = BAR_CHART.replace(
+      '<c:valAx><c:axId val="222"/></c:valAx>',
+      '<c:valAx><c:axId val="222"/><c:scaling><c:orientation val="minMax"/><c:max val="300"/></c:scaling></c:valAx>',
+    );
+    const chart = parseChart(enc.encode(withScaling), defaultColorResolver);
+    expect(chart!.valAxisMax).toBe(300);
+    expect(chart!.valAxisMin).toBeUndefined();
+    // …and an axis the author left alone stays automatic.
+    expect(parseChart(enc.encode(BAR_CHART), defaultColorResolver)!.valAxisMax).toBeUndefined();
+  });
+
+  it('reads a category axis labelled on two levels (§21.2.2.115)', () => {
+    // A pivot chart's categories: a measure under each bar, a year over each
+    // pair of them. The first level labels the categories, the second groups.
+    const cat =
+      '<c:cat><c:multiLvlStrRef><c:f>Sheet2!$A$4:$B$7</c:f><c:multiLvlStrCache><c:ptCount val="4"/>' +
+      '<c:lvl><c:pt idx="0"><c:v>Cost</c:v></c:pt><c:pt idx="1"><c:v>Revenue</c:v></c:pt>' +
+      '<c:pt idx="2"><c:v>Cost</c:v></c:pt><c:pt idx="3"><c:v>Revenue</c:v></c:pt></c:lvl>' +
+      '<c:lvl><c:pt idx="0"><c:v>2005</c:v></c:pt><c:pt idx="2"><c:v>2006</c:v></c:pt></c:lvl>' +
+      '</c:multiLvlStrCache></c:multiLvlStrRef></c:cat>';
+    const chart = parseChart(
+      enc.encode(BAR_CHART.replace(/<c:cat>[\s\S]*?<\/c:cat>/, cat)),
+      defaultColorResolver,
+    )!;
+    expect(chart.categories).toEqual(['Cost', 'Revenue', 'Cost', 'Revenue']);
+    expect(chart.categoryGroups).toEqual([
+      [
+        { start: 0, label: '2005' },
+        { start: 2, label: '2006' },
+      ],
+    ]);
+  });
+
+  it('reads where the category axis crosses and where its labels stand (§21.2.2.33)', () => {
+    const catAx = (inner: string): ReturnType<typeof parseChart> =>
+      parseChart(
+        enc.encode(
+          BAR_CHART.replace(
+            '<c:catAx><c:axId val="111"/></c:catAx>',
+            `<c:catAx><c:axId val="111"/>${inner}</c:catAx>`,
+          ),
+        ),
+        defaultColorResolver,
+      );
+    const plain = catAx('<c:tickLblPos val="nextTo"/><c:crosses val="autoZero"/>')!;
+    expect(plain.catAxisCrosses).toBeUndefined();
+    expect(plain.catTickLabelPos).toBeUndefined();
+    const low = catAx('<c:tickLblPos val="low"/><c:crosses val="max"/>')!;
+    expect(low.catTickLabelPos).toBe('low');
+    expect(low.catAxisCrosses).toBe('max');
+    expect(catAx('<c:crossesAt val="2.5"/>')!.catAxisCrosses).toBe(2.5);
+    // …and where the value axis crosses the category axis.
+    const valMax = parseChart(
+      enc.encode(
+        BAR_CHART.replace(
+          '<c:valAx><c:axId val="222"/></c:valAx>',
+          '<c:valAx><c:axId val="222"/><c:crosses val="max"/></c:valAx>',
+        ),
+      ),
+      defaultColorResolver,
+    )!;
+    expect(valMax.valAxisCrosses).toBe('max');
+  });
+
+  it('reads the chart-space frame beside <c:chart> (§21.2.2.198)', () => {
+    const framed = BAR_CHART.replace(
+      '<c:chart>',
+      '<c:spPr><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill><a:ln><a:solidFill><a:srgbClr val="D9D9D9"/></a:solidFill></a:ln></c:spPr><c:chart>',
+    );
+    const chart = parseChart(enc.encode(framed), defaultColorResolver);
+    expect(chart!.frameFillHex).toBe('FFFFFF');
+    expect(chart!.frameLineHex).toBe('D9D9D9');
+    // A chart that states no frame at all gets the one both references draw
+    // around a plain chart: white inside a light grey rule (chart-prop.docx).
+    const plain = parseChart(enc.encode(BAR_CHART), defaultColorResolver);
+    expect(plain!.frameFillHex).toBe('FFFFFF');
+    expect(plain!.frameLineHex).toBe('D9D9D9');
+    // …but a chart that asks for neither gets neither (chart-dupe.docx).
+    const bare = parseChart(
+      enc.encode(BAR_CHART.replace('<c:chart>', '<c:spPr><a:noFill/></c:spPr><c:chart>')),
+      defaultColorResolver,
+    );
+    expect(bare!.frameFillHex).toBeUndefined();
+    expect(bare!.frameLineHex).toBeUndefined();
+    // A system colour names it as well as an RGB one does — Excel 2007 and
+    // 2010 rule a chart in windowText — and is transformed like any other:
+    // windowText at lumMod 15% + lumOff 85% is a light grey.
+    const system = (clr: string): string =>
+      BAR_CHART.replace(
+        '<c:chart>',
+        `<c:spPr><a:ln w="12700"><a:solidFill>${clr}</a:solidFill></a:ln></c:spPr><c:chart>`,
+      );
+    expect(
+      parseChart(
+        enc.encode(system('<a:sysClr val="windowText" lastClr="000000"/>')),
+        defaultColorResolver,
+      )!.frameLineHex,
+    ).toBe('000000');
+    expect(
+      parseChart(
+        enc.encode(
+          system(
+            '<a:sysClr val="windowText" lastClr="000000"><a:lumMod val="15000"/><a:lumOff val="85000"/></a:sysClr>',
+          ),
+        ),
+        defaultColorResolver,
+      )!.frameLineHex,
+    ).toBe('D9D9D9');
+  });
+
+  it('reads the frame rule width and dash, and the plot rectangle (§21.2.2.145)', () => {
+    // Chart_Plot_BorderLine_Style.docx rules its chart in a heavy blue sysDash
+    // and its PLOT in an orange lgDashDot, over no fill at all. We drew a thin
+    // solid frame, no plot rule, and painted the plot in the colour of the rule
+    // we were not drawing.
+    const ruled = BAR_CHART.replace(
+      '<c:plotArea>',
+      '<c:plotArea><c:spPr><a:noFill/><a:ln w="38100"><a:solidFill><a:srgbClr val="ED9B60"/></a:solidFill>' +
+        '<a:prstDash val="lgDashDot"/></a:ln></c:spPr>',
+    ).replace(
+      '<c:chart>',
+      '<c:spPr><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill>' +
+        '<a:ln w="57150"><a:solidFill><a:srgbClr val="2E74B5"/></a:solidFill>' +
+        '<a:prstDash val="sysDash"/></a:ln></c:spPr><c:chart>',
+    );
+    const chart = parseChart(enc.encode(ruled), defaultColorResolver);
+    expect(chart!.frameLineWidthPt).toBeCloseTo(4.5);
+    expect(chart!.frameLineDash).toBe('sysDash');
+    expect(chart!.plotFillHex).toBeUndefined();
+    expect(chart!.plotLine).toMatchObject({ colorHex: 'ED9B60', dash: 'lgDashDot' });
+    expect(chart!.plotLine?.widthPt).toBeCloseTo(3);
+  });
+
+  it("outlines a bar in its series' own rule (§21.2.2.198)", () => {
+    // Chart_BorderLine_Style.docx outlines each series in a colour and dash of
+    // its own, and bars drawn unstroked lost all of it.
+    const outlined = BAR_CHART.replace(
+      '<c:spPr><a:solidFill><a:srgbClr val="4472C4"/></a:solidFill></c:spPr>',
+      '<c:spPr><a:solidFill><a:srgbClr val="4472C4"/></a:solidFill>' +
+        '<a:ln w="28575"><a:solidFill><a:srgbClr val="70AD47"/></a:solidFill>' +
+        '<a:prstDash val="dash"/></a:ln></c:spPr>',
+    );
+    const chart = parseChart(enc.encode(outlined), defaultColorResolver);
+    expect(chart!.series[0]?.line).toMatchObject({ colorHex: '70AD47', dash: 'dash' });
+    const text = asLatin1(
+      convertDocxToPdfSync(
+        buildDocxFromBody(chartDrawing('rId5'), { charts: { rId5: outlined } }),
+        { fonts: FONTS },
+      ),
+    );
+    expect(text).toContain('0.439216 0.678431 0.278431 RG'); // 70AD47 stroke
+    expect(text).toMatch(/\[[\d.]+ [\d.]+\] 0 d/); // a dash pattern
+  });
+
+  it("reads how far a cluster's bars overlap (§21.2.2.131)", () => {
+    const withOverlap = (val: string): string =>
+      BAR_CHART.replace('<c:axId val="111"/>', `<c:overlap val="${val}"/><c:axId val="111"/>`);
+    const read = (xml: string) => parseChart(enc.encode(xml), defaultColorResolver)!;
+    expect(read(withOverlap('-27')).overlapPercent).toBe(-27);
+    // None, or none to speak of, leaves the bars side by side; past ±100 is ±100.
+    expect(read(BAR_CHART).overlapPercent).toBeUndefined();
+    expect(read(withOverlap('0')).overlapPercent).toBeUndefined();
+    expect(read(withOverlap('250')).overlapPercent).toBe(100);
+    expect(read(withOverlap('x')).overlapPercent).toBeUndefined();
+  });
+
+  it('rules the plot only with the gridlines its value axis has (§21.2.2.100)', () => {
+    const measure = (t: string, sz: number) => t.length * sz * 0.5;
+    const ruled = (xml: string) =>
+      buildChartScene(parseChart(enc.encode(xml), defaultColorResolver)!, 400, 300, measure)!
+        .gridlines ?? [];
+    // tdf147586.pptx: no `c:majorGridlines`, no gridlines.
+    expect(parseChart(enc.encode(BAR_CHART), defaultColorResolver)!.gridLine).toEqual({
+      none: true,
+    });
+    expect(ruled(BAR_CHART)).toHaveLength(0);
+    const gridded = BAR_CHART.replace(
+      '<c:valAx><c:axId val="222"/>',
+      '<c:valAx><c:axId val="222"/><c:majorGridlines><c:spPr><a:ln w="19050"><a:solidFill>' +
+        '<a:srgbClr val="C00000"/></a:solidFill></a:ln></c:spPr></c:majorGridlines>',
+    );
+    expect(ruled(gridded).length).toBeGreaterThan(0);
+    for (const g of ruled(gridded)) expect(g).toMatchObject({ strokeHex: 'C00000', widthPt: 1.5 });
+    // A horizontal bar chart's are its value axis's, lying along its foot, not
+    // the upright category axis's (tdf128207.docx).
+    const lying = gridded
+      .replace('<c:barDir val="col"/>', '<c:barDir val="bar"/>')
+      .replace('<c:catAx><c:axId val="111"/>', '<c:catAx><c:axId val="111"/><c:axPos val="l"/>')
+      .replace('<c:valAx><c:axId val="222"/>', '<c:valAx><c:axId val="222"/><c:axPos val="b"/>');
+    expect(parseChart(enc.encode(lying), defaultColorResolver)!.gridLine).toMatchObject({
+      colorHex: 'C00000',
+    });
+    // A rule of `a:noFill` rules nothing either.
+    const unruled = BAR_CHART.replace(
+      '<c:valAx><c:axId val="222"/>',
+      '<c:valAx><c:axId val="222"/><c:majorGridlines><c:spPr><a:ln><a:noFill/></a:ln></c:spPr></c:majorGridlines>',
+    );
+    expect(ruled(unruled)).toHaveLength(0);
+  });
+
+  it('draws nothing of an axis its author deleted, and keeps no room for it (§21.2.2.40)', () => {
+    // LIBRE_OFFICE-100610-0.pptx deletes both axes of its five bar charts.
+    const measure = (t: string, sz: number) => t.length * sz * 0.5;
+    const deleted = BAR_CHART.replace(
+      '<c:catAx><c:axId val="111"/>',
+      '<c:catAx><c:axId val="111"/><c:delete val="1"/>',
+    ).replace('<c:valAx><c:axId val="222"/>', '<c:valAx><c:axId val="222"/><c:delete val="1"/>');
+    const chart = parseChart(enc.encode(deleted), defaultColorResolver)!;
+    expect(chart).toMatchObject({ catAxisDeleted: true, valAxisDeleted: true });
+    expect(chart.catAxisLine).toEqual({ none: true });
+    expect(chart.valAxisLine).toEqual({ none: true });
+    const scene = buildChartScene(chart, 400, 300, measure)!;
+    const texts = scene.labels.map((l) => l.text);
+    for (const t of ['Q1', 'Q2', 'Q3', '0', '10', '20']) expect(texts).not.toContain(t);
+    // The bars take the room the labels leave.
+    const shown = buildChartScene(
+      parseChart(enc.encode(BAR_CHART), defaultColorResolver)!,
+      400,
+      300,
+      measure,
+    )!;
+    const left = (s: typeof scene) =>
+      Math.min(...s.rects.filter((r) => r.fillHex === '4472C4').map((r) => r.x));
+    expect(left(scene)).toBeLessThan(left(shown));
+  });
+
+  it('takes a gradient-filled series from its first stop, not from its outline', () => {
+    // §20.1.8.33 — a series filled with a gradient still has a colour, and the
+    // scene model carries one per series. Falling through to the outline
+    // painted 123233_charts.xlsx's five gradient bars in the black of their
+    // own hairline.
+    const grad = BAR_CHART.replace(
+      '<c:spPr><a:solidFill><a:srgbClr val="4472C4"/></a:solidFill></c:spPr>',
+      '<c:spPr><a:gradFill><a:gsLst><a:gs pos="0"><a:srgbClr val="8599D3"/></a:gs>' +
+        '<a:gs pos="100000"><a:srgbClr val="5876AE"/></a:gs></a:gsLst></a:gradFill>' +
+        '<a:ln><a:solidFill><a:srgbClr val="000000"/></a:solidFill></a:ln></c:spPr>',
+    );
+    const chart = parseChart(enc.encode(grad), defaultColorResolver);
+    expect(chart!.series[0]?.colorHex).toBe('8599D3');
+  });
+
+  it('keeps the references a cache-less chart reads its data from', () => {
+    // A chart written without caches is not a chart without data — the reader
+    // resolves these against the workbook (123233_charts.xlsx, four charts that
+    // drew as empty axes).
+    const noCache = `<c:chartSpace ${C_NS}><c:chart><c:plotArea><c:barChart>
+      <c:ser><c:idx val="0"/><c:order val="0"/>
+        <c:tx><c:strRef><c:f>data!B1</c:f></c:strRef></c:tx>
+        <c:cat><c:strRef><c:f>data!A2:A4</c:f></c:strRef></c:cat>
+        <c:val><c:numRef><c:f>data!B2:B4</c:f></c:numRef></c:val>
+      </c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>`;
+    const chart = parseChart(enc.encode(noCache), defaultColorResolver);
+    expect(chart!.series[0]?.valuesRef).toBe('data!B2:B4');
+    expect(chart!.series[0]?.nameRef).toBe('data!B1');
+    expect(chart!.categoriesRef).toBe('data!A2:A4');
+    // A cached chart records them too, and keeps its cache.
+    expect(parseChart(enc.encode(BAR_CHART), defaultColorResolver)!.series[0]?.values).toEqual([
+      10, 20, 15,
+    ]);
+  });
+
+  it('returns unknown type for an unsupported chart group', () => {
+    const radar = `<c:chartSpace ${C_NS}><c:chart><c:plotArea><c:radarChart/></c:plotArea></c:chart></c:chartSpace>`;
+    expect(parseChart(enc.encode(radar), defaultColorResolver)!.type).toBe('unknown');
+  });
+
+  it('reads a scatter chart from c:xVal / c:yVal', () => {
+    const scatter = `<c:chartSpace ${C_NS}><c:chart><c:plotArea><c:scatterChart>
+      <c:ser><c:idx val="0"/>
+        <c:xVal><c:numRef><c:numCache><c:ptCount val="3"/>
+          <c:pt idx="0"><c:v>1</c:v></c:pt><c:pt idx="1"><c:v>2</c:v></c:pt><c:pt idx="2"><c:v>3</c:v></c:pt>
+        </c:numCache></c:numRef></c:xVal>
+        <c:yVal><c:numRef><c:numCache><c:ptCount val="3"/>
+          <c:pt idx="0"><c:v>5</c:v></c:pt><c:pt idx="1"><c:v>9</c:v></c:pt><c:pt idx="2"><c:v>4</c:v></c:pt>
+        </c:numCache></c:numRef></c:yVal>
+      </c:ser>
+    </c:scatterChart></c:plotArea></c:chart></c:chartSpace>`;
+    const chart = parseChart(enc.encode(scatter), defaultColorResolver);
+    expect(chart!.type).toBe('scatter');
+    expect(chart!.series[0]!.values).toEqual([5, 9, 4]);
+    expect(chart!.series[0]!.xValues).toEqual([1, 2, 3]);
+  });
+
+  it('reads data labels (showVal) and axis titles', () => {
+    const withExtras = `<c:chartSpace ${C_NS}><c:chart><c:plotArea><c:barChart>
+      <c:barDir val="col"/><c:grouping val="clustered"/>
+      <c:dLbls><c:showVal val="1"/></c:dLbls>
+      <c:ser><c:idx val="0"/>
+        <c:val><c:numRef><c:numCache><c:ptCount val="2"/>
+          <c:pt idx="0"><c:v>3</c:v></c:pt><c:pt idx="1"><c:v>7</c:v></c:pt>
+        </c:numCache></c:numRef></c:val>
+      </c:ser>
+      </c:barChart>
+      <c:catAx><c:title><c:tx><c:rich><a:p><a:r><a:t>Quarter</a:t></a:r></a:p></c:rich></c:tx></c:title></c:catAx>
+      <c:valAx><c:title><c:tx><c:rich><a:p><a:r><a:t>Sales</a:t></a:r></a:p></c:rich></c:tx></c:valAx>
+    </c:plotArea></c:chart></c:chartSpace>`;
+    const chart = parseChart(enc.encode(withExtras), defaultColorResolver)!;
+    expect(chart.showValues).toBe(true);
+    expect(chart.catAxisTitle).toBe('Quarter');
+    expect(chart.valAxisTitle).toBe('Sales');
+  });
+
+  it("draws the axis and its data labels in the axis's own number format", () => {
+    // §21.2.2.121 c:valAx/c:numFmt. simple-monthly-budget.xlsx declares
+    // `"$"#,##0` and we printed 0/1000/2000 down the axis and 3750 on the bar,
+    // where every other reader shows $0/$1,000/$2,000 and $3,750.
+    const money = `<c:chartSpace ${C_NS}><c:chart><c:plotArea><c:barChart>
+      <c:barDir val="col"/><c:grouping val="clustered"/>
+      <c:dLbls><c:showVal val="1"/></c:dLbls>
+      <c:ser><c:idx val="0"/>
+        <c:val><c:numRef><c:numCache><c:ptCount val="2"/>
+          <c:pt idx="0"><c:v>3750</c:v></c:pt><c:pt idx="1"><c:v>2336</c:v></c:pt>
+        </c:numCache></c:numRef></c:val>
+      </c:ser>
+      </c:barChart>
+      <c:valAx><c:numFmt formatCode="&quot;$&quot;#,##0" sourceLinked="0"/></c:valAx>
+    </c:plotArea></c:chart></c:chartSpace>`;
+    const chart = parseChart(enc.encode(money), defaultColorResolver)!;
+    expect(chart.numberFormat).toBe('"$"#,##0');
+    const scene = buildChartScene(chart, 320, 200, (t, sz) => t.length * sz * 0.5);
+    const texts = scene!.labels.map((t) => t.text);
+    expect(texts).toContain('$3,750');
+    expect(texts).toContain('$2,336');
+    // The ticks carry it too — no bare 4000 anywhere on the axis.
+    expect(texts.some((t) => /^\$[\d,]+$/.test(t) && t !== '$3,750' && t !== '$2,336')).toBe(true);
+    expect(texts).not.toContain('4000');
+
+    // General is not a format: it means "plain", and a chart that says so keeps
+    // the numeric render.
+    const general = parseChart(
+      enc.encode(money.replace('&quot;$&quot;#,##0', 'General')),
+      defaultColorResolver,
+    )!;
+    expect(general.numberFormat).toBeUndefined();
+  });
+
+  it('prints a data label the author typed, not the one it would compute', () => {
+    // §21.2.2.49 — a <c:dLbl> carrying its own <c:tx><c:rich> replaces whatever
+    // the chart would generate for that point, and it is the only place that
+    // text exists. orderOfCNumFmtElements.xlsx labels every slice of its pie
+    // with a sentence ("Промышленные потребители; 22,7млрд.кВтч; 67,3%") and we
+    // drew a bare "67%" over each one.
+    const pie = `<c:chartSpace ${C_NS}><c:chart><c:plotArea><c:pieChart>
+      <c:ser><c:idx val="0"/>
+        <c:dLbls>
+          <c:dLbl><c:idx val="0"/><c:tx><c:rich><a:p><a:r><a:t>Big slice; 60%</a:t></a:r></a:p></c:rich></c:tx></c:dLbl>
+          <c:showVal val="1"/>
+        </c:dLbls>
+        <c:val><c:numRef><c:numCache><c:ptCount val="2"/>
+          <c:pt idx="0"><c:v>60</c:v></c:pt><c:pt idx="1"><c:v>40</c:v></c:pt>
+        </c:numCache></c:numRef></c:val>
+      </c:ser>
+      </c:pieChart></c:plotArea></c:chart></c:chartSpace>`;
+    const chart = parseChart(enc.encode(pie), defaultColorResolver)!;
+    expect(chart.series[0]?.pointLabels).toEqual([{ idx: 0, text: 'Big slice; 60%' }]);
+    const texts = buildChartScene(chart, 320, 240, (t, sz) => t.length * sz * 0.5)!.labels.map(
+      (l) => l.text,
+    );
+    expect(texts).toContain('Big slice; 60%');
+    // The point with no label of its own keeps the computed one — and this
+    // chart asks for `showVal`, so the computed one is the NUMBER.
+    expect(texts).toContain('40');
+    expect(texts).not.toContain('60%');
+  });
+
+  it('labels a pie with its numbers when the chart asks for them', () => {
+    // §21.2.2.223 `c:showVal`. Always a share of the whole,
+    // LIBRE_OFFICE-100610-0.pptx's five pies read 21/32/16/32% where every
+    // reader prints the 4, 6, 3 and 6 the file says to show.
+    const pie = (dLbls: string): string =>
+      `<c:chartSpace ${C_NS}><c:chart><c:plotArea><c:pieChart>
+      <c:ser><c:idx val="0"/>${dLbls}
+        <c:val><c:numRef><c:numCache><c:ptCount val="2"/>
+          <c:pt idx="0"><c:v>4</c:v></c:pt><c:pt idx="1"><c:v>6</c:v></c:pt>
+        </c:numCache></c:numRef></c:val>
+      </c:ser></c:pieChart></c:plotArea></c:chart></c:chartSpace>`;
+    const drawn = (dLbls: string): Array<string> =>
+      buildChartScene(
+        parseChart(enc.encode(pie(dLbls)), defaultColorResolver)!,
+        320,
+        240,
+        (t, sz) => t.length * sz * 0.5,
+      )!.labels.map((l) => l.text);
+    expect(drawn('<c:dLbls><c:showVal val="1"/></c:dLbls>')).toEqual(
+      expect.arrayContaining(['4', '6']),
+    );
+    // §21.2.2.49 — a pie whose labels show nothing, or that has none, shows
+    // nothing: Excel's PDF of such a pie carries no text at all (2026-10-02).
+    expect(drawn('')).toEqual([]);
+    expect(drawn('<c:dLbls><c:showVal val="0"/><c:showPercent val="0"/></c:dLbls>')).toEqual([]);
+    expect(drawn('<c:dLbls><c:delete val="1"/></c:dLbls>')).toEqual([]);
+  });
+
+  it("labels a pie's slices with what its switches ask for, as Excel does", () => {
+    // Excel's PDF of 10, 20 and 15 (2026-10-02): whole shares that add up to a
+    // hundred — 22%, 45%, 33%, where rounding each reads 44 for the middle
+    // one; the category over the share where the separator is a new line;
+    // the value then the share where it names none.
+    const pie = (dLbls: string): string =>
+      `<c:chartSpace ${C_NS}><c:chart><c:plotArea><c:pieChart>
+      <c:ser><c:idx val="0"/>${dLbls}
+        <c:cat><c:strRef><c:strCache><c:ptCount val="3"/>
+          <c:pt idx="0"><c:v>Alpha</c:v></c:pt><c:pt idx="1"><c:v>Beta</c:v></c:pt><c:pt idx="2"><c:v>Gamma</c:v></c:pt>
+        </c:strCache></c:strRef></c:cat>
+        <c:val><c:numRef><c:numCache><c:ptCount val="3"/>
+          <c:pt idx="0"><c:v>10</c:v></c:pt><c:pt idx="1"><c:v>20</c:v></c:pt><c:pt idx="2"><c:v>15</c:v></c:pt>
+        </c:numCache></c:numRef></c:val>
+      </c:ser></c:pieChart></c:plotArea></c:chart></c:chartSpace>`;
+    const drawn = (dLbls: string): Array<string> =>
+      buildChartScene(
+        parseChart(enc.encode(pie(dLbls)), defaultColorResolver)!,
+        320,
+        240,
+        (t, sz) => t.length * sz * 0.5,
+      )!.labels.map((l) => l.text);
+    expect(drawn('<c:dLbls><c:showPercent val="1"/></c:dLbls>')).toEqual(['22%', '45%', '33%']);
+    expect(
+      drawn(
+        '<c:dLbls><c:showCatName val="1"/><c:showPercent val="1"/><c:separator>\n</c:separator></c:dLbls>',
+      ),
+    ).toEqual(['Alpha', '22%', 'Beta', '45%', 'Gamma', '33%']);
+    expect(drawn('<c:dLbls><c:showVal val="1"/><c:showPercent val="1"/></c:dLbls>')).toEqual([
+      '10, 22%',
+      '20, 45%',
+      '15, 33%',
+    ]);
+    // The labels' own format is the share's where only the share is shown.
+    expect(
+      drawn(
+        '<c:dLbls><c:numFmt formatCode="0.0%" sourceLinked="0"/><c:showPercent val="1"/></c:dLbls>',
+      ),
+    ).toEqual(['22.2%', '44.4%', '33.3%']);
+  });
+
+  it("sets a slice's label inside where it fits and outside, tied back, where it does not", () => {
+    // §21.2.2.48 bestFit, Excel's default: the big slice keeps its name; the
+    // thin one's long name stands past its end with a leader line.
+    const pie = (dLblsExtra: string, dLbl = ''): string =>
+      `<c:chartSpace ${C_NS}><c:chart><c:plotArea><c:pieChart>
+      <c:ser><c:idx val="0"/>
+        <c:dLbls>${dLbl}<c:showCatName val="1"/><c:showLeaderLines val="1"/>${dLblsExtra}</c:dLbls>
+        <c:cat><c:strRef><c:strCache><c:ptCount val="2"/>
+          <c:pt idx="0"><c:v>Big</c:v></c:pt><c:pt idx="1"><c:v>A rather long name for a thin slice</c:v></c:pt>
+        </c:strCache></c:strRef></c:cat>
+        <c:val><c:numRef><c:numCache><c:ptCount val="2"/>
+          <c:pt idx="0"><c:v>95</c:v></c:pt><c:pt idx="1"><c:v>5</c:v></c:pt>
+        </c:numCache></c:numRef></c:val>
+      </c:ser></c:pieChart></c:plotArea></c:chart></c:chartSpace>`;
+    const scene = (xml: string) =>
+      buildChartScene(
+        parseChart(enc.encode(xml), defaultColorResolver)!,
+        400,
+        300,
+        (t, sz) => t.length * sz * 0.5,
+      )!;
+    const s = scene(pie(''));
+    const wedge = s.wedges[0]!;
+    const at = (text: string) => s.labels.find((l) => l.text.startsWith(text))!;
+    const dist = (l: { x: number; y: number }): number =>
+      Math.hypot(l.x - wedge.cx, l.y - wedge.cy);
+    expect(dist(at('Big'))).toBeLessThan(wedge.r);
+    expect(dist(at('A rather'))).toBeGreaterThan(wedge.r);
+    expect(s.polylines.length).toBe(1);
+    // …and a label its author placed by its own corner (§21.2.2.104, edge)
+    // stands there, the chart's fractions of its width and height.
+    const placed = scene(
+      pie(
+        '',
+        '<c:dLbl><c:idx val="1"/><c:layout><c:manualLayout><c:xMode val="edge"/><c:yMode val="edge"/>' +
+          '<c:x val="0.05"/><c:y val="0.1"/></c:manualLayout></c:layout><c:showCatName val="1"/></c:dLbl>',
+      ),
+    );
+    const moved = placed.labels.find((l) => l.text.startsWith('A rather'))!;
+    expect(moved.y).toBeGreaterThan(300 * 0.75);
+  });
+
+  it('draws a 3-D pie as a tilted disc, its front edge darker, as Excel does', () => {
+    // §21.2.2.140/§21.2.2.228 — Excel's PDF of a 3-D pie at rotX 30
+    // (2026-10-02): an ellipse half as tall as wide, standing 0.17 of its
+    // radius deep; with no rotX at all, the disc seen edge on.
+    const pie3D = (view: string, extra = ''): string =>
+      `<c:chartSpace ${C_NS}><c:chart>${view}<c:plotArea>${extra}<c:pie3DChart><c:varyColors val="1"/>
+      <c:ser><c:idx val="0"/><c:explosion val="25"/>
+        <c:dPt><c:idx val="1"/><c:explosion val="0"/></c:dPt>
+        <c:val><c:numRef><c:numCache><c:ptCount val="2"/>
+          <c:pt idx="0"><c:v>3</c:v></c:pt><c:pt idx="1"><c:v>1</c:v></c:pt>
+        </c:numCache></c:numRef></c:val>
+      </c:ser></c:pie3DChart></c:plotArea></c:chart></c:chartSpace>`;
+    const chart = parseChart(
+      enc.encode(pie3D('<c:view3D><c:rotX val="30"/><c:rotY val="90"/></c:view3D>')),
+      defaultColorResolver,
+    )!;
+    expect(chart.pie3D).toEqual({ rotX: 30, rotY: 90 });
+    expect(chart.series[0]).toMatchObject({
+      explosion: 25,
+      pointExplosions: [{ idx: 1, percent: 0 }],
+    });
+    const scene = buildChartScene(chart, 400, 300, (t, sz) => t.length * sz * 0.5)!;
+    expect(scene.wedges).toEqual([]);
+    const polygons = scene.polygons ?? [];
+    // Each slice's face in its own colour, and the edge under the front in a
+    // darker one.
+    const faces = polygons.filter((pg) => pg.fillHex === '4472C4' || pg.fillHex === 'ED7D31');
+    expect(faces).toHaveLength(2);
+    expect(polygons.some((pg) => pg.fillHex === '305089')).toBe(true);
+    const extent = (pts: ReadonlyArray<readonly [number, number]>) => {
+      const xs = pts.map(([x]) => x);
+      const ys = pts.map(([, y]) => y);
+      return { w: Math.max(...xs) - Math.min(...xs), h: Math.max(...ys) - Math.min(...ys) };
+    };
+    const all = extent(polygons.flatMap((pg) => pg.points));
+    expect(all.h / all.w).toBeLessThan(0.75);
+    // No rotX: the schema's 0, edge on.
+    expect(
+      parseChart(
+        enc.encode(pie3D('<c:view3D><c:perspective val="0"/></c:view3D>')),
+        defaultColorResolver,
+      )!.pie3D,
+    ).toEqual({ rotX: 0, rotY: 0 });
+  });
+
+  it('fits a pie into the box its author sized the plot to (§21.2.2.104)', () => {
+    // Excel's PDF: a flat pie in a box 0.4 wide and 0.25 tall is a circle as
+    // wide as the box is tall, centred in it.
+    const pie = `<c:chartSpace ${C_NS}><c:chart><c:plotArea>
+      <c:layout><c:manualLayout><c:layoutTarget val="inner"/><c:xMode val="edge"/><c:yMode val="edge"/>
+        <c:x val="0.3"/><c:y val="0.4"/><c:w val="0.4"/><c:h val="0.25"/></c:manualLayout></c:layout>
+      <c:pieChart><c:varyColors val="1"/><c:ser><c:idx val="0"/>
+        <c:val><c:numRef><c:numCache><c:ptCount val="2"/>
+          <c:pt idx="0"><c:v>3</c:v></c:pt><c:pt idx="1"><c:v>1</c:v></c:pt>
+        </c:numCache></c:numRef></c:val>
+      </c:ser></c:pieChart></c:plotArea></c:chart></c:chartSpace>`;
+    const chart = parseChart(enc.encode(pie), defaultColorResolver)!;
+    expect(chart.plotBox).toEqual({ x: 0.3, y: 0.4, w: 0.4, h: 0.25, inner: true });
+    const wedge = buildChartScene(chart, 400, 300, (t, sz) => t.length * sz * 0.5)!.wedges[0]!;
+    expect(wedge.r).toBeCloseTo((0.25 * 300) / 2, 5);
+    expect(wedge.cx).toBeCloseTo(0.5 * 400, 5);
+    expect(wedge.cy).toBeCloseTo(300 - (0.4 + 0.125) * 300, 5);
+  });
+
+  it("sets a chart's plot in the inner box its author sized (§21.2.2.104)", () => {
+    // aascu 5864.pptx sizes its bar charts' plots to the top of their frames,
+    // their legends placed under them; the plot is that box, its labels outside.
+    const withBox = BAR_CHART.replace(
+      '<c:plotArea>',
+      '<c:plotArea><c:layout><c:manualLayout><c:layoutTarget val="inner"/><c:xMode val="edge"/>' +
+        '<c:yMode val="edge"/><c:x val="0.2"/><c:y val="0.1"/><c:w val="0.6"/><c:h val="0.5"/>' +
+        '</c:manualLayout></c:layout>',
+    ).replace('<c:valAx><c:axId val="222"/>', '<c:valAx><c:axId val="222"/><c:majorGridlines/>');
+    const chart = parseChart(enc.encode(withBox), defaultColorResolver)!;
+    expect(chart.plotBox).toEqual({ x: 0.2, y: 0.1, w: 0.6, h: 0.5, inner: true });
+    const scene = buildChartScene(chart, 400, 300, (t, sz) => t.length * sz * 0.5)!;
+    const xs = (scene.gridlines ?? []).flatMap((g) => g.points.map(([x]) => x));
+    const ys = (scene.gridlines ?? []).flatMap((g) => g.points.map(([, y]) => y));
+    expect(Math.min(...xs)).toBeCloseTo(0.2 * 400, 5);
+    expect(Math.max(...xs)).toBeCloseTo(0.8 * 400, 5);
+    expect(Math.max(...ys)).toBeCloseTo(300 - 0.1 * 300, 5);
+    expect(Math.min(...ys)).toBeCloseTo(300 - 0.6 * 300, 5);
+  });
+
+  it('flags a doughnut chart (renders as a pie with a hole)', () => {
+    const doughnut = `<c:chartSpace ${C_NS}><c:chart><c:plotArea><c:doughnutChart>
+      <c:ser><c:idx val="0"/>
+        <c:val><c:numRef><c:numCache><c:ptCount val="2"/>
+          <c:pt idx="0"><c:v>60</c:v></c:pt><c:pt idx="1"><c:v>40</c:v></c:pt>
+        </c:numCache></c:numRef></c:val>
+      </c:ser>
+    </c:doughnutChart></c:plotArea></c:chart></c:chartSpace>`;
+    const chart = parseChart(enc.encode(doughnut), defaultColorResolver);
+    expect(chart!.type).toBe('pie');
+    expect(chart!.doughnut).toBe(true);
+  });
+});
+
+describe('chart drawing parsing', () => {
+  it('produces a chart BodyElement carrying the relationship id', () => {
+    const docx = buildDocxFromBody(chartDrawing('rId5'));
+    const parsed = parseDocument(OpcPackage.open(docx).getMainDocument().data);
+    expect(parsed).toHaveLength(1);
+    expect(parsed[0]!.kind).toBe('chart');
+    if (parsed[0]!.kind !== 'chart') throw new Error('unreachable');
+    expect(parsed[0]!.chart.chartRelId).toBe('rId5');
+    expect(parsed[0]!.chart.width).toBe(emuToPt(5486400));
+    expect(parsed[0]!.chart.height).toBe(emuToPt(3200400));
+  });
+});
+
+const LINE_CHART = `<c:chartSpace ${C_NS}><c:chart>
+  <c:plotArea>
+    <c:lineChart><c:grouping val="standard"/>
+      <c:ser>
+        <c:idx val="0"/><c:order val="0"/>
+        <c:tx><c:strRef><c:strCache><c:ptCount val="1"/><c:pt idx="0"><c:v>Alpha</c:v></c:pt></c:strCache></c:strRef></c:tx>
+        <c:spPr><a:ln><a:solidFill><a:srgbClr val="4472C4"/></a:solidFill></a:ln></c:spPr>
+        <c:cat><c:strRef><c:strCache><c:ptCount val="4"/><c:pt idx="0"><c:v>Jan</c:v></c:pt><c:pt idx="1"><c:v>Feb</c:v></c:pt><c:pt idx="2"><c:v>Mar</c:v></c:pt><c:pt idx="3"><c:v>Apr</c:v></c:pt></c:strCache></c:strRef></c:cat>
+        <c:val><c:numRef><c:numCache><c:ptCount val="4"/><c:pt idx="0"><c:v>5</c:v></c:pt><c:pt idx="1"><c:v>9</c:v></c:pt><c:pt idx="2"><c:v>7</c:v></c:pt><c:pt idx="3"><c:v>12</c:v></c:pt></c:numCache></c:numRef></c:val>
+      </c:ser>
+      <c:axId val="1"/><c:axId val="2"/>
+    </c:lineChart>
+    <c:catAx><c:axId val="1"/></c:catAx><c:valAx><c:axId val="2"/></c:valAx>
+  </c:plotArea>
+</c:chart></c:chartSpace>`;
+
+describe('line chart', () => {
+  it('parses a line series colour from its outline (a:ln)', () => {
+    const chart = parseChart(enc.encode(LINE_CHART), defaultColorResolver);
+    expect(chart!.type).toBe('line');
+    expect(chart!.series[0]).toMatchObject({
+      name: 'Alpha',
+      values: [5, 9, 7, 12],
+      colorHex: '4472C4',
+    });
+    expect(chart!.categories).toEqual(['Jan', 'Feb', 'Mar', 'Apr']);
+  });
+
+  it('renders a stroked polyline in the series colour', () => {
+    const docx = buildDocxFromBody(chartDrawing('rId7'), { charts: { rId7: LINE_CHART } });
+    const text = asLatin1(convertDocxToPdfSync(docx, { fonts: FONTS }));
+    // Series line stroked in 4472C4 (stroking RG, not fill rg).
+    expect(text).toContain('0.266667 0.447059 0.768627 RG');
+    expect(text).toContain(' l\n'); // polyline segments
+    expect(text).toMatch(/<[0-9A-F]+> Tj/); // axis/category labels
+  });
+});
+
+const PIE_CHART = `<c:chartSpace ${C_NS}><c:chart>
+  <c:plotArea>
+    <c:pieChart>
+      <c:ser>
+        <c:idx val="0"/><c:order val="0"/>
+        <c:cat><c:strRef><c:strCache><c:ptCount val="3"/><c:pt idx="0"><c:v>Red</c:v></c:pt><c:pt idx="1"><c:v>Green</c:v></c:pt><c:pt idx="2"><c:v>Blue</c:v></c:pt></c:strCache></c:strRef></c:cat>
+        <c:val><c:numRef><c:numCache><c:ptCount val="3"/><c:pt idx="0"><c:v>50</c:v></c:pt><c:pt idx="1"><c:v>30</c:v></c:pt><c:pt idx="2"><c:v>20</c:v></c:pt></c:numCache></c:numRef></c:val>
+      </c:ser>
+    </c:pieChart>
+  </c:plotArea>
+  <c:legend><c:legendPos val="r"/></c:legend>
+</c:chart></c:chartSpace>`;
+
+describe('pie chart', () => {
+  it('parses a single-series pie with categories', () => {
+    const chart = parseChart(enc.encode(PIE_CHART), defaultColorResolver);
+    expect(chart!.type).toBe('pie');
+    expect(chart!.categories).toEqual(['Red', 'Green', 'Blue']);
+    expect(chart!.series[0]!.values).toEqual([50, 30, 20]);
+  });
+
+  it('renders filled wedges (arc Béziers) with a category legend', () => {
+    const docx = buildDocxFromBody(chartDrawing('rId8'), { charts: { rId8: PIE_CHART } });
+    const text = asLatin1(convertDocxToPdfSync(docx, { fonts: FONTS }));
+    // Wedges are filled arc paths → contain Bézier curves.
+    expect(text).toMatch(/ c\n/);
+    // First slice in accent1 (4472C4) fill.
+    expect(text).toContain('0.266667 0.447059 0.768627 rg');
+    expect(text).toMatch(/<[0-9A-F]+> Tj/); // % labels / legend categories
+  });
+});
+
+describe('column chart rendering (end-to-end)', () => {
+  it('renders clustered bars in series colours with axes and labels', () => {
+    const docx = buildDocxFromBody(chartDrawing('rId5'), { charts: { rId5: BAR_CHART } });
+    const text = asLatin1(convertDocxToPdfSync(docx, { fonts: FONTS }));
+    // Filled bars in each series colour (4472C4 / ED7D31).
+    expect(text).toContain('0.266667 0.447059 0.768627 rg'); // 4472C4
+    expect(text).toContain('0.929412 0.490196 0.192157 rg'); // ED7D31
+    expect(text).toMatch(/\nh\nf\n/); // a filled bar rect
+    // Axis lines stroked in 595959 (→ 0.34902).
+    expect(text).toContain('0.34902 0.34902 0.34902 RG');
+    // Labels (categories / ticks / title) rendered as text.
+    expect(text).toMatch(/<[0-9A-F]+> Tj/);
+  });
+});
+
+describe('a text box anchored beside text (chart-size.docx)', () => {
+  // The box shares its paragraph with a run of body text, so the drawing is
+  // read from the run — which used to parse it with no body parser and no
+  // image resolver at all. The box came out empty: no "Before.", no chart, no
+  // "After.".
+  const boxed =
+    `<w:p><w:r><w:drawing>` +
+    `<wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0" relativeHeight="1" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1">` +
+    `<wp:simplePos x="0" y="0"/>` +
+    `<wp:positionH relativeFrom="column"><wp:posOffset>1000000</wp:posOffset></wp:positionH>` +
+    `<wp:positionV relativeFrom="paragraph"><wp:posOffset>100000</wp:posOffset></wp:positionV>` +
+    `<wp:extent cx="3943350" cy="1404620"/><wp:wrapNone/><wp:docPr id="2" name="Text Box 2"/>` +
+    `<a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">` +
+    `<a:graphicData uri="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">` +
+    `<wps:wsp xmlns:wps="http://schemas.microsoft.com/office/word/2010/wordprocessingShape">` +
+    `<wps:cNvSpPr txBox="1"/>` +
+    `<wps:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="3943350" cy="1404620"/></a:xfrm>` +
+    `<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></wps:spPr>` +
+    `<wps:txbx><w:txbxContent>` +
+    `<w:p><w:r><w:t>Before.</w:t></w:r></w:p>` +
+    chartDrawing('rId5', 2162810, 1297940) +
+    `<w:p><w:r><w:t>After.</w:t></w:r></w:p>` +
+    `</w:txbxContent></wps:txbx><wps:bodyPr/></wps:wsp>` +
+    `</a:graphicData></a:graphic></wp:anchor>` +
+    `</w:drawing></w:r><w:r><w:t>Body text.</w:t></w:r></w:p>`;
+
+  it('parses the box with everything in it', () => {
+    const { doc } = readDocx(buildDocxFromBody(boxed, { charts: { rId5: BAR_CHART } }));
+    const shape = doc.body.find((b) => b.kind === 'shape');
+    expect(
+      shape?.kind === 'shape' ? shape.shape.text?.content.map((c) => c.kind) : undefined,
+    ).toEqual(['paragraph', 'chart', 'paragraph']);
+  });
+
+  it('draws the chart inside it', () => {
+    const text = asLatin1(
+      convertDocxToPdfSync(buildDocxFromBody(boxed, { charts: { rId5: BAR_CHART } }), {
+        fonts: FONTS,
+      }),
+    );
+    expect(text).toContain('0.266667 0.447059 0.768627 rg'); // 4472C4 bars
+    expect(text).toContain('0.929412 0.490196 0.192157 rg'); // ED7D31 bars
+  });
+});
+
+describe('a chart in a paragraph that holds text too (chart-dupe.docx)', () => {
+  // A lone drawing collapses to a block; anything else in the paragraph kept
+  // the drawing in the run, where only pictures render — the chart was
+  // dropped. chart-dupe.docx sets one beside a trailing space.
+  const body = chartDrawing('rId5').replace(
+    '</w:r></w:p>',
+    `</w:r><w:r><w:t xml:space="preserve"> </w:t></w:r></w:p>`,
+  );
+
+  it('keeps the chart, as the block it is, and the paragraph beside it', () => {
+    const { doc } = readDocx(buildDocxFromBody(body, { charts: { rId5: BAR_CHART } }));
+    expect(doc.body.map((b) => b.kind)).toEqual(['chart', 'paragraph']);
+    const first = doc.body[0];
+    expect(first?.kind === 'chart' ? first.chart.chartRelId : undefined).toBe(
+      'word/charts/chart1.xml',
+    );
+  });
+
+  it('draws it', () => {
+    const text = asLatin1(
+      convertDocxToPdfSync(buildDocxFromBody(body, { charts: { rId5: BAR_CHART } }), {
+        fonts: FONTS,
+      }),
+    );
+    expect(text).toContain('0.266667 0.447059 0.768627 rg'); // 4472C4 bars
+    expect(text).toMatch(/\nh\nf\n/);
+  });
+});
+
+describe('a chart anchored in a footer (chart-in-footer.docx)', () => {
+  // Charts were collected from the main document's rels only, and the band
+  // renderer drew paragraphs, tables and images but not charts — a document
+  // whose only content is a footer chart came out blank. Relationship ids are
+  // scoped to their owning part (OPC §9.3), so the footer's rId5 here is a
+  // different chart from the body's.
+  const docx = buildDocxFromBody(
+    `<w:p><w:r><w:t>body</w:t></w:r></w:p>` +
+      `<w:sectPr><w:footerReference w:type="default" r:id="rId11"/></w:sectPr>`,
+    {
+      footerXml: chartDrawing('rId5'),
+      footerCharts: { rId5: BAR_CHART },
+      charts: { rId5: PIE_CHART },
+    },
+  );
+
+  it('draws the footer chart on every page', () => {
+    const text = asLatin1(convertDocxToPdfSync(docx, { fonts: FONTS }));
+    expect(text).toContain('0.266667 0.447059 0.768627 rg'); // 4472C4 bars
+    expect(text).toContain('0.929412 0.490196 0.192157 rg'); // ED7D31 bars
+    expect(text).toMatch(/\nh\nf\n/); // a filled bar rect
+  });
+
+  it('keeps the body and the footer rId5 apart', () => {
+    const { doc } = readDocx(docx);
+    // Two chart parts, filed under their part paths rather than a shared id.
+    expect([...(doc.charts?.keys() ?? [])].sort()).toEqual([
+      'word/charts/chart1.xml',
+      'word/charts/chart2.xml',
+    ]);
+    const footer = doc.headersFooters?.get('rId11');
+    const block = footer?.find((b) => b.kind === 'chart');
+    expect(block?.kind === 'chart' ? block.chart.chartRelId : undefined).toBe(
+      'word/charts/chart2.xml',
+    );
+    expect(doc.charts?.get('word/charts/chart2.xml')?.type).toBe('bar');
+  });
+});
+
+describe('an auto-generated chart title (§21.2.2.213)', () => {
+  const chartXml = (title: string, sers: string): string =>
+    `<?xml version="1.0"?><c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">` +
+    `<c:chart>${title}<c:plotArea><c:barChart><c:barDir val="col"/>${sers}</c:barChart></c:plotArea></c:chart></c:chartSpace>`;
+  const oneSeries =
+    `<c:ser><c:tx><c:strRef><c:strCache><c:pt idx="0"><c:v>Demo</c:v></c:pt></c:strCache></c:strRef></c:tx>` +
+    `<c:val><c:numRef><c:numCache><c:pt idx="0"><c:v>1</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser>`;
+
+  it('takes the series name when there is exactly one, and the placeholder otherwise', () => {
+    // `c:tx` is optional: a `<c:title>` without one asks the application to make
+    // the title up, and §21.2.2.10's `autoTitleDeleted val="0"` says the made-up
+    // title stands. Reading only the `a:t` runs left it undefined, and eleven
+    // chart parts across eight corpus files are written this way.
+    const single = parseChart(
+      enc.encode(
+        chartXml('<c:title><c:layout/></c:title><c:autoTitleDeleted val="0"/>', oneSeries),
+      ),
+      defaultColorResolver,
+    );
+    expect(single?.title).toBe('Demo');
+    const two = parseChart(
+      enc.encode(
+        chartXml('<c:title><c:layout/></c:title>', oneSeries + oneSeries.replace('Demo', 'Other')),
+      ),
+      defaultColorResolver,
+    );
+    expect(two?.title).toBe('Chart Title');
+  });
+
+  it('stays silent when the author deleted it, or asked for no title at all', () => {
+    expect(
+      parseChart(
+        enc.encode(
+          chartXml('<c:title><c:layout/></c:title><c:autoTitleDeleted val="1"/>', oneSeries),
+        ),
+        defaultColorResolver,
+      )?.title,
+    ).toBeUndefined();
+    expect(
+      parseChart(enc.encode(chartXml('', oneSeries)), defaultColorResolver)?.title,
+    ).toBeUndefined();
+  });
+});
+
+describe('the points a chart part declares', () => {
+  /** A column chart of `series` series, each with the value cache `cache`. */
+  const withCache = (cache: string, series = 1): string =>
+    `<c:chartSpace ${C_NS}><c:chart><c:plotArea><c:barChart><c:barDir val="col"/>` +
+    Array.from(
+      { length: series },
+      (_, i) =>
+        `<c:ser><c:idx val="${String(i)}"/><c:order val="${String(i)}"/>` +
+        `<c:val><c:numRef><c:numCache>${cache}</c:numCache></c:numRef></c:val></c:ser>`,
+    ).join('') +
+    '</c:barChart></c:plotArea></c:chart></c:chartSpace>';
+  const valuesOf = (xml: string): ReadonlyArray<ReadonlyArray<number>> =>
+    parseChart(enc.encode(xml), defaultColorResolver)!.series.map((s) => s.values);
+
+  it('keeps the empty points a cache counts past its last value', () => {
+    // A range with blank rows after its data leaves their slots on the axis.
+    const cache =
+      '<c:ptCount val="5"/><c:pt idx="0"><c:v>3</c:v></c:pt><c:pt idx="2"><c:v>7</c:v></c:pt>';
+    expect(valuesOf(withCache(cache))[0]).toEqual([3, 0, 7, 0, 0]);
+  });
+
+  it('keeps no more points than a sheet has rows, whatever the cache counts', () => {
+    // A count past 2³² − 1 threw for want of an array that long, an index out
+    // there did the same, and a count of two billion took all the memory.
+    for (const cache of [
+      '<c:ptCount val="5000000000"/><c:pt idx="0"><c:v>3</c:v></c:pt>',
+      '<c:ptCount val="1"/><c:pt idx="0"><c:v>3</c:v></c:pt><c:pt idx="4294967295"><c:v>7</c:v></c:pt>',
+    ]) {
+      const [values] = valuesOf(withCache(cache));
+      expect(values).toHaveLength(MOST_CHART_POINTS);
+      expect(values![0]).toBe(3);
+    }
+  });
+
+  it('reads a count or an index that is no whole number as none', () => {
+    // 2.5 slots is no length an array can have, and the chart failed to read.
+    const cache =
+      '<c:ptCount val="2.5"/><c:pt idx="0"><c:v>3</c:v></c:pt><c:pt idx="1.5"><c:v>7</c:v></c:pt>';
+    expect(valuesOf(withCache(cache))[0]).toEqual([3]);
+  });
+
+  it('shares the points among the series, so the chart as a whole is bounded', () => {
+    // Two thousand series, each counting a sheet's worth of points, are two
+    // billion of them.
+    const series = valuesOf(
+      withCache('<c:ptCount val="1048576"/><c:pt idx="0"><c:v>3</c:v></c:pt>', 2000),
+    );
+    expect(series).toHaveLength(2000);
+    for (const values of series) expect(values).toHaveLength(pointsPerSeries(2000));
+    expect(pointsPerSeries(2000) * 2000).toBeLessThanOrEqual(MOST_CHART_POINTS);
+  });
+
+  it('bounds the categories of several levels, and reads more than a call takes', () => {
+    // §21.2.2.115 — their count and starts are the file's too; and spread into
+    // one call, 200 000 labels overflowed the stack.
+    const labels = Array.from(
+      { length: 200_000 },
+      (_, i) => `<c:pt idx="${String(i)}"><c:v>c${String(i)}</c:v></c:pt>`,
+    ).join('');
+    const cat = (count: string, inner: string): string =>
+      `<c:cat><c:multiLvlStrRef><c:multiLvlStrCache><c:ptCount val="${count}"/>` +
+      `<c:lvl>${inner}</c:lvl><c:lvl><c:pt idx="0"><c:v>G</c:v></c:pt>` +
+      '<c:pt idx="99999999999"><c:v>far</c:v></c:pt></c:lvl>' +
+      '</c:multiLvlStrCache></c:multiLvlStrRef></c:cat>';
+    const parse = (c: string): ReturnType<typeof parseChart> =>
+      parseChart(
+        enc.encode(BAR_CHART.replace(/<c:cat>[\s\S]*?<\/c:cat>/, c)),
+        defaultColorResolver,
+      );
+    const counted = parse(cat('5000000000', '<c:pt idx="0"><c:v>a</c:v></c:pt>'))!;
+    // As many as each of its two series keeps.
+    expect(counted.categories).toHaveLength(pointsPerSeries(counted.series.length));
+    expect(counted.categoryGroups).toEqual([[{ start: 0, label: 'G' }]]);
+    const many = parse(cat('200000', labels))!;
+    expect(many.categories).toHaveLength(200_000);
+    expect(many.categories[199_999]).toBe('c199999');
+  });
+
+  it("bounds a title's cache too", () => {
+    const title =
+      '<c:title><c:tx><c:strRef><c:f>Sheet1!$A$1</c:f><c:strCache><c:ptCount val="5000000000"/>' +
+      '<c:pt idx="0"><c:v>Formula Title</c:v></c:pt></c:strCache></c:strRef></c:tx></c:title>';
+    const chart = parseChart(
+      enc.encode(BAR_CHART.replace(/<c:title>[\s\S]*?<\/c:title>/, title)),
+      defaultColorResolver,
+    );
+    expect(chart?.title).toBe('Formula Title');
+  });
+});

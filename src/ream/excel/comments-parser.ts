@@ -1,0 +1,196 @@
+// Cell comments / notes (E-SHEET W7). Two parts carry them:
+//   • legacy  xl/comments#.xml  (§18.7) — <authors> + <commentList>, each
+//     <comment ref authorId> with a rich <text>; the author is an index into
+//     <authors>. The text is kept run by run as well, for the note's box — the
+//     accompanying VML drawing says whether that box is shown, and where (the
+//     reader pairs the two).
+//   • modern  xl/threadedComments/threadedComment#.xml (a conversation) — each
+//     <threadedComment ref personId> with a plain <text>; the author is a
+//     person id resolved through xl/persons/person.xml.
+// Both reduce to the same format-neutral SheetComment list (cell ref, author,
+// text), which the projection lists in a "Comments" section after the grid.
+
+import { XMLParser } from 'fast-xml-parser';
+
+import type { SheetComment } from '../core/ir/sheet';
+import type { SheetRichRun } from '../core/spreadsheet-model';
+import { resolveInternalEntities } from '../core/opc/xml-entities';
+import { richRun as richRunOf } from './shared-strings-parser';
+
+const decoder = new TextDecoder('utf-8');
+
+const parser = new XMLParser({
+  // §4.1 of XML 1.0: a numeric character reference is not an entity — `&#10;`
+  // IS a line feed and every parser must decode it. fast-xml-parser gates that
+  // on `htmlEntities`, which defaults to false, so `&#10;` reached the page as
+  // five literal characters (formats.xlsx writes "Hello,&#10;Calc!"). Named
+  // HTML entities come along with the switch; in XML they are undefined anyway,
+  // and reading `&nbsp;` as a space beats drawing it. Entities a DOCTYPE
+  // declares the parser never registers at all, so they are resolved before it
+  // sees the text — see resolveInternalEntities.
+  htmlEntities: true,
+  ignoreAttributes: false,
+  attributeNamePrefix: '@_',
+  textNodeName: '#text',
+  parseAttributeValue: false,
+  parseTagValue: false,
+  trimValues: false,
+  // Tolerate explicit namespace prefixes (some producers prefix every element).
+  removeNSPrefix: true,
+});
+
+/**
+ * Parse a legacy `xl/comments#.xml` part (§18.7.3/§18.7.6) into {@link SheetComment}s.
+ * `authorId` indexes the `<authors>` list; the text is rich (`<r><t>`) so it
+ * flattens like a shared string. Excel stores a bold "Author:\n" run at the head
+ * of the text — stripped here so the resolved author is not shown twice.
+ */
+export function parseLegacyComments(data: Uint8Array): Array<SheetComment> {
+  const tree = parser.parse(resolveInternalEntities(decoder.decode(data))) as Record<
+    string,
+    unknown
+  >;
+  const root = asObject(tree['comments']);
+  if (!root) return [];
+  const authors = toArray(asObject(root['authors'])?.['author']).map((a) => textOf(a));
+  const out: Array<SheetComment> = [];
+  for (const c of toArray(asObject(root['commentList'])?.['comment'])) {
+    const obj = asObject(c);
+    if (!obj) continue;
+    const ref = strAttr(obj, 'ref');
+    if (!ref) continue;
+    const authorIdx = Number(strAttr(obj, 'authorId'));
+    const author = Number.isInteger(authorIdx) ? authors[authorIdx] : undefined;
+    const text = stripAuthorPrefix(richText(obj['text']), author);
+    if (text.length === 0 && !author) continue;
+    const runs = richRuns(obj['text']);
+    out.push({
+      ref,
+      ...(author ? { author } : {}),
+      text,
+      ...(runs.length > 0 ? { runs } : {}),
+      threaded: false,
+    });
+  }
+  return out;
+}
+
+/**
+ * Parse `xl/persons/person.xml` into an `id → displayName` map, used to resolve
+ * the authors of threaded comments.
+ */
+export function parsePersons(data: Uint8Array): Map<string, string> {
+  const tree = parser.parse(resolveInternalEntities(decoder.decode(data))) as Record<
+    string,
+    unknown
+  >;
+  const root = asObject(tree['personList']);
+  const map = new Map<string, string>();
+  if (!root) return map;
+  for (const p of toArray(root['person'])) {
+    const obj = asObject(p);
+    const id = obj ? strAttr(obj, 'id') : undefined;
+    const name = obj ? strAttr(obj, 'displayName') : undefined;
+    if (id && name) map.set(id, name);
+  }
+  return map;
+}
+
+/**
+ * Parse a modern `xl/threadedComments/threadedComment#.xml` part (a conversation)
+ * into {@link SheetComment}s. Each entry is one message (replies share the `ref`);
+ * `personId` resolves through `persons`. Entries are returned in document order so
+ * a thread reads top to bottom.
+ *
+ * @param data    The threaded-comments part bytes.
+ * @param persons The `id → displayName` map from {@link parsePersons}.
+ */
+export function parseThreadedComments(
+  data: Uint8Array,
+  persons: ReadonlyMap<string, string>,
+): Array<SheetComment> {
+  const tree = parser.parse(resolveInternalEntities(decoder.decode(data))) as Record<
+    string,
+    unknown
+  >;
+  const root = asObject(tree['ThreadedComments']);
+  if (!root) return [];
+  const out: Array<SheetComment> = [];
+  for (const c of toArray(root['threadedComment'])) {
+    const obj = asObject(c);
+    if (!obj) continue;
+    const ref = strAttr(obj, 'ref');
+    if (!ref) continue;
+    const personId = strAttr(obj, 'personId');
+    const author = personId ? persons.get(personId) : undefined;
+    const text = textOf(obj['text']);
+    if (text.length === 0) continue;
+    out.push({ ref, ...(author ? { author } : {}), text, threaded: true });
+  }
+  return out;
+}
+
+// A legacy comment's <text> is rich (<r><t>…</t></r>…) or a bare <t>; flatten it.
+function richText(node: unknown): string {
+  const obj = asObject(node);
+  if (!obj) return textOf(node);
+  const direct = textOf(obj['t']);
+  if (direct) return direct;
+  return toArray(obj['r'])
+    .map((r) => textOf(asObject(r)?.['t']))
+    .join('');
+}
+
+// The same <text>, run by run with each run's own font — the note's box shows
+// it exactly so, the bold "Author:" line included.
+function richRuns(node: unknown): Array<SheetRichRun> {
+  const obj = asObject(node);
+  if (!obj) {
+    const plain = textOf(node);
+    return plain ? [{ text: plain }] : [];
+  }
+  const direct = textOf(obj['t']);
+  if (direct) return [{ text: direct }];
+  const out: Array<SheetRichRun> = [];
+  for (const r of toArray(obj['r'])) {
+    const run = asObject(r);
+    const text = textOf(run?.['t']);
+    if (text.length > 0) out.push(richRunOf(text, run?.['rPr']));
+  }
+  return out;
+}
+
+// Drop a leading "Author:" / "Author:\n" the legacy producer prepends, so the
+// resolved author (shown separately) is not duplicated in the body.
+function stripAuthorPrefix(text: string, author: string | undefined): string {
+  if (!author) return text;
+  const prefix = `${author}:`;
+  if (text.startsWith(prefix)) return text.slice(prefix.length).replace(/^\s+/, '');
+  return text;
+}
+
+function asObject(v: unknown): Record<string, unknown> | undefined {
+  return v && typeof v === 'object' && !Array.isArray(v)
+    ? (v as Record<string, unknown>)
+    : undefined;
+}
+
+function toArray(v: unknown): ReadonlyArray<unknown> {
+  return Array.isArray(v) ? v : v !== undefined ? [v] : [];
+}
+
+function strAttr(obj: Record<string, unknown>, key: string): string | undefined {
+  const v = obj[`@_${key}`];
+  return typeof v === 'string' ? v : undefined;
+}
+
+function textOf(node: unknown): string {
+  if (typeof node === 'string') return node;
+  if (typeof node === 'number') return String(node);
+  const obj = asObject(node);
+  if (!obj) return '';
+  const inner = obj['#text'];
+  if (typeof inner === 'string') return inner;
+  if (typeof inner === 'number') return String(inner);
+  return '';
+}

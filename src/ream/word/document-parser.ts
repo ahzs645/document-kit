@@ -1,0 +1,1960 @@
+// ECMA-376 Part 1 §17 — WordprocessingML document parser.
+//
+// Produces BodyElement[] preserving the original interleaving of paragraphs
+// and tables in the body. Uses fast-xml-parser in preserveOrder mode for
+// traversal; for per-element property extraction we adapt PO subtrees to the
+// flat shape the rPr/pPr parsers consume (po-to-flat).
+
+import { XMLParser } from 'fast-xml-parser';
+
+import type {
+  BodyElement,
+  Comment,
+  HeaderFooterReference,
+  HeaderFooterType,
+  InlineImage,
+  NumberingFormat,
+  PageMargins,
+  PageSize,
+  Paragraph,
+  ParagraphProperties,
+  Run,
+  RunProperties,
+  Section,
+  SectionColumns,
+  SectionProperties,
+  ShapeFill,
+  TabStop,
+} from '../core/document-model';
+
+import type { ColorResolver } from '../core/drawingml/colors';
+import type { Loss, Pt, ResourceId } from '../core/ir';
+import type { PoNode } from '../core/po-helpers';
+import type { ThemeFonts } from '../core/drawingml/theme-parser';
+import type { DrawingContent, ParseDrawingText, ThemeStyles } from './drawing-parser';
+import { resolveInternalEntities } from '../core/opc/xml-entities';
+import { emuToPt, pt, twipsToPt } from '../core/ir';
+import { parseOMath } from './omml-parser';
+import { defaultColorResolver } from '../core/drawingml/colors';
+import { expandMcChildren, parseDrawing, parseVmlPicture, vmlFill } from './drawing-parser';
+import {
+  diagramTransform,
+  noDiagramOverrideLoss,
+  parseDiagramNodes,
+  parseTxBody,
+} from '../pptx/slide-parser';
+import { parseParagraphProperties } from './paragraph-properties';
+import {
+  poAttr,
+  poAttrLocal,
+  poChildren,
+  poFindByPath,
+  poFindDescendant,
+  poIntAttr,
+  poIs,
+  poIsLocal,
+  poText,
+} from '../core/po-helpers';
+import { poElementToFlat } from './po-to-flat';
+import { parseRunProperties } from './run-properties';
+import { parseBorders, parseTable } from './table-parser';
+import { FORMATS } from './numbering-parser';
+
+const decoder = new TextDecoder('utf-8');
+
+// §21.1.2 — the DrawingML text reader a drawing needs for an `a:txBody`. It
+// lives with the PresentationML shapes, which is the other place a shape may
+// carry one; the drawing parser takes it as a parameter rather than import it,
+// so the two stay independent of one another.
+const drawingTextParser: ParseDrawingText = (txBody, resolveColor) =>
+  parseTxBody(txBody, undefined, undefined, resolveColor, undefined);
+
+const parser = new XMLParser({
+  // §4.1 of XML 1.0: a numeric character reference is not an entity — `&#10;`
+  // IS a line feed and every parser must decode it. fast-xml-parser gates that
+  // on `htmlEntities`, which defaults to false, so `&#10;` reached the page as
+  // five literal characters (formats.xlsx writes "Hello,&#10;Calc!"). Named
+  // HTML entities come along with the switch; in XML they are undefined anyway,
+  // and reading `&nbsp;` as a space beats drawing it. Nested DOCTYPE entities
+  // stay unexpanded either way — the parser never registers them (54764-2.xlsx).
+  htmlEntities: true,
+  ignoreAttributes: false,
+  attributeNamePrefix: '@_',
+  preserveOrder: true,
+  parseAttributeValue: false,
+  parseTagValue: false,
+  trimValues: false,
+  // The parser's own guard against runaway nesting defaults to 100 tags, which
+  // real documents reach: deep-table-cell.docx nests tables past it and the
+  // whole file went unread over a limit meant for pathological input. Deep
+  // enough for any document a word processor can produce, and still bounded.
+  maxNestedTags: 1000,
+});
+
+const RUN_CONTAINER_TAGS = new Set([
+  'w:hyperlink',
+  'w:sdt',
+  'w:sdtContent',
+  'w:smartTag',
+  'w:fldSimple',
+  // Tracked changes — "accept all / final document" semantics: descend into
+  // inserted (§17.13.5.18) and moved-in (§17.13.5.31) runs so their text
+  // renders. w:del / w:moveFrom are deliberately NOT here, so deleted /
+  // moved-out runs are dropped (their text lives in w:delText, not w:t).
+  'w:ins',
+  'w:moveTo',
+]);
+
+/**
+ * Resolves a drawing relationship id to a content-addressed `ResourceId` —
+ * supplied by the converter (which owns the OPC package and the `ResourceStore`).
+ */
+export type ImageResolver = (relId: string) => ResourceId | undefined;
+/** Resolves a `w:hyperlink` `r:id` to its external target URL. */
+export type HyperlinkResolver = (relId: string) => string | undefined;
+
+/**
+ * A SmartArt diagram's pre-rendered drawing override: its `dsp:spTree`, plus a
+ * resolver for the picture fills its nodes name — those relationships belong to
+ * the drawing part, not to the part that references the diagram.
+ */
+export interface ResolvedDiagram {
+  readonly spTree: PoNode;
+  readonly resolveImage?: ImageResolver;
+}
+
+/**
+ * Document-wide resolvers every nested parser needs — one context object instead
+ * of threading a parameter pair through ten signatures (oop-design §8).
+ */
+export interface ParseContext {
+  /** Resolver for theme/scheme/auto colours. */
+  readonly resolveColor: ColorResolver;
+  /** Resolver for a drawing relationship id to a stored image. */
+  readonly resolveImage?: ImageResolver;
+  /**
+   * §17.16.22 `w:hyperlink` `r:id` → external target URL from the owning part's
+   * rels (`TargetMode="External"` only). Absent ⇒ links unwrap to plain text.
+   */
+  readonly resolveHyperlink?: HyperlinkResolver;
+  /**
+   * SmartArt: a data relationship id (`dgm:relIds` `@r:dm`) → the diagram's
+   * pre-rendered drawing override, or `undefined` when the file ships none
+   * (E-SMARTART SA2).
+   */
+  readonly resolveDiagram?: (
+    relId: string,
+    frame: { readonly cx: number; readonly cy: number },
+  ) => ResolvedDiagram | undefined;
+  /**
+   * §21.2 a `c:chart` `@r:id` → the chart part's path, the key the reader files
+   * parsed charts under. Relationship ids are scoped to their owning part, so a
+   * footer's `rId1` and the body's `rId1` are different charts. Absent ⇒ the
+   * raw rel id is kept.
+   */
+  readonly resolveChartPart?: (relId: string) => string | undefined;
+  /**
+   * §20.1.4.2.19 — the theme's `a:lnStyleLst` widths in points, which a
+   * gallery-styled shape's `a:lnRef idx` indexes for its outline weight.
+   */
+  readonly themeLineWidths?: ReadonlyArray<number>;
+  /**
+   * §20.1.4.1.14/§20.1.4.1.15 — the theme's format scheme: the fill, background
+   * fill and effect styles a `<wps:style>` reference indexes for the fill and
+   * the shadow a gallery-drawn shape wears.
+   */
+  readonly themeStyles?: ThemeStyles;
+  /**
+   * §20.1.4.1.16 — the theme's font scheme, for the typefaces a run names by
+   * slot (`w:asciiTheme="minorHAnsi"`) rather than by name.
+   */
+  readonly themeFonts?: ThemeFonts;
+  /**
+   * Sink for graceful-degradation notices (E-SMARTART SA3): a SmartArt with no
+   * drawing override records a dropped-feature {@link Loss} rather than vanishing.
+   */
+  readonly onLoss?: (loss: Loss) => void;
+  /**
+   * §17.13.4 comment ranges currently open as the body is read — a mutable set
+   * the run collector stamps onto each run (`commentRangeRefs`). A comment range
+   * can span paragraphs, so the state is document-level, not per-paragraph. The
+   * reference is readonly; its contents mutate during the walk (CM2c).
+   */
+  readonly openCommentRanges?: Set<string>;
+  /**
+   * §17.3.1.1/§17.3.1.3 — what `w:beforeAutospacing`/`w:afterAutospacing`
+   * resolve to: HTML's 14pt for a Word document, nothing (the default) where
+   * the caller gives none.
+   */
+  readonly autoSpacingPt?: number;
+}
+
+/** The default {@link ParseContext} — just the default colour resolver. */
+export const DEFAULT_PARSE_CONTEXT: ParseContext = { resolveColor: defaultColorResolver };
+
+/**
+ * Parse `word/document.xml` (ECMA-376 Part 1 §17) into a flat list of
+ * {@link BodyElement}, preserving the original interleaving of paragraphs and
+ * tables.
+ *
+ * @param documentXml The raw `document.xml` bytes.
+ * @param ctx         The document-wide parse context.
+ * @returns The body elements; empty when the `w:body` is absent.
+ */
+export function parseDocument(
+  documentXml: Uint8Array,
+  ctx: ParseContext = DEFAULT_PARSE_CONTEXT,
+  blocks?: BlockCounter,
+): Array<BodyElement> {
+  // A DTD is forbidden in OPC and fast-xml-parser refuses one outright when it
+  // declares an EXTERNAL entity — which is the right instinct and the wrong
+  // outcome: ExternalEntityInText.docx names http://poi.apache.org/ and the
+  // whole document went unread over it. The subset is resolved and stripped
+  // here, and a reference to something we will not fetch simply drops.
+  const xml = resolveInternalEntities(decoder.decode(documentXml));
+  const tree = parser.parse(xml) as Array<PoNode>;
+  const children = documentBodyChildren(tree);
+  if (children.length === 0) return [];
+  return parseBodyElements(children, ctx, blocks);
+}
+
+/**
+ * §17.2.2 — the `w:document`'s body content. The schema allows one `w:body`
+ * and producers have written several: MultipleBodyBug.docx carries three, and
+ * reading only the first printed one paragraph of its three. They are read as
+ * the one body they stand for, in order.
+ *
+ * @param tree The parsed `document.xml`.
+ * @returns Every body's children, concatenated.
+ */
+function documentBodyChildren(tree: ReadonlyArray<PoNode>): Array<PoNode> {
+  const doc = poFindByPath(tree, ['w:document']);
+  if (!doc) return [];
+  const out: Array<PoNode> = [];
+  for (const child of poChildren(doc)) {
+    if (poIs(child, 'w:body')) out.push(...poChildren(child));
+  }
+  return out;
+}
+
+/**
+ * §17.2.1 `w:background` — the colour the whole page is painted, as a six-digit
+ * hex. Read from `@w:color` (Word's own attribute), falling back to the VML
+ * `v:background @fillcolor` beside it. `auto` and a gradient-only background
+ * (which carries no flat colour of its own) both come back undefined.
+ *
+ * @param documentXml The raw `document.xml` bytes.
+ * @returns The colour, or undefined when the document names none.
+ */
+export function parseBackgroundColor(documentXml: Uint8Array): string | undefined {
+  const bg = backgroundNode(documentXml);
+  if (!bg) return undefined;
+  const vml = poChildren(bg).find((c) => poIs(c, 'v:background'));
+  const raw = poAttr(bg, 'color') ?? (vml ? poAttr(vml, 'fillcolor') : undefined);
+  const hex = raw?.replace(/^#/u, '');
+  return hex !== undefined && /^[0-9A-Fa-f]{6}$/u.test(hex) ? hex.toUpperCase() : undefined;
+}
+
+/**
+ * §17.2.1 — the page background as the FILL it is. `@w:color` is only the flat
+ * fallback: the `v:background` beside it carries the gradient or the picture
+ * Word actually paints, and both references draw those. fill.docx runs a
+ * five-stop radial sweep where we painted its fallback navy, and
+ * tdf126533_pageBitmap.docx papers the page with an image.
+ *
+ * @param documentXml  The raw `document.xml` bytes.
+ * @param resolveImage Resolver for a picture background's `r:id`.
+ * @returns The fill, or undefined when the document names no background.
+ */
+export function parseBackgroundFill(
+  documentXml: Uint8Array,
+  resolveImage?: (relId: string) => ResourceId | undefined,
+): ShapeFill | undefined {
+  const bg = backgroundNode(documentXml);
+  // §17.2.1 — the shape is drawn only when the element carries `@w:color` too.
+  // The pair tdf126533_pageBitmap / _noPageBitmap differ in nothing else: same
+  // `v:fill type="frame"`, same picture, same `w:displayBackgroundShape`, and
+  // the one without the attribute is the one no reader paints.
+  if (!bg || poAttr(bg, 'color') === undefined) return undefined;
+  const vml = poChildren(bg).find((c) => poIs(c, 'v:background'));
+  if (!vml) return undefined;
+  const fill = vmlFill(vml, undefined, resolveImage);
+  // A flat fill says nothing `@w:color` has not said already; the caller keeps
+  // using the colour for that, so the writers that know only a colour still see
+  // one.
+  return fill.kind === 'gradient' || fill.kind === 'picture' ? fill : undefined;
+}
+
+function backgroundNode(documentXml: Uint8Array): PoNode | undefined {
+  const tree = parser.parse(resolveInternalEntities(decoder.decode(documentXml))) as Array<PoNode>;
+  const doc = poFindByPath(tree, ['w:document']);
+  return doc ? poChildren(doc).find((c) => poIs(c, 'w:background')) : undefined;
+}
+
+/**
+ * Lines a parsed body up with anything counted in SOURCE blocks. `index[i]` is
+ * the ordinal of the `w:p`/`w:tbl` that produced body element `i`; `next` is the
+ * running count. A paragraph carrying anchored drawings produces several
+ * elements, so the two counts diverge — and {@link parseSections} counts blocks.
+ */
+export interface BlockCounter {
+  readonly index: Array<number>;
+  next: number;
+}
+
+/** A fresh {@link BlockCounter}. */
+export function newBlockCounter(): BlockCounter {
+  return { index: [], next: 0 };
+}
+
+/**
+ * Translate a section boundary counted in source blocks into one counted in body
+ * elements: the number of elements that came from a block before `blockEnd`.
+ *
+ * @param blocks   The counter filled while parsing the body.
+ * @param blockEnd The section's `endIndex`, in source blocks.
+ * @returns The matching body-element index.
+ */
+export function bodyIndexForBlock(blocks: BlockCounter, blockEnd: number): number {
+  let n = 0;
+  while (n < blocks.index.length && blocks.index[n]! < blockEnd) n++;
+  return n;
+}
+
+const HF_TYPES = new Set<HeaderFooterType>(['default', 'first', 'even']);
+
+/**
+ * The empty {@link SectionProperties} fallback (no headers/footers). §17.6.13 —
+ * on the page a document with no `w:sectPr` of its own is made on, which is the
+ * same US Letter a section with no `w:pgSz` gets.
+ */
+export const EMPTY_SECTION: SectionProperties = {
+  pageSize: { width: twipsToPt(12240), height: twipsToPt(15840) },
+  headers: [],
+  footers: [],
+};
+
+/**
+ * Parse the document's final section properties (ECMA-376 Part 1 §17.6.17 — the
+ * body-level `sectPr` is the last child of `w:body` and describes the final
+ * section). Returned as a single {@link SectionProperties} for backward
+ * compatibility; multi-section documents use {@link parseSections} instead.
+ *
+ * @param documentXml The raw `document.xml` bytes.
+ * @returns The final section's properties, or {@link EMPTY_SECTION} when there is none.
+ */
+export function parseSection(documentXml: Uint8Array): SectionProperties {
+  const sections = parseSections(documentXml);
+  if (sections.length === 0) return EMPTY_SECTION;
+  // Use the final section as the document-wide fallback; it usually carries
+  // pgSz/pgMar even when intermediate sections only override headers.
+  return sections[sections.length - 1]!.properties;
+}
+
+/**
+ * Collect every section in the document (ECMA-376 §17.6): one `sectPr` per
+ * intermediate paragraph plus the body-final one. Each {@link Section} carries
+ * the exclusive `endIndex` into the body-element list, so section `i` applies to
+ * `body[sections[i-1].endIndex .. endIndex)`. A document with no `sectPr` at all
+ * returns a single empty section spanning the whole body.
+ *
+ * @param documentXml The raw `document.xml` bytes.
+ * @returns The sections in document order; empty when the `w:body` is absent.
+ */
+export function parseSections(documentXml: Uint8Array): Array<Section> {
+  const xml = resolveInternalEntities(decoder.decode(documentXml));
+  const tree = parser.parse(xml) as Array<PoNode>;
+  const children = documentBodyChildren(tree);
+  if (children.length === 0) return [];
+
+  const sections: Array<Section> = [];
+  let bodyIdx = 0;
+  let trailing: SectionProperties | undefined;
+
+  const walk = (nodes: ReadonlyArray<PoNode>): void => {
+    for (const child of nodes) {
+      if (poIs(child, 'w:sectPr')) {
+        // §17.6.17 — the body carries ONE sectPr, and it describes the section
+        // holding everything after the last break, wherever the element itself
+        // sits. tdf108849.docx writes two of them in the MIDDLE of its body:
+        // taken as sections in their own right they became a portrait page of
+        // nothing and pushed the last paragraph onto a fourth, A4 page. Only
+        // the last one counts, and it closes at the end of the body.
+        trailing = parseSectPrNode(child);
+        continue;
+      }
+      if (poIs(child, 'w:p')) {
+        // Mid-document section break: sectPr inside pPr ends the section at the
+        // *end* of this paragraph (paragraph belongs to the closing section).
+        const pPrNode = poChildren(child).find((c) => poIs(c, 'w:pPr'));
+        const sectPrInPPr = pPrNode
+          ? poChildren(pPrNode).find((c) => poIs(c, 'w:sectPr'))
+          : undefined;
+        // tryExtractImageFromParagraph and parseTable count toward bodyIdx
+        // identically — we mirror parseBodyElements' "one BodyElement per w:p
+        // or w:tbl" semantics here.
+        bodyIdx++;
+        if (sectPrInPPr) {
+          sections.push({ properties: parseSectPrNode(sectPrInPPr), endIndex: bodyIdx });
+        }
+      } else if (poIs(child, 'w:tbl')) {
+        bodyIdx++;
+      } else if (poIs(child, 'w:sdt')) {
+        // A block-level content control is chrome: its children are body flow,
+        // and parseBodyElements counts them, so this must too — section breaks
+        // included. multi-page-toc.docx ends its table of contents, control and
+        // all, with the break that starts the chapters on a page of their own,
+        // and counted without looking inside we drew the whole document on one.
+        const content = poChildren(child).find((c) => poIs(c, 'w:sdtContent'));
+        walk(content ? poChildren(content) : []);
+      }
+    }
+  };
+  walk(children);
+
+  if (trailing) sections.push({ properties: trailing, endIndex: bodyIdx });
+  if (sections.length === 0 || sections[sections.length - 1]!.endIndex < bodyIdx) {
+    sections.push({ properties: EMPTY_SECTION, endIndex: bodyIdx });
+  }
+  return sections;
+}
+
+function parseSectPrNode(sectPr: PoNode): SectionProperties {
+  // §17.6.13 — a section that states no `w:pgSz` is on the page Word makes a
+  // document on: US Letter, 12240×15840 twips. Left to the library's own A4
+  // fallback, every hand-written fixture that omits the element — 39 of the
+  // corpus, tdf104713_undefinedStyles.docx among them — came out on a page
+  // 30pt narrower and 50pt taller than both references draw.
+  let pageSize: PageSize | undefined = { width: twipsToPt(12240), height: twipsToPt(15840) };
+  let margins: PageMargins | undefined;
+  let titlePg = false;
+  let pageNumberStart: number | undefined;
+  let pageNumberFormat: NumberingFormat | undefined;
+  let lineNumbering: SectionProperties['lineNumbering'];
+  let columns: SectionColumns | undefined;
+  let sectionStart: 'continuous' | 'nextPage' | 'oddPage' | 'evenPage' | undefined;
+  let pageBorders: SectionProperties['pageBorders'];
+  let gridLinePitchPt: Pt | undefined;
+  let textDirection: SectionProperties['textDirection'];
+  const headers: Array<HeaderFooterReference> = [];
+  const footers: Array<HeaderFooterReference> = [];
+
+  for (const child of poChildren(sectPr)) {
+    if (poIs(child, 'w:pgSz')) {
+      const w = poIntAttr(child, 'w');
+      const h = poIntAttr(child, 'h');
+      const orientRaw = poAttr(child, 'orient');
+      if (w !== undefined && h !== undefined) {
+        pageSize = {
+          width: twipsToPt(w),
+          height: twipsToPt(h),
+          ...(orientRaw === 'portrait' || orientRaw === 'landscape'
+            ? { orientation: orientRaw }
+            : {}),
+        };
+      }
+    } else if (poIs(child, 'w:pgMar')) {
+      const top = poIntAttr(child, 'top');
+      const right = poIntAttr(child, 'right');
+      const bottom = poIntAttr(child, 'bottom');
+      const left = poIntAttr(child, 'left');
+      const header = poIntAttr(child, 'header');
+      const footer = poIntAttr(child, 'footer');
+      // §17.6.11 — the binding space. gutter-left.docx asks for half an inch
+      // of it and we set its text flush against the plain margin.
+      const gutter = poIntAttr(child, 'gutter');
+      margins = {
+        top: twipsToPt(top ?? 1440),
+        right: twipsToPt(right ?? 1440),
+        bottom: twipsToPt(bottom ?? 1440),
+        left: twipsToPt(left ?? 1440),
+        ...(header !== undefined ? { header: twipsToPt(header) } : {}),
+        ...(footer !== undefined ? { footer: twipsToPt(footer) } : {}),
+        ...(gutter !== undefined && gutter > 0 ? { gutter: twipsToPt(gutter) } : {}),
+      };
+    } else if (poIs(child, 'w:headerReference')) {
+      pushHeaderFooter(child, headers);
+    } else if (poIs(child, 'w:footerReference')) {
+      pushHeaderFooter(child, footers);
+    } else if (poIs(child, 'w:titlePg')) {
+      const val = poAttr(child, 'val');
+      titlePg = val === undefined || val === '' || (val !== '0' && val !== 'false');
+    } else if (poIs(child, 'w:lnNumType')) {
+      // §17.6.8 — line numbers in the margin. fdo66543.docx counts by three and
+      // we printed none of them.
+      const countBy = poIntAttr(child, 'countBy') ?? 1;
+      const start = poIntAttr(child, 'start') ?? 1;
+      const distance = poIntAttr(child, 'distance');
+      const restartRaw = poAttr(child, 'restart');
+      lineNumbering = {
+        countBy: countBy > 0 ? countBy : 1,
+        start,
+        ...(distance !== undefined ? { distancePt: twipsToPt(distance) } : {}),
+        restart:
+          restartRaw === 'newSection' || restartRaw === 'continuous' ? restartRaw : 'newPage',
+      };
+    } else if (poIs(child, 'w:pgNumType')) {
+      // §17.6.12 — the number this section's first page carries.
+      // fdo44689_start_page_0.docx asks for 0 and its footer printed 1.
+      const start = poIntAttr(child, 'start');
+      if (start !== undefined) pageNumberStart = start;
+      // …and the numerals it prints them in: a thesis numbers its front
+      // matter i, ii, iii before the body starts again at 1.
+      const fmt = poAttr(child, 'fmt');
+      if (fmt !== undefined && FORMATS.has(fmt as NumberingFormat) && fmt !== 'decimal') {
+        pageNumberFormat = fmt as NumberingFormat;
+      }
+    } else if (poIs(child, 'w:cols')) {
+      columns = parseColumns(child);
+    } else if (poIs(child, 'w:pgBorders')) {
+      // §17.6.10 — the rules around the page, spelled exactly as a cell's are.
+      // `@w:offsetFrom` defaults to the text margin (§17.18.65 ST_PageBorderOffset).
+      const borders = parseBorders(child);
+      if (borders) {
+        pageBorders = {
+          borders,
+          offsetFrom: poAttr(child, 'offsetFrom') === 'page' ? 'page' : 'text',
+        };
+      }
+    } else if (poIs(child, 'w:docGrid')) {
+      // §17.6.5 — the document grid. `lines` (and `linesAndChars`) puts every
+      // line of the section's text on a grid of `@w:linePitch` twips; the
+      // default `default` sets no grid at all. fdo80902.docx rules an 18pt
+      // grid, and its two paragraphs sat a plain line height apart.
+      const type = poAttr(child, 'type') ?? 'default';
+      const pitch = poIntAttr(child, 'linePitch');
+      if ((type === 'lines' || type === 'linesAndChars') && pitch !== undefined && pitch > 0) {
+        gridLinePitchPt = twipsToPt(pitch);
+      }
+    } else if (poIs(child, 'w:type')) {
+      // §17.6.22 ST_SectionMark. `continuous` keeps the page; `oddPage` and
+      // `evenPage` ask for a sheet of that parity, which the layout pads to;
+      // `nextColumn` is a page here as it is for a section of one column.
+      const val = poAttr(child, 'val');
+      sectionStart =
+        val === 'continuous' || val === 'oddPage' || val === 'evenPage' ? val : 'nextPage';
+    } else if (poIs(child, 'w:textDirection')) {
+      // §17.6.20 — the section's lines run down the sheet, each to the left
+      // of the one before. `lrTb`, the default, says nothing.
+      const val = poAttr(child, 'val');
+      if (val === 'tbRl' || val === 'btLr') textDirection = val;
+    }
+  }
+
+  return {
+    pageSize,
+    ...(margins ? { margins } : {}),
+    headers,
+    footers,
+    ...(titlePg ? { titlePg: true } : {}),
+    ...(pageNumberStart !== undefined ? { pageNumberStart } : {}),
+    ...(pageNumberFormat !== undefined ? { pageNumberFormat } : {}),
+    ...(lineNumbering ? { lineNumbering } : {}),
+    ...(columns ? { columns } : {}),
+    ...(sectionStart ? { sectionStart } : {}),
+    ...(pageBorders ? { pageBorders } : {}),
+    ...(gridLinePitchPt !== undefined ? { gridLinePitchPt } : {}),
+    ...(textDirection ? { textDirection } : {}),
+  };
+}
+
+// §17.6.4 w:cols: @w:num equal-width columns separated by @w:space, OR
+// explicit w:col children each with their own width/trailing space.
+function parseColumns(cols: PoNode): SectionColumns | undefined {
+  // §17.6.4 `w:sep` — the rule Word draws down each gutter.
+  const sepRaw = poAttr(cols, 'sep');
+  const separator = sepRaw !== undefined && sepRaw !== '0' && sepRaw !== 'false';
+  const explicit: Array<{ widthPt: number; spacePt: number }> = [];
+  for (const col of poChildren(cols)) {
+    if (!poIs(col, 'w:col')) continue;
+    const w = poIntAttr(col, 'w');
+    if (w === undefined) continue;
+    explicit.push({ widthPt: twipsToPt(w), spacePt: twipsToPt(poIntAttr(col, 'space') ?? 0) });
+  }
+  const num = poIntAttr(cols, 'num');
+  const count = explicit.length > 0 ? explicit.length : (num ?? 1);
+  if (count <= 1) return undefined;
+  return {
+    count,
+    spacePt: twipsToPt(poIntAttr(cols, 'space') ?? 720),
+    ...(explicit.length > 0 ? { explicit } : {}),
+    ...(separator ? { separator: true } : {}),
+  };
+}
+
+function pushHeaderFooter(node: PoNode, list: Array<HeaderFooterReference>): void {
+  const rId = poAttr(node, 'id');
+  if (!rId) return;
+  const typeRaw = poAttr(node, 'type') ?? 'default';
+  const type: HeaderFooterType = HF_TYPES.has(typeRaw as HeaderFooterType)
+    ? (typeRaw as HeaderFooterType)
+    : 'default';
+  list.push({ type, relationshipId: rId });
+}
+
+/**
+ * Parse `word/header*.xml` or `word/footer*.xml`. The root is `w:hdr` or
+ * `w:ftr`, whose children are the same body-element shape as the main document.
+ *
+ * @param xml The raw header/footer part bytes.
+ * @param ctx The document-wide parse context.
+ * @returns The body elements; empty when neither root is found.
+ */
+export function parseHeaderFooter(
+  xml: Uint8Array,
+  ctx: ParseContext = DEFAULT_PARSE_CONTEXT,
+): Array<BodyElement> {
+  const tree = parser.parse(resolveInternalEntities(decoder.decode(xml))) as Array<PoNode>;
+  const root = tree.find((n) => poIs(n, 'w:hdr') || poIs(n, 'w:ftr'));
+  if (!root) return [];
+  return parseBodyElements(poChildren(root), ctx);
+}
+
+/**
+ * Parse a sequence of body-level children (`w:p`, `w:tbl`, `w:sdt`,
+ * `w:bookmarkStart`) into {@link BodyElement}s, preserving order. A lone-drawing
+ * paragraph collapses to a standalone image/shape/chart block; a block-level SDT
+ * unwraps to its content; a body-level bookmark anchors onto the next paragraph.
+ *
+ * @param children The body-level child nodes.
+ * @param ctx      The document-wide parse context.
+ * @returns The parsed body elements.
+ */
+export function parseBodyElements(
+  children: ReadonlyArray<PoNode>,
+  ctx: ParseContext = DEFAULT_PARSE_CONTEXT,
+  // Out-param: for each emitted element, the ordinal of the `w:p`/`w:tbl` it
+  // came from. A paragraph carrying anchored drawings emits several elements,
+  // so this is what lets a caller line the body up with something counted in
+  // source blocks — {@link parseSections}' endIndex, for one.
+  blocks?: BlockCounter,
+  // §17.5.2.28 — the run properties a content control around this content
+  // lends it, under whatever each run states for itself.
+  sdtRunProps?: RunProperties,
+): Array<BodyElement> {
+  const out: Array<BodyElement> = [];
+  const mark = (n: number): void => {
+    if (!blocks) return;
+    for (let i = 0; i < n; i++) blocks.index.push(blocks.next);
+  };
+  // Body-level w:bookmarkStart (between block elements) anchors to the NEXT
+  // paragraph.
+  let pendingBookmarks: Array<string> | undefined;
+  // §17.3.3.1 — a `w:br` belongs in a RUN, but producers do write one straight
+  // into the body, and both references honour it. tdf108714.docx separates its
+  // paragraphs with body-level page breaks and nothing else, so read as
+  // unknown chrome its four pages came out as one.
+  let pendingPageBreak = false;
+  for (const child of children) {
+    if (poIs(child, 'w:br')) {
+      if (poAttr(child, 'type') === 'page') pendingPageBreak = true;
+      continue;
+    }
+    if (poIs(child, 'w:bookmarkStart')) {
+      const bookmarkName = poAttr(child, 'name');
+      if (bookmarkName !== undefined && bookmarkName !== '' && bookmarkName !== '_GoBack') {
+        (pendingBookmarks ??= []).push(bookmarkName);
+      }
+    } else if (poIs(child, 'w:p')) {
+      const drawings = tryExtractDrawingFromParagraph(child, ctx);
+      if (drawings) {
+        out.push(...drawings);
+        mark(drawings.length);
+      } else {
+        const anchored: Array<BodyElement> = [];
+        const parsed = parseParagraph(child, ctx, pendingBookmarks, anchored, sdtRunProps);
+        const paragraph = pendingPageBreak
+          ? { ...parsed, properties: { ...parsed.properties, pageBreakBefore: true } }
+          : parsed;
+        pendingPageBreak = false;
+        // The floats first: each places itself against the paragraph it hangs
+        // off, and one emitted after it would hang off whatever follows.
+        out.push(...anchored, { kind: 'paragraph', paragraph });
+        mark(anchored.length + 1);
+        pendingBookmarks = undefined;
+      }
+      if (blocks) blocks.next++;
+    } else if (poIs(child, 'w:tbl')) {
+      out.push({ kind: 'table', table: parseTable(child, ctx) });
+      mark(1);
+      if (blocks) blocks.next++;
+    } else if (poIs(child, 'w:sdt')) {
+      // §17.5.2 block-level structured document tag (content control): the
+      // wrapper is chrome — its sdtContent children are ordinary body flow.
+      const content = poChildren(child).find((c) => poIs(c, 'w:sdtContent'));
+      if (content) {
+        // §17.5.2.28 — a BLOCK-level control's `w:sdtPr/w:rPr` is the placeholder
+        // it shows when empty, not the formatting of the paragraphs inside it:
+        // those keep their own styles. fdo83044.docx wraps its cover page in a
+        // `Cover Pages` docPartObj that states 16pt italic, and lending that to
+        // the contents set the title in it — where Word and LibreOffice print
+        // the large bold face the CoverPage style asks for.
+        out.push(...parseBodyElements(poChildren(content), ctx, blocks, sdtRunProps));
+      }
+    }
+  }
+  return out;
+}
+
+// ECMA-376 Part 1 §17.3.3 (drawing) + §20 (DrawingML).
+// A paragraph containing ONLY a w:drawing (no text alongside it) collapses to
+// a standalone block: an ImageBlock for an embedded picture, or a ShapeBlock
+// for a wps:wsp shape. Mixed text+drawing paragraphs keep a picture on the run
+// via Run.inlineImage (shapes in mixed runs are dropped in M5) and are emitted
+// as paragraphs by parseBodyElements.
+// Run wrappers a lone picture can hide inside that the writer flattens away:
+// tracked-change insals/moves (§17.13.5) and content controls / smart tags
+// (§17.5.2). A re-read of the writer's output sees the bare <w:drawing>, so to
+// keep paragraph counts stable across the round-trip these must be transparent
+// to the standalone-image collapse too. w:hyperlink and w:fldSimple are
+// deliberately excluded — the writer preserves a link / field on an inline
+// image, so such a paragraph must stay a paragraph, not collapse to a block.
+const COLLAPSE_TRANSPARENT_TAGS = new Set([
+  'w:ins',
+  'w:moveTo',
+  'w:sdt',
+  'w:sdtContent',
+  'w:smartTag',
+]);
+
+interface LoneDrawingScan {
+  /**
+   * Every drawing in the paragraph, in order. A paragraph may anchor several —
+   * LineStyle_DashType.docx hangs all seven of its rectangles off one — and
+   * keeping only the first dropped the other six on the floor.
+   */
+  drawings: Array<PoNode>;
+  vml?: PoNode;
+  hasOther: boolean;
+}
+
+// Scan a paragraph (descending through the transparent wrappers above) for a
+// single drawing / VML picture with no sibling content. hasOther trips on real
+// text, math, fields or hyperlinks — anything the writer would keep, which
+// means the paragraph must not collapse to a standalone image block.
+function scanForLoneDrawing(container: PoNode, acc: LoneDrawingScan): void {
+  for (const child of expandMcChildren(poChildren(container))) {
+    if (poIs(child, 'w:pPr')) continue;
+    if (poIs(child, 'w:r')) {
+      for (const rc of expandMcChildren(poChildren(child))) {
+        if (poIs(rc, 'w:drawing')) {
+          acc.drawings.push(rc);
+        } else if (poIs(rc, 'w:pict') || poIs(rc, 'w:object')) {
+          // Only a VML node that actually bears something to draw is a
+          // candidate — a picture (`v:imagedata`) or §14.1.2.22 WordArt
+          // (`v:textpath`). An empty frame or a bare ActiveX/OLE control object
+          // is ignored, so a paragraph that pairs a picture run with a control
+          // run still collapses on the picture.
+          if (
+            !acc.vml &&
+            (poFindDescendant(rc, 'v:imagedata') ?? poFindDescendant(rc, 'v:textpath')) !==
+              undefined
+          ) {
+            acc.vml = rc;
+          }
+        } else if (poIs(rc, 'w:t') && poText(rc).length > 0) {
+          acc.hasOther = true;
+        } else if (
+          poIs(rc, 'w:tab') ||
+          poIs(rc, 'w:ptab') ||
+          poIs(rc, 'w:br') ||
+          poIs(rc, 'w:noBreakHyphen')
+        ) {
+          acc.hasOther = true;
+        }
+      }
+      continue;
+    }
+    if (poIs(child, 'm:oMath') || poIs(child, 'm:oMathPara')) {
+      acc.hasOther = true;
+      continue;
+    }
+    const tag = elementTag(child);
+    if (tag && COLLAPSE_TRANSPARENT_TAGS.has(tag)) {
+      scanForLoneDrawing(child, acc);
+    } else if (tag && RUN_CONTAINER_TAGS.has(tag)) {
+      // A hyperlink / field wrapping the picture: keep the paragraph (the
+      // writer preserves the link or field on the inline image).
+      acc.hasOther = true;
+    }
+  }
+}
+
+function tryExtractDrawingFromParagraph(p: PoNode, ctx: ParseContext): Array<BodyElement> | null {
+  const scan: LoneDrawingScan = { hasOther: false, drawings: [] };
+  scanForLoneDrawing(p, scan);
+  const { drawings, vml } = scan;
+  if (scan.hasOther || (drawings.length === 0 && !vml)) return null;
+  // §20.4.2.3 — an ANCHORED drawing leaves the flow; the paragraph it hangs
+  // off does not. Its mark still stands on a line of its own, so a paragraph
+  // that holds nothing else is an EMPTY line with a drawing beside it — which
+  // is what the collapse below throws away. tdf101627.docx anchors its page
+  // number in the footer that way and the band, measured as nothing, sat a
+  // line lower than the footer margin puts it. An INLINE drawing still
+  // collapses: it IS the line, and the writer re-emits it as one.
+  if (!vml && drawings.every((d) => poChildren(d).some((c) => poIs(c, 'wp:anchor')))) return null;
+
+  // Inject parseBodyElements (bound to this context) so a shape's text box is
+  // parsed without a module cycle. A modern <w:drawing> takes precedence over a
+  // legacy <w:pict>/<w:object> VML picture (§14). Collapsing a lone picture to
+  // a standalone block here is what keeps the round-trip symmetric: the writer
+  // re-emits a block image as its own lone-drawing paragraph, which a re-read
+  // collapses again — so the FIRST read must collapse too, or paragraph counts
+  // drift by one on every standalone VML image.
+  const parseBody = (children: ReadonlyArray<PoNode>): Array<BodyElement> =>
+    parseBodyElements(children, ctx);
+  const pPrNode = poChildren(p).find((c) => poIs(c, 'w:pPr'));
+  const paragraphProperties = pPrNode
+    ? parseParagraphProperties(poElementToFlat(pPrNode), ctx.autoSpacingPt, ctx.themeFonts)
+    : {};
+
+  if (drawings.length === 0) {
+    const content = parseVmlPicture(vml!, parseBody);
+    if (!content) return null;
+    // A dangling VML <v:imagedata r:id> (referenced media absent from the
+    // package) carries nothing to render; skip it so the paragraph stays empty
+    // on both read passes rather than materialising an un-writable phantom.
+    if (content.kind === 'image' && ctx.resolveImage?.(content.imageId) === undefined) return null;
+    return blocksForDrawing(content, paragraphProperties, ctx);
+  }
+
+  // Every drawing the paragraph holds, in order — not just the first. Each
+  // becomes a block of its own, which is right for a drawing that PLACES
+  // itself (an anchored float) and for the lone inline picture the writer
+  // re-emits as its own paragraph. Several INLINE drawings share a line, and
+  // blocks cannot: issue_51265_3.docx sets four pictures in one paragraph and
+  // we stacked them down the page where two fit across it.
+  const contents = drawings
+    .map((d) =>
+      parseDrawing(
+        d,
+        ctx.resolveColor,
+        parseBody,
+        ctx.resolveImage,
+        ctx.resolveChartPart,
+        ctx.themeLineWidths,
+        ctx.themeStyles,
+        drawingTextParser,
+      ),
+    )
+    .filter((c): c is DrawingContent => c !== null);
+  if (contents.length > 1 && contents.some((c) => !c.float)) return null;
+  const out: Array<BodyElement> = [];
+  for (const content of contents) {
+    out.push(...(blocksForDrawing(content, paragraphProperties, ctx) ?? []));
+  }
+  return out.length > 0 ? out : null;
+}
+
+/**
+ * One parsed drawing as the body elements it becomes: a picture, a chart, a
+ * shape, or the several shapes a SmartArt diagram draws.
+ *
+ * @param content              The parsed drawing.
+ * @param paragraphProperties  The owning paragraph's properties, which a block
+ *                             carries for its spacing and alignment.
+ * @param ctx                  The document-wide parse context.
+ * @returns The blocks, or `null` when the drawing renders nothing.
+ */
+function blocksForDrawing(
+  content: DrawingContent,
+  paragraphProperties: ParagraphProperties,
+  ctx: ParseContext,
+): Array<BodyElement> | null {
+  if (content.kind === 'image') {
+    const resource = ctx.resolveImage?.(content.imageId);
+    return [
+      {
+        kind: 'image',
+        image: {
+          ...(resource ? { resource } : {}),
+          ...(content.outline ? { outline: content.outline } : {}),
+          ...(content.shadow ? { shadow: content.shadow } : {}),
+          ...(content.wash ? { wash: content.wash } : {}),
+          width: content.width,
+          height: content.height,
+          ...(content.crop ? { crop: content.crop } : {}),
+          ...(content.rotation60k ? { rotation60k: content.rotation60k } : {}),
+          ...(content.flipH ? { flipH: true } : {}),
+          ...(content.flipV ? { flipV: true } : {}),
+          ...(content.relativeSize ? { relativeSize: content.relativeSize } : {}),
+          ...(content.effectExtent ? { effectExtent: content.effectExtent } : {}),
+          paragraphProperties,
+          ...(content.altText ? { altText: content.altText } : {}),
+          ...(content.float ? { float: content.float } : {}),
+        },
+      },
+    ];
+  }
+  if (content.kind === 'chart') {
+    return [
+      {
+        kind: 'chart',
+        chart: {
+          chartRelId: content.chartRelId,
+          width: content.width,
+          height: content.height,
+          paragraphProperties,
+          ...(content.altText ? { altText: content.altText } : {}),
+          ...(content.float ? { float: content.float } : {}),
+        },
+      },
+    ];
+  }
+  if (content.kind === 'diagram') {
+    // SmartArt: resolve the drawing override and render its nodes (E-SMARTART
+    // SA2). No override ⇒ keep the (empty) paragraph, byte-stable.
+    // The frame goes with the id: a file that ships no cached drawing has its
+    // layout RUN, and a layout is a program whose answer depends on the size it
+    // is given.
+    const diagram = ctx.resolveDiagram?.(content.dmRelId, {
+      cx: content.widthEmu,
+      cy: content.heightEmu,
+    });
+    if (!diagram) {
+      // No drawing override shipped — record a graceful loss and keep the
+      // (empty) paragraph, byte-stable (SA3).
+      ctx.onLoss?.(noDiagramOverrideLoss());
+      return null;
+    }
+    const frame = { x: 0, y: 0, cx: content.widthEmu, cy: content.heightEmu };
+    const nodes = parseDiagramNodes(
+      diagram.spTree,
+      diagramTransform(diagram.spTree, frame),
+      ctx.resolveColor,
+      undefined,
+      diagram.resolveImage,
+    );
+    // One box holding the nodes at their offsets inside it, rather than a
+    // scatter of floats each anchored to the paragraph: a diagram is a drawing
+    // like any other, and an INLINE one has to reserve its height the way the
+    // reference does. fdo87488 stacks two full-page diagrams — the second of
+    // them empty — and we drew one page where the reference draws two.
+    return [
+      {
+        kind: 'shape',
+        shape: {
+          width: emuToPt(content.widthEmu),
+          height: emuToPt(content.heightEmu),
+          children: nodes.map(({ box, shape }) => ({
+            shape,
+            xPt: emuToPt(box.x),
+            yPt: emuToPt(box.y),
+          })),
+          geometry: { kind: 'preset', preset: 'rect', adjust: new Map() },
+          fill: { kind: 'none' },
+          paragraphProperties,
+          ...(content.altText ? { altText: content.altText } : {}),
+          ...(content.float ? { float: content.float } : {}),
+        },
+      },
+    ];
+  }
+  return [
+    {
+      kind: 'shape',
+      shape: {
+        ...content.data,
+        paragraphProperties,
+        ...(content.altText ? { altText: content.altText } : {}),
+        ...(content.float ? { float: content.float } : {}),
+      },
+    },
+  ];
+}
+
+function parseParagraph(
+  p: PoNode,
+  ctx: ParseContext,
+  extraBookmarks?: Array<string>,
+  // §20.4.2.3 — out-param: the anchored drawings the paragraph's runs carry.
+  // They hang off the paragraph rather than sitting in its lines, so the caller
+  // emits them as blocks beside it.
+  anchored?: Array<BodyElement>,
+  // §17.5.2.28 — what a content control around this paragraph lends its runs.
+  sdtRunProps?: RunProperties,
+): Paragraph {
+  // §17.13.6.2 — bookmarks opening in this paragraph (plus any the caller
+  // carried over from between-paragraph positions). The hidden _GoBack
+  // edit-cursor bookmark is noise in every Word save — skipped.
+  const bookmarks: Array<string> = [...(extraBookmarks ?? [])];
+  for (const child of poChildren(p)) {
+    if (!poIs(child, 'w:bookmarkStart')) continue;
+    const bookmarkName = poAttr(child, 'name');
+    if (bookmarkName !== undefined && bookmarkName !== '' && bookmarkName !== '_GoBack') {
+      bookmarks.push(bookmarkName);
+    }
+  }
+  const pPr = poChildren(p).find((c) => poIs(c, 'w:pPr'));
+  let properties = parseParagraphProperties(
+    pPr ? poElementToFlat(pPr) : undefined,
+    ctx.autoSpacingPt,
+    ctx.themeFonts,
+  );
+  // §17.6.17 — a `w:sectPr` in the paragraph mark makes this paragraph the last
+  // of its section, and the mark itself the break. An otherwise empty one is
+  // therefore not a blank line: fdo73596_RunInStyle brackets its index with two
+  // of them and we opened a 20pt hole on either side.
+  if (pPr && poChildren(pPr).some((c) => poIs(c, 'w:sectPr'))) {
+    properties = { ...properties, sectionBreak: true };
+  }
+  // A display equation (m:oMathPara) centres its paragraph by default
+  // (m:oMathParaPr/m:jc may override). Only applied when the paragraph has no
+  // explicit alignment of its own.
+  const mathPara = poChildren(p).find((c) => poIs(c, 'm:oMathPara'));
+  if (mathPara && properties.alignment === undefined) {
+    const paraPr = poChildren(mathPara).find((c) => poIs(c, 'm:oMathParaPr'));
+    const jcNode = paraPr ? poChildren(paraPr).find((c) => poIs(c, 'm:jc')) : undefined;
+    const jcVal = poAttr(jcNode, 'val');
+    const alignment = jcVal === 'left' ? 'left' : jcVal === 'right' ? 'right' : 'center';
+    properties = { ...properties, alignment };
+  }
+  // §17.3.3.15 — every `w:ptab` in the paragraph becomes a stop of its own, in
+  // the order they appear: the tab that reaches it is an ordinary one, and the
+  // resolver takes the next stop past where the line has run. Read nowhere,
+  // SimpleHeadThreeColFoot.docx printed "Footer LeftFooter MiddleFooter Right".
+  const pTabs = collectPositionTabs(p);
+  if (pTabs.length > 0) {
+    properties = { ...properties, tabs: [...(properties.tabs ?? []), ...pTabs] };
+  }
+  const collected: Array<CollectedRun> = [];
+  collectRuns(p, collected, ctx, undefined, undefined, anchored, sdtRunProps);
+  return {
+    properties,
+    runs: applyFieldFsm(collected),
+    ...(bookmarks.length > 0 ? { bookmarks } : {}),
+  };
+}
+
+/**
+ * §17.3.3.15 `w:ptab` — the absolute-position tabs a paragraph holds, as stops.
+ *
+ * `@w:alignment` says which edge of the text column the tab reaches for; the
+ * `left` alignment reaches for no edge at all (it goes to where the text
+ * already is) and states no stop. `@w:relativeTo` distinguishes the margin from
+ * the paragraph's indent, which for a stop measured from the text margin is the
+ * same place.
+ *
+ * @param p The `w:p` element.
+ * @returns One stop per position tab, in document order.
+ */
+function collectPositionTabs(p: PoNode): Array<TabStop> {
+  const out: Array<TabStop> = [];
+  const visit = (node: PoNode): void => {
+    for (const child of poChildren(node)) {
+      if (poIs(child, 'w:ptab')) {
+        const alignment = poAttr(child, 'alignment');
+        if (alignment === 'center' || alignment === 'right') {
+          out.push({ positionPt: pt(0), alignment, relativeTo: alignment });
+        }
+        continue;
+      }
+      if (poIs(child, 'w:r') || poIs(child, 'w:hyperlink') || poIs(child, 'w:ins')) visit(child);
+    }
+  };
+  visit(p);
+  return out;
+}
+
+// A parsed run plus the complex-field markers the FSM consumes (§17.16.18
+// w:fldChar / w:instrText). Internal to run collection.
+interface CollectedRun {
+  readonly run: Run;
+  readonly fldChar?: 'begin' | 'separate' | 'end';
+  readonly instrText?: string;
+  /** §17.16.5.20 — a FORMCHECKBOX field's state, carried on its `begin`. */
+  readonly checkBox?: boolean;
+}
+
+/**
+ * §17.16.5.44 `MACROBUTTON macroName displayText` — the display text, which is
+ * everything after the macro's name and is all a reader ever sees of the field.
+ *
+ * @param instr The field instruction.
+ * @returns The display text, or `undefined` when this is not a MACROBUTTON.
+ */
+function macroButtonText(instr: string): string | undefined {
+  const m = /^\s*MACROBUTTON\s+\S+\s(.*)$/su.exec(instr);
+  const shown = m?.[1]?.trimEnd();
+  return shown !== undefined && shown !== '' ? shown : undefined;
+}
+
+// §17.16.5.35 PAGE / §17.16.5.33 NUMPAGES: the instruction's first keyword;
+// switches (\* MERGEFORMAT …) are ignored. Anything else stays a cached
+// result (REF, TOC, DATE, … render their stored text exactly as before).
+function parseFieldInstr(instr: string | undefined): 'PAGE' | 'NUMPAGES' | undefined {
+  const kw = fieldKeyword(instr);
+  return kw === 'PAGE' ? 'PAGE' : kw === 'NUMPAGES' ? 'NUMPAGES' : undefined;
+}
+
+function fieldKeyword(instr: string | undefined): string | undefined {
+  if (instr === undefined) return undefined;
+  return /^\s*([A-Za-z]+)/.exec(instr)?.[1]?.toUpperCase();
+}
+
+// The fields §17.16.5 defines as having NO result: they do their work — bind a
+// bookmark, prompt, record an index or contents entry — and display nothing.
+// Word caches a result for them all the same, and printing it put "Praun et
+// al. 20012001" in the middle of fdo76163's bibliography, where both
+// references print nothing.
+// §17.16.5.20 — what a form checkbox looks like: BALLOT BOX and BALLOT BOX
+// WITH X, the pair Word and LibreOffice both draw one of.
+const CHECKBOX_CLEAR = '\u2610';
+const CHECKBOX_CHECKED = '\u2612';
+
+const SILENT_FIELDS = new Set([
+  'SET', // §17.16.5.53 — binds a bookmark to a value
+  'ASK', // §17.16.5.2 — prompts, then binds
+  'XE', // §17.16.5.71 — index entry
+  'TC', // §17.16.5.63 — table-of-contents entry
+  'RD', // §17.16.5.50 — referenced document for an index/TOC
+  'PRIVATE', // §17.16.5.48 — data another format left behind
+]);
+
+// Fold a recognized field's cached-result runs into ONE field run: the cached
+// text concatenated (the per-page substitution replaces it wholesale), the
+// first result run's formatting, any hyperlink carried along.
+function synthesizeFieldRun(
+  result: ReadonlyArray<Run>,
+  field: 'PAGE' | 'NUMPAGES',
+  href?: string,
+): Run {
+  const first = result[0];
+  const linked = href ?? result.find((r) => r.href !== undefined)?.href;
+  return {
+    text: result.map((r) => r.text).join(''),
+    properties: first?.properties ?? {},
+    field,
+    ...(linked !== undefined ? { href: linked } : {}),
+  };
+}
+
+/**
+ * §17.16.18 — the parts of a run that holds field characters beside other
+ * content, each a run of its own with the run's properties: every
+ * `w:fldChar` and `w:instrText` alone, the content between them together. A
+ * run with at most one part (Word's own way of writing a field) is returned
+ * as it is, as the only part.
+ */
+function fieldRunParts(r: PoNode): Array<PoNode> {
+  const children = poChildren(r);
+  const isMarker = (c: PoNode): boolean => poIs(c, 'w:fldChar') || poIs(c, 'w:instrText');
+  if (!children.some(isMarker)) return [r];
+  const rPr = children.filter((c) => poIs(c, 'w:rPr'));
+  const groups: Array<Array<PoNode>> = [];
+  let open: Array<PoNode> | null = null;
+  for (const c of children) {
+    if (poIs(c, 'w:rPr')) continue;
+    if (isMarker(c)) {
+      groups.push([c]);
+      open = null;
+    } else {
+      if (!open) {
+        open = [];
+        groups.push(open);
+      }
+      open.push(c);
+    }
+  }
+  if (groups.length <= 1) return [r];
+  const attrs = r[':@'];
+  return groups.map((g) => ({ 'w:r': [...rPr, ...g], ...(attrs !== undefined ? { ':@': attrs } : {}) }));
+}
+
+// §17.16.18 complex fields: begin → instrText* → separate → cached result →
+// end, spread across sibling runs. Recognized PAGE/NUMPAGES collapse to one
+// field run; everything else keeps its cached result exactly as before (the
+// zero-glyph marker runs were never rendered, so dropping them is inert).
+function applyFieldFsm(collected: ReadonlyArray<CollectedRun>): Array<Run> {
+  const out: Array<Run> = [];
+  let st: {
+    phase: 'instr' | 'result';
+    instr: string;
+    result: Array<Run>;
+    depth: number;
+    checkBox?: boolean;
+    properties?: Run['properties'];
+  } | null = null;
+  for (const c of collected) {
+    if (c.fldChar === 'begin') {
+      if (st) {
+        if (st.phase === 'instr') st.depth++;
+        else {
+          // A new field opening inside a result: flush what we have and track
+          // the new one (nested result fields are rare; keep it simple).
+          out.push(...st.result);
+          st = { phase: 'instr', instr: '', result: [], depth: 0 };
+        }
+      } else {
+        st = {
+          phase: 'instr',
+          instr: '',
+          result: [],
+          depth: 0,
+          ...(c.checkBox !== undefined ? { checkBox: c.checkBox } : {}),
+          properties: c.run.properties,
+        };
+      }
+      continue;
+    }
+    if (!st) {
+      out.push(c.run);
+      continue;
+    }
+    if (c.fldChar === 'separate') {
+      if (st.depth === 0) st.phase = 'result';
+      continue;
+    }
+    if (c.fldChar === 'end') {
+      if (st.depth > 0) {
+        st.depth--;
+        continue;
+      }
+      const field = parseFieldInstr(st.instr);
+      const silent = SILENT_FIELDS.has(fieldKeyword(st.instr) ?? '');
+      if (silent) {
+        // The field shows nothing; its cached result is bookkeeping.
+      } else if (field) out.push(synthesizeFieldRun(st.result, field));
+      else if (st.result.length > 0) out.push(...st.result);
+      else {
+        // §17.16.5.44 MACROBUTTON — the words a reader SEES are in the
+        // instruction, after the macro's name, and the field caches no result
+        // of its own. Unsupportedtextfields.docx asks for "contacts  ssss" and
+        // we printed a blank line where LibreOffice prints them.
+        const shown = macroButtonText(st.instr);
+        // §17.16.5.20 FORMCHECKBOX — the box IS the field: it caches no result
+        // and Word draws it from the state on the opening character. Read
+        // nowhere, checkboxes.docx printed a form with no boxes at all.
+        const box =
+          fieldKeyword(st.instr) === 'FORMCHECKBOX' && st.checkBox !== undefined
+            ? st.checkBox
+              ? CHECKBOX_CHECKED
+              : CHECKBOX_CLEAR
+            : undefined;
+        if (shown !== undefined) out.push({ text: shown, properties: {} });
+        else if (box !== undefined) out.push({ text: box, properties: st.properties ?? {} });
+      }
+      st = null;
+      continue;
+    }
+    if (st.phase === 'instr') {
+      if (c.instrText !== undefined) st.instr += c.instrText;
+      continue;
+    }
+    st.result.push(c.run);
+  }
+  if (st) out.push(...st.result); // unterminated field: keep the visible part
+  return out;
+}
+
+function collectRuns(
+  container: PoNode,
+  out: Array<CollectedRun>,
+  ctx: ParseContext,
+  href?: string,
+  anchor?: string,
+  // §20.4.2.3 — out-param threaded to parseRun: the anchored drawings the
+  // paragraph's runs carry, which are blocks of their own rather than glyphs.
+  anchored?: Array<BodyElement>,
+  // §17.5.2.28 — the run properties a `w:sdt` lends its contents, under
+  // whatever each run states for itself.
+  sdtRunProps?: RunProperties,
+): void {
+  for (const child of poChildren(container)) {
+    if (poIs(child, 'w:pPr')) continue;
+    // §17.13.4.3/4 — comment range bounds (siblings of w:r). Track the open set
+    // so runs in between carry commentRangeRefs (the highlighted span).
+    if (poIs(child, 'w:commentRangeStart')) {
+      const id = poAttr(child, 'id');
+      if (id !== undefined) ctx.openCommentRanges?.add(id);
+      continue;
+    }
+    if (poIs(child, 'w:commentRangeEnd')) {
+      const id = poAttr(child, 'id');
+      if (id !== undefined) ctx.openCommentRanges?.delete(id);
+      continue;
+    }
+    if (poIs(child, 'w:r') && fieldRunParts(child).length > 1) {
+      // A whole field in one run (begin, instruction, separate, end and the
+      // text round it in a single w:r, as the docx library writes "Page {PAGE}
+      // of {NUMPAGES}"): Word reads it, and so do we, as the runs Word itself
+      // would write, one part each, all with the run's properties.
+      collectRuns({ 'w:r-parts': fieldRunParts(child) }, out, ctx, href, anchor, anchored, sdtRunProps);
+      continue;
+    }
+    if (poIs(child, 'w:r')) {
+      const parsed = parseRun(child, ctx, anchored);
+      const ranges =
+        ctx.openCommentRanges && ctx.openCommentRanges.size > 0
+          ? [...ctx.openCommentRanges]
+          : undefined;
+      // A run cut at its breaks is several, each in the link, the comment and
+      // the control the whole one is in. A field's run is never cut, so the
+      // field's markers ride on the only one.
+      for (const own of parsed.runs) {
+        const run =
+          href !== undefined || anchor !== undefined || ranges !== undefined || sdtRunProps
+            ? {
+                ...own,
+                ...(sdtRunProps ? { properties: { ...sdtRunProps, ...own.properties } } : {}),
+                ...(href !== undefined ? { href } : {}),
+                ...(anchor !== undefined ? { anchor } : {}),
+                ...(ranges !== undefined ? { commentRangeRefs: ranges } : {}),
+              }
+            : own;
+        out.push({
+          run,
+          ...(parsed.fldChar ? { fldChar: parsed.fldChar } : {}),
+          ...(parsed.instrText !== undefined ? { instrText: parsed.instrText } : {}),
+          ...(parsed.checkBox !== undefined ? { checkBox: parsed.checkBox } : {}),
+        });
+      }
+      continue;
+    }
+    // OfficeMath: an inline equation (m:oMath) or a display paragraph
+    // (m:oMathPara, holding one or more m:oMath) → math runs.
+    if (poIs(child, 'm:oMath')) {
+      out.push({ run: { text: '', properties: {}, math: parseOMath(child) } });
+      continue;
+    }
+    if (poIs(child, 'm:oMathPara')) {
+      for (const om of poChildren(child)) {
+        if (poIs(om, 'm:oMath')) {
+          out.push({ run: { text: '', properties: {}, math: parseOMath(om) } });
+        }
+      }
+      continue;
+    }
+    const tag = elementTag(child);
+    if (tag === 'w:fldSimple') {
+      // §17.16.19 — the instruction is an attribute, the children are the
+      // cached result. PAGE/NUMPAGES collapse to one field run; anything else
+      // keeps its cached runs (the old unwrap behavior).
+      const field = parseFieldInstr(poAttr(child, 'instr'));
+      if (field) {
+        const inner: Array<CollectedRun> = [];
+        collectRuns(child, inner, ctx, href, anchor, anchored, sdtRunProps);
+        out.push({ run: synthesizeFieldRun(applyFieldFsm(inner), field, href) });
+        continue;
+      }
+      collectRuns(child, out, ctx, href, anchor, anchored, sdtRunProps);
+      continue;
+    }
+    if (tag && RUN_CONTAINER_TAGS.has(tag)) {
+      // A hyperlink container stamps its target onto every run inside (nested
+      // containers inherit the outer link): @r:id resolves to an external URL,
+      // @w:anchor names a bookmark in this document (§17.16.22).
+      let childHref = href;
+      let childAnchor = anchor;
+      if (tag === 'w:hyperlink') {
+        const rId = poAttr(child, 'id');
+        const resolved = rId ? ctx.resolveHyperlink?.(rId) : undefined;
+        if (resolved !== undefined) {
+          childHref = resolved;
+        } else {
+          const bookmark = poAttr(child, 'anchor');
+          if (bookmark !== undefined && bookmark !== '') childAnchor = bookmark;
+        }
+      }
+      // §17.5.2.28 — a content control lends its `w:sdtPr/w:rPr` to what it
+      // holds. fdo78469.docx's cover date is a Date control whose only white
+      // is stated there, and we drew it in the body colour on a dark red cell.
+      const childProps =
+        tag === 'w:sdt' ? (sdtRunProperties(child, ctx.themeFonts) ?? sdtRunProps) : sdtRunProps;
+      collectRuns(child, out, ctx, childHref, childAnchor, anchored, childProps);
+    }
+  }
+}
+
+/**
+ * §17.5.2.28 `w:sdt/w:sdtPr/w:rPr` — the run properties a content control
+ * lends what it holds, when it states any.
+ *
+ * @param sdt The `w:sdt` element.
+ * @returns The properties, or `undefined` when the control states none.
+ */
+export function sdtRunProperties(sdt: PoNode, themeFonts?: ThemeFonts): RunProperties | undefined {
+  const sdtPr = poChildren(sdt).find((c) => poIs(c, 'w:sdtPr'));
+  const rPr = sdtPr ? poChildren(sdtPr).find((c) => poIs(c, 'w:rPr')) : undefined;
+  if (!rPr) return undefined;
+  const props = parseRunProperties(poElementToFlat(rPr), themeFonts);
+  return Object.keys(props).length > 0 ? props : undefined;
+}
+
+// §17.3.3.30 — the Unicode a symbol-font code point stands for. Word writes
+// `@w:char` in the font's own encoding, which for Symbol, Wingdings and their
+// relatives is the private-use block F020…F0FF. The common ones have real
+// Unicode characters; anything else is passed through as the code point it is,
+// so a caller who supplies the actual font still draws it.
+// Wingdings: the code points that carry a Unicode meaning, by low byte.
+const WINGDINGS_TO_UNICODE: ReadonlyMap<number, string> = new Map([
+  [0x6c, '\u25cf'], // ● filled circle
+  [0x6d, '\u274d'], // ❍ shadowed circle
+  [0x6e, '\u25a0'], // ■ filled square
+  [0x71, '\u2751'], // ❑ shadowed square
+  [0x73, '\u25a1'], // □ square
+  [0x74, '\u2752'], // ❒
+  [0x76, '\u2756'], // ❖
+  [0xa7, '\u25aa'], // ▪ small filled square
+  [0xa8, '\u25ab'], // ▫
+  [0xfc, '\u2714'], // ✔ check
+  [0xfd, '\u2716'], // ✖ cross
+  [0xfe, '\u2612'], // ☒ crossed box
+  [0xfb, '\u2611'], // ☑ checked box
+  [0xe0, '\u21e6'], // ⇦
+  [0xe1, '\u21e8'], // ⇨
+  [0xe2, '\u21e7'], // ⇧
+  [0xe3, '\u21e9'], // ⇩
+  [0xe7, '\u2190'], // ← left arrow
+  [0xe8, '\u2192'], // →
+  [0xe9, '\u2191'], // ↑
+  [0xea, '\u2193'], // ↓
+  [0xeb, '\u2196'], // ↖
+  [0xec, '\u2197'], // ↗
+  [0xed, '\u2199'], // ↙
+  [0xee, '\u2198'], // ↘
+]);
+
+// Symbol: the Greek alphabet sits where the Latin one does, plus the operators.
+const SYMBOL_TO_UNICODE: ReadonlyMap<number, string> = new Map([
+  [0x22, '\u2200'],
+  [0x24, '\u2203'],
+  [0x40, '\u2245'],
+  [0x5c, '\u2234'],
+  [0x61, '\u03b1'],
+  [0x62, '\u03b2'],
+  [0x63, '\u03c7'],
+  [0x64, '\u03b4'],
+  [0x65, '\u03b5'],
+  [0x66, '\u03c6'],
+  [0x67, '\u03b3'],
+  [0x68, '\u03b7'],
+  [0x69, '\u03b9'],
+  [0x6b, '\u03ba'],
+  [0x6c, '\u03bb'],
+  [0x6d, '\u03bc'],
+  [0x6e, '\u03bd'],
+  [0x6f, '\u03bf'],
+  [0x70, '\u03c0'],
+  [0x71, '\u03b8'],
+  [0x72, '\u03c1'],
+  [0x73, '\u03c3'],
+  [0x74, '\u03c4'],
+  [0x75, '\u03c5'],
+  [0x77, '\u03c9'],
+  [0x78, '\u03be'],
+  [0x79, '\u03c8'],
+  [0x7a, '\u03b6'],
+  [0xa5, '\u221e'],
+  [0xb1, '\u00b1'],
+  [0xb3, '\u2265'],
+  [0xb4, '\u00d7'],
+  [0xb7, '\u2022'],
+  [0xb8, '\u00f7'],
+  [0xb9, '\u2260'],
+  [0xba, '\u2261'],
+  [0xbb, '\u2248'],
+  [0xd6, '\u221a'],
+  [0xe5, '\u2211'],
+]);
+
+function symbolChar(font: string | undefined, char: string | undefined): string {
+  const cp = char !== undefined ? Number.parseInt(char, 16) : Number.NaN;
+  if (!Number.isFinite(cp) || cp <= 0) return '';
+  const low = cp & 0xff;
+  const table = /wingdings|webdings|zapf/iu.test(font ?? '')
+    ? WINGDINGS_TO_UNICODE
+    : /symbol/iu.test(font ?? '')
+      ? SYMBOL_TO_UNICODE
+      : undefined;
+  const mapped = table?.get(low);
+  if (mapped !== undefined) return mapped;
+  // Not one we can name: the code point itself, which a caller who supplies
+  // the font draws, and which is already Unicode in an ordinary font.
+  return String.fromCodePoint(cp);
+}
+
+function parseRun(
+  r: PoNode,
+  ctx: ParseContext,
+  // §20.4.2.3 — out-param: the ANCHORED drawings this run carries. They are not
+  // part of the line at all; the caller emits them as blocks of their own.
+  anchored?: Array<BodyElement>,
+): {
+  runs: ReadonlyArray<Run>;
+  fldChar?: 'begin' | 'separate' | 'end';
+  instrText?: string;
+  checkBox?: boolean;
+} {
+  const rPr = poChildren(r).find((c) => poIs(c, 'w:rPr'));
+  const properties = parseRunProperties(rPr ? poElementToFlat(rPr) : undefined, ctx.themeFonts);
+  const children = expandMcChildren(poChildren(r));
+  // §17.3.3.1 — a page or column break happens WHERE IT STANDS in the run: what
+  // comes before it ends its line there, what comes after starts the next page
+  // or column. Read as a flag on the whole run, "Latin", a page break and
+  // "Second" in one `w:r` set both words on the first page and the break after
+  // the paragraph. So the run is cut at each such break into runs of the same
+  // properties, the break a run of its own, the way Word itself writes one. A
+  // field's run is read whole: what it holds belongs to the field.
+  const cuts = !children.some((c) => poIs(c, 'w:fldChar') || poIs(c, 'w:instrText'));
+  const runs: Array<Run> = [];
+  let text = '';
+  let pageBreak = false;
+  let columnBreak = false;
+  let inlineImage: InlineImage | undefined;
+  let fldChar: 'begin' | 'separate' | 'end' | undefined;
+  let instrText: string | undefined;
+  let checkBox: boolean | undefined;
+  let footnoteRef: string | undefined;
+  let endnoteRef: string | undefined;
+  let commentRef: string | undefined;
+  let noteNumber = false;
+  // The run read since the last cut, ended: kept when it holds anything, or
+  // when it is all the run there is.
+  const cut = (last: boolean): void => {
+    const holds =
+      text !== '' ||
+      inlineImage !== undefined ||
+      pageBreak ||
+      columnBreak ||
+      footnoteRef !== undefined ||
+      endnoteRef !== undefined ||
+      commentRef !== undefined ||
+      noteNumber;
+    if (holds || (last && runs.length === 0)) {
+      runs.push({
+        text,
+        properties,
+        ...(inlineImage ? { inlineImage } : {}),
+        ...(pageBreak ? { pageBreak: true } : {}),
+        ...(columnBreak ? { columnBreak: true } : {}),
+        ...(footnoteRef !== undefined ? { footnoteRef } : {}),
+        ...(endnoteRef !== undefined ? { endnoteRef } : {}),
+        ...(commentRef !== undefined ? { commentRef } : {}),
+        ...(noteNumber ? { noteNumber: true } : {}),
+      });
+    }
+    text = '';
+    pageBreak = false;
+    columnBreak = false;
+    inlineImage = undefined;
+    footnoteRef = undefined;
+    endnoteRef = undefined;
+    commentRef = undefined;
+    noteNumber = false;
+  };
+  for (const child of children) {
+    if (poIs(child, 'w:rPr')) continue;
+    if (poIs(child, 'w:fldChar')) {
+      const t = poAttr(child, 'fldCharType');
+      if (t === 'begin' || t === 'separate' || t === 'end') fldChar = t;
+      // §17.16.32 `w:ffData/w:checkBox` — a form checkbox's state rides on the
+      // field's OPENING character, not on its (absent) result.
+      if (t === 'begin') checkBox = fieldCheckBoxState(child);
+      continue;
+    }
+    if (poIs(child, 'w:instrText')) {
+      instrText = (instrText ?? '') + poText(child);
+      continue;
+    }
+    if (poIs(child, 'w:footnoteReference')) {
+      const id = poAttr(child, 'id');
+      if (id !== undefined) footnoteRef = id;
+      continue;
+    }
+    if (poIs(child, 'w:endnoteReference')) {
+      const id = poAttr(child, 'id');
+      if (id !== undefined) endnoteRef = id;
+      continue;
+    }
+    if (poIs(child, 'w:commentReference')) {
+      const id = poAttr(child, 'id');
+      if (id !== undefined) commentRef = id;
+      continue;
+    }
+    if (poIs(child, 'w:footnoteRef') || poIs(child, 'w:endnoteRef')) {
+      noteNumber = true;
+      continue;
+    }
+    if (poIs(child, 'w:t')) {
+      text += poText(child);
+    } else if (poIs(child, 'w:tab')) {
+      text += '\t';
+    } else if (poIs(child, 'w:ptab')) {
+      // §17.3.3.15 — an absolute position tab is a tab: what makes it absolute
+      // is where it goes, and parseParagraph collects that from the same run.
+      text += '\t';
+    } else if (poIs(child, 'w:br')) {
+      // §17.3.3.1 — `page` forces a page break, `column` sends what follows to
+      // the next column; either way the line ends here, and any other break
+      // type (textWrapping/none) is a soft line break within the text flow.
+      const breakType = poAttr(child, 'type');
+      const forced = cuts && (breakType === 'page' || breakType === 'column');
+      if (forced) cut(false);
+      if (breakType === 'page') pageBreak = true;
+      else {
+        if (breakType === 'column') columnBreak = true;
+        text += '\n';
+      }
+      if (forced) cut(false);
+    } else if (poIs(child, 'w:sym')) {
+      // §17.3.3.30 — a character from a SYMBOL font, named by the font and the
+      // code point it sits at there (usually in the private-use area). Read
+      // nowhere, fdo78384.docx's one arrow left a blank page. What reaches the
+      // page is the Unicode character it stands for, which any font may have.
+      text += symbolChar(poAttr(child, 'font'), poAttr(child, 'char'));
+    } else if (poIs(child, 'w:noBreakHyphen')) {
+      text += '‑';
+    } else if (poIs(child, 'w:softHyphen')) {
+      text += '­';
+    } else if (poIs(child, 'w:drawing')) {
+      // Only pictures render inline in M5; a wps shape in a mixed run is
+      // dropped (its text is preserved). Colour is irrelevant for pictures,
+      // so this deliberately does NOT take ctx.resolveColor (byte-parity with
+      // the pre-context code; revisit if inline shapes ever render).
+      // A shape here is drawn, not skipped, so it gets the same parsers a lone
+      // drawing does: its own theme colours, its text box, its pictures.
+      // chart-size.docx anchors a text box beside a run of text and we drew the
+      // empty frame — its "Before.", its chart and its "After." all gone.
+      const content = parseDrawing(
+        child,
+        ctx.resolveColor,
+        (children) => parseBodyElements(children, ctx),
+        ctx.resolveImage,
+        ctx.resolveChartPart,
+        ctx.themeLineWidths,
+        ctx.themeStyles,
+        drawingTextParser,
+      );
+      // §20.4.2.3 — an ANCHORED drawing is not in the line: it hangs off the
+      // paragraph at a position of its own, and the text flows past it. Read as
+      // an inline picture it split the line it sat in — anchor-position.docx
+      // put its picture between the "A" and the "B" where every other reader
+      // sets "AB" beside it.
+      if (content?.float && anchored) {
+        anchored.push(...(blocksForDrawing(content, {}, ctx) ?? []));
+      } else if (
+        (content?.kind === 'chart' || content?.kind === 'shape' || content?.kind === 'diagram') &&
+        anchored
+      ) {
+        // A chart is block-sized: it takes a line of its own, so it leaves the
+        // run and becomes a block ahead of the paragraph. chart-dupe.docx sets
+        // one beside a trailing space, and keeping it in the run dropped it.
+        // A DRAWN shape in a run of text goes the same way. The line model
+        // carries pictures and nothing else, so the alternative is to lose it:
+        // fdo82492.docx sets an ellipse beside its title and we printed the
+        // title alone. It stands a line above where Word draws it, and it is
+        // there. A SmartArt diagram is block-sized in exactly the same way:
+        // strict.docx writes its diagram beside "And this is a smart-art:" and
+        // we printed the sentence alone.
+        anchored.push(...(blocksForDrawing(content, {}, ctx) ?? []));
+      } else if (content && content.kind === 'image') {
+        const resource = ctx.resolveImage?.(content.imageId);
+        inlineImage = {
+          ...(resource ? { resource } : {}),
+          ...(content.outline ? { outline: content.outline } : {}),
+          ...(content.shadow ? { shadow: content.shadow } : {}),
+          ...(content.wash ? { wash: content.wash } : {}),
+          width: content.width,
+          height: content.height,
+          ...(content.crop ? { crop: content.crop } : {}),
+          ...(content.rotation60k ? { rotation60k: content.rotation60k } : {}),
+          ...(content.flipH ? { flipH: true } : {}),
+          ...(content.flipV ? { flipV: true } : {}),
+          ...(content.effectExtent ? { effectExtent: content.effectExtent } : {}),
+        };
+      }
+    } else if (poIs(child, 'w:pict') || poIs(child, 'w:object')) {
+      // §14 legacy VML picture (and OLE-object image previews). Modern
+      // <w:drawing> wins under MC resolution, so this fires only for pure-VML
+      // content — common in headers and older files. Unlike a DrawingML blip,
+      // a VML image is materialised only when its part actually resolves to
+      // bytes: a dangling <v:imagedata r:id> (the referenced media stripped
+      // from the package, as some corpus files have) carries nothing to render,
+      // so we skip the phantom rather than emit an empty picture.
+      const content = parseVmlPicture(child, (children) => parseBodyElements(children, ctx));
+      if (content?.float && anchored) {
+        // §14.1.2 — a POSITIONED VML drawing hangs off the paragraph, picture
+        // or shape alike: drawinglayer-pic-pos.docx sets its photo two inches
+        // down the page and we drew it in the line.
+        anchored.push(...(blocksForDrawing(content, {}, ctx) ?? []));
+      } else if (content && content.kind === 'image') {
+        const resource = ctx.resolveImage?.(content.imageId);
+        if (resource) {
+          inlineImage = {
+            resource,
+            ...(content.outline ? { outline: content.outline } : {}),
+            ...(content.shadow ? { shadow: content.shadow } : {}),
+            ...(content.wash ? { wash: content.wash } : {}),
+            width: content.width,
+            height: content.height,
+          };
+        }
+      } else if (content && anchored) {
+        // §14.1.2 — a drawn VML shape in a run of text: a block of its own,
+        // the way an anchored drawing is. drawinglayer-pic-pos.docx frames its
+        // title in one beside the paragraph's text.
+        anchored.push(...(blocksForDrawing(content, {}, ctx) ?? []));
+      }
+    }
+  }
+  cut(true);
+  return {
+    runs,
+    ...(fldChar ? { fldChar } : {}),
+    ...(instrText !== undefined ? { instrText } : {}),
+    ...(checkBox !== undefined ? { checkBox } : {}),
+  };
+}
+
+/**
+ * §17.16.32 `w:fldChar/w:ffData/w:checkBox` — whether a form checkbox is
+ * ticked: its current `w:checked` if it states one, else the `w:default` it was
+ * created with, else clear.
+ *
+ * @param fldChar The field's `w:fldChar` (only a `begin` carries `w:ffData`).
+ * @returns The state, or undefined when this is not a checkbox field.
+ */
+function fieldCheckBoxState(fldChar: PoNode): boolean | undefined {
+  const ffData = poChildren(fldChar).find((c) => poIs(c, 'w:ffData'));
+  const box = ffData ? poChildren(ffData).find((c) => poIs(c, 'w:checkBox')) : undefined;
+  if (!box) return undefined;
+  const flag = (name: string): boolean | undefined => {
+    const el = poChildren(box).find((c) => poIs(c, name));
+    if (!el) return undefined;
+    const val = poAttr(el, 'val');
+    return val === undefined || val === '' || (val !== '0' && val !== 'false');
+  };
+  return flag('w:checked') ?? flag('w:default') ?? false;
+}
+
+function elementTag(node: PoNode): string | undefined {
+  for (const key of Object.keys(node)) {
+    if (key !== ':@' && key !== '#text') return key;
+  }
+  return undefined;
+}
+
+/**
+ * Parse `footnotes.xml` / `endnotes.xml` (§17.11) into note content by id. The
+ * separator / continuationSeparator / continuationNotice stubs (negative ids or
+ * an explicit `w:type`) are skipped — the layout draws its own separator.
+ *
+ * @param notesXml The raw notes-part bytes.
+ * @param rootTag  The part's root element (`w:footnotes` or `w:endnotes`).
+ * @param noteTag  The per-note element (`w:footnote` or `w:endnote`).
+ * @param ctx      The document-wide parse context.
+ * @returns A map from note id to its body content.
+ */
+export function parseNotes(
+  notesXml: Uint8Array,
+  rootTag: 'w:footnotes' | 'w:endnotes',
+  noteTag: 'w:footnote' | 'w:endnote',
+  ctx: ParseContext = DEFAULT_PARSE_CONTEXT,
+): Map<string, Array<BodyElement>> {
+  const xml = resolveInternalEntities(decoder.decode(notesXml));
+  const tree = parser.parse(xml) as Array<PoNode>;
+  const root = poFindByPath(tree, [rootTag]);
+  const out = new Map<string, Array<BodyElement>>();
+  if (!root) return out;
+  for (const note of poChildren(root)) {
+    if (!poIs(note, noteTag)) continue;
+    const type = poAttr(note, 'type');
+    if (type !== undefined && type !== 'normal') continue;
+    const id = poAttr(note, 'id');
+    if (id === undefined) continue;
+    out.set(id, parseBodyElements(poChildren(note), ctx));
+  }
+  return out;
+}
+
+// §17.13.4 — comments.xml. Like parseNotes, but a comment carries author/date
+// attribution alongside its block content, so it returns a richer Comment
+// (parseNotes keeps content only). Comments have no separator/stub convention.
+// Alongside the comments, capture each comment's last-paragraph w14:paraId —
+// the key Microsoft's commentsExtended (w15) threads link on (CM4).
+function parseCommentsRaw(
+  commentsXml: Uint8Array,
+  ctx: ParseContext,
+): { comments: Map<string, Comment>; paraIds: Map<string, string> } {
+  const xml = resolveInternalEntities(decoder.decode(commentsXml));
+  const tree = parser.parse(xml) as Array<PoNode>;
+  const root = poFindByPath(tree, ['w:comments']);
+  const comments = new Map<string, Comment>();
+  const paraIds = new Map<string, string>();
+  if (!root) return { comments, paraIds };
+  for (const c of poChildren(root)) {
+    if (!poIs(c, 'w:comment')) continue;
+    const id = poAttr(c, 'id');
+    if (id === undefined) continue;
+    const author = poAttr(c, 'author');
+    const initials = poAttr(c, 'initials');
+    const date = poAttr(c, 'date');
+    comments.set(id, {
+      content: parseBodyElements(poChildren(c), ctx),
+      ...(author !== undefined ? { author } : {}),
+      ...(initials !== undefined ? { initials } : {}),
+      ...(date !== undefined ? { date } : {}),
+    });
+    // The thread key is the last paragraph's paraId (Word writes it on every
+    // comment paragraph; commentsExtended references the final one).
+    let paraId: string | undefined;
+    for (const child of poChildren(c)) {
+      if (!poIs(child, 'w:p')) continue;
+      const pid = poAttrLocal(child, 'paraId');
+      if (pid !== undefined) paraId = pid;
+    }
+    if (paraId !== undefined) paraIds.set(id, paraId);
+  }
+  return { comments, paraIds };
+}
+
+/**
+ * Parse `word/comments.xml` (§17.13.4) into {@link Comment}s by id, each with its
+ * block content and author/initials/date attribution. Thread metadata is added
+ * separately by {@link parseCommentThreads}.
+ *
+ * @param commentsXml The raw `comments.xml` bytes.
+ * @param ctx         The document-wide parse context.
+ * @returns A map from comment id to the parsed comment.
+ */
+export function parseComments(
+  commentsXml: Uint8Array,
+  ctx: ParseContext = DEFAULT_PARSE_CONTEXT,
+): Map<string, Comment> {
+  return parseCommentsRaw(commentsXml, ctx).comments;
+}
+
+/** A commentsExtended entry, keyed by the comment's last-paragraph w14:paraId. */
+export interface CommentExtension {
+  /** The parent comment's paraId — present when this comment is a reply. */
+  readonly paraIdParent?: string;
+  /** w15:done — the thread is resolved. */
+  readonly done: boolean;
+}
+
+/**
+ * Parse `word/commentsExtended.xml` (Microsoft w15 `commentsEx`) — a flat list
+ * of `commentEx`, each keyed by a comment's `paraId`: `paraIdParent` links a
+ * reply to its parent, `done` flags a resolved thread. Prefix-agnostic (w15 by
+ * convention).
+ *
+ * @param xml The raw `commentsExtended.xml` bytes.
+ * @returns A map from `paraId` to its {@link CommentExtension}.
+ */
+export function parseCommentsExtended(xml: Uint8Array): Map<string, CommentExtension> {
+  const tree = parser.parse(resolveInternalEntities(decoder.decode(xml))) as Array<PoNode>;
+  const out = new Map<string, CommentExtension>();
+  const root = tree.find((n) => poIsLocal(n, 'commentsEx'));
+  if (!root) return out;
+  for (const ex of poChildren(root)) {
+    if (!poIsLocal(ex, 'commentEx')) continue;
+    const paraId = poAttrLocal(ex, 'paraId');
+    if (paraId === undefined) continue;
+    const paraIdParent = poAttrLocal(ex, 'paraIdParent');
+    const done = poAttrLocal(ex, 'done');
+    out.set(paraId, {
+      ...(paraIdParent !== undefined ? { paraIdParent } : {}),
+      done: done === '1' || done === 'true',
+    });
+  }
+  return out;
+}
+
+// Fold commentsExtended thread links onto the comments: a reply gains parentId
+// (the comment owning its paraIdParent), a resolved thread gains done.
+function linkCommentThreads(
+  comments: Map<string, Comment>,
+  paraIdByComment: Map<string, string>,
+  ext: Map<string, CommentExtension>,
+): Map<string, Comment> {
+  if (ext.size === 0) return comments;
+  const commentByParaId = new Map<string, string>();
+  for (const [id, pid] of paraIdByComment) commentByParaId.set(pid, id);
+  const out = new Map<string, Comment>();
+  for (const [id, c] of comments) {
+    const pid = paraIdByComment.get(id);
+    const e = pid !== undefined ? ext.get(pid) : undefined;
+    if (!e) {
+      out.set(id, c);
+      continue;
+    }
+    const parentId = e.paraIdParent !== undefined ? commentByParaId.get(e.paraIdParent) : undefined;
+    out.set(id, {
+      ...c,
+      ...(parentId !== undefined ? { parentId } : {}),
+      ...(e.done ? { done: true } : {}),
+    });
+  }
+  return out;
+}
+
+/**
+ * Read comments with their thread metadata: `comments.xml` for content /
+ * attribution plus the optional `commentsExtended.xml` for reply links and
+ * resolved flags (CM4). A reply gains `parentId`, a resolved thread gains `done`.
+ *
+ * @param commentsXml         The raw `comments.xml` bytes.
+ * @param commentsExtendedXml The raw `commentsExtended.xml` bytes, or `undefined`.
+ * @param ctx                 The document-wide parse context.
+ * @returns A map from comment id to the parsed, thread-linked comment.
+ */
+export function parseCommentThreads(
+  commentsXml: Uint8Array,
+  commentsExtendedXml: Uint8Array | undefined,
+  ctx: ParseContext = DEFAULT_PARSE_CONTEXT,
+): Map<string, Comment> {
+  const { comments, paraIds } = parseCommentsRaw(commentsXml, ctx);
+  if (!commentsExtendedXml) return comments;
+  return linkCommentThreads(comments, paraIds, parseCommentsExtended(commentsExtendedXml));
+}
+
+/**
+ * Parse `word/people.xml` (Microsoft w15) — maps an author display name to a
+ * presence identity (`w15:presenceInfo/@w15:userId`, usually an email), used to
+ * enrich a comment's `authorId`. Prefix-agnostic.
+ *
+ * @param xml The raw `people.xml` bytes.
+ * @returns A map from author name to userId.
+ */
+export function parsePeople(xml: Uint8Array): Map<string, string> {
+  const tree = parser.parse(resolveInternalEntities(decoder.decode(xml))) as Array<PoNode>;
+  const out = new Map<string, string>();
+  const root = tree.find((n) => poIsLocal(n, 'people'));
+  if (!root) return out;
+  for (const person of poChildren(root)) {
+    if (!poIsLocal(person, 'person')) continue;
+    const author = poAttrLocal(person, 'author');
+    if (author === undefined) continue;
+    let userId: string | undefined;
+    for (const child of poChildren(person)) {
+      if (!poIsLocal(child, 'presenceInfo')) continue;
+      const uid = poAttrLocal(child, 'userId');
+      if (uid !== undefined) userId = uid;
+    }
+    if (userId !== undefined) out.set(author, userId);
+  }
+  return out;
+}
+
+/**
+ * Attach each comment's `authorId` by matching its author name against the
+ * {@link parsePeople} map. Comments without a matching author pass through
+ * unchanged.
+ *
+ * @param comments The comments by id.
+ * @param people   The author → userId map from `people.xml`.
+ * @returns The comments with `authorId` filled in where resolvable.
+ */
+export function applyAuthorIds(
+  comments: Map<string, Comment>,
+  people: Map<string, string>,
+): Map<string, Comment> {
+  if (people.size === 0) return comments;
+  const out = new Map<string, Comment>();
+  for (const [id, c] of comments) {
+    const userId = c.author !== undefined ? people.get(c.author) : undefined;
+    out.set(id, userId !== undefined ? { ...c, authorId: userId } : c);
+  }
+  return out;
+}

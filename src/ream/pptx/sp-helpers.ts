@@ -1,0 +1,191 @@
+// E-PPTX — shared shape (p:sp) parsing helpers, used by both the slide parser
+// and the placeholder cascade (a leaf module, so neither imports the other).
+//
+// Slides, layouts and masters all describe shapes the same way: a p:nvSpPr (with
+// an optional p:ph placeholder reference), a p:spPr (with the a:xfrm transform)
+// and a p:txBody. These helpers read the pieces every layer shares.
+
+import type { RunProperties } from '../core/document-model';
+import type { ColorResolver } from '../core/drawingml/colors';
+import type { ThemeFonts } from '../core/drawingml/theme-parser';
+import type { PoNode } from '../core/po-helpers';
+
+import { resolveColorNode } from '../core/drawingml/colors';
+import { resolveThemeFont } from '../core/drawingml/theme-parser';
+import { pt } from '../core/ir';
+import { poAttr, poChildren, poIntAttr, poIs } from '../core/po-helpers';
+
+/**
+ * §19.3.1.36 `p:ph` — a shape's placeholder reference. `type`/`idx` tie a slide
+ * shape to the matching prototype in its layout and master.
+ */
+export interface PlaceholderRef {
+  /** The placeholder type, e.g. `'title'`, `'ctrTitle'`, `'subTitle'`, `'body'`, `'obj'`. */
+  readonly type?: string;
+  readonly idx?: string;
+}
+
+/** An `a:xfrm` box in EMU (`off` + `ext`). */
+export interface ShapeBoxEmu {
+  readonly x: number;
+  readonly y: number;
+  readonly cx: number;
+  readonly cy: number;
+}
+
+const isTrue = (v: string | undefined): boolean => v === '1' || v === 'true' || v === 'on';
+
+// §19.3.1.33/§19.3.1.34/§19.3.1.21 — the non-visual properties go by a name of
+// their own for each kind of shape, and every one of them may hold a `p:nvPr`.
+const NON_VISUAL = ['p:nvSpPr', 'p:nvPicPr', 'p:nvGraphicFramePr', 'p:nvCxnSpPr'];
+
+/**
+ * `p:nvPr/p:ph` → the placeholder reference, or `undefined` for an ordinary
+ * (non-placeholder) shape. A bare `<p:ph/>` returns an empty ref (still a
+ * placeholder: `type` defaults to `'obj'`).
+ *
+ * A PICTURE is a placeholder as readily as a shape is — a content placeholder
+ * filled with a photograph writes `p:nvPicPr/p:nvPr/p:ph` and an EMPTY `p:spPr`,
+ * leaving its whole geometry to the layout (customshape-bitmapfill-srcrect).
+ */
+export function parsePh(sp: PoNode): PlaceholderRef | undefined {
+  const nonVisual = poChildren(sp).find((c) => NON_VISUAL.some((n) => poIs(c, n)));
+  const nvPr = nonVisual ? poChildren(nonVisual).find((c) => poIs(c, 'p:nvPr')) : undefined;
+  const ph = nvPr ? poChildren(nvPr).find((c) => poIs(c, 'p:ph')) : undefined;
+  if (!ph) return undefined;
+  const type = poAttr(ph, 'type');
+  const idx = poAttr(ph, 'idx');
+  return {
+    ...(type !== undefined ? { type } : {}),
+    ...(idx !== undefined ? { idx } : {}),
+  };
+}
+
+/**
+ * An xfrm node (`a:off` + `a:ext` children) → the EMU box. Works for both
+ * `a:xfrm` (in `p:spPr`) and `p:xfrm` (on a `p:graphicFrame`), whose children are
+ * identical. Returns `undefined` for a missing or negative extent, or one that is
+ * empty both ways. A single zero is a real box: a horizontal line has `cy="0"` and
+ * a vertical one `cx="0"`.
+ */
+export function boxFromXfrm(xfrm: PoNode | undefined): ShapeBoxEmu | undefined {
+  if (!xfrm) return undefined;
+  const off = poChildren(xfrm).find((c) => poIs(c, 'a:off'));
+  const ext = poChildren(xfrm).find((c) => poIs(c, 'a:ext'));
+  const cx = ext ? poIntAttr(ext, 'cx') : undefined;
+  const cy = ext ? poIntAttr(ext, 'cy') : undefined;
+  if (cx === undefined || cy === undefined || cx < 0 || cy < 0) return undefined;
+  if (cx === 0 && cy === 0) return undefined;
+  const x = (off ? poIntAttr(off, 'x') : undefined) ?? 0;
+  const y = (off ? poIntAttr(off, 'y') : undefined) ?? 0;
+  return { x, y, cx, cy };
+}
+
+/**
+ * `p:spPr/a:xfrm` → the EMU box, or `undefined` when the shape carries no
+ * explicit transform (a placeholder that inherits it from the layout/master).
+ */
+export function parseXfrmBox(spPr: PoNode | undefined): ShapeBoxEmu | undefined {
+  return boxFromXfrm(spPr ? poChildren(spPr).find((c) => poIs(c, 'a:xfrm')) : undefined);
+}
+
+/**
+ * `a:rPr` / `a:defRPr` → {@link RunProperties}. Both the direct run formatting on
+ * a slide (`a:rPr`) and the per-level defaults in a master's `p:txStyles`
+ * (`a:defRPr`) share this element, so the cascade reuses the same reader: size
+ * (`sz`, hundredths of a point), bold/italic/underline, solid colour and the
+ * latin typeface. Scheme colours and the theme font cascade come in PX5.
+ */
+export function rPrToRunProps(
+  rPr: PoNode | undefined,
+  colors: ColorResolver,
+  themeFonts?: ThemeFonts,
+): RunProperties {
+  if (!rPr) return {};
+  const sz = poIntAttr(rPr, 'sz');
+  const u = poAttr(rPr, 'u');
+  const colorHex = solidFillColor(rPr, colors);
+  const latin = poChildren(rPr).find((c) => poIs(c, 'a:latin'));
+  // §20.1.4.1.14 — a slide names its typeface by TOKEN far more often than by
+  // name (`+mn-lt` is "whatever the theme calls its body font"). Left
+  // unresolved the token travels on as if it WERE a typeface, and no
+  // substitution table knows it: 45541_Header's Times deck came out in a
+  // grotesque.
+  const typeface = resolveThemeFont(
+    latin ? poAttr(latin, 'typeface')?.trim() : undefined,
+    themeFonts,
+  );
+  // A run states these to turn them OFF as much as on: the body style of
+  // 45541_Header's master is bold and every slide's own runs say `b="0"`, so
+  // read as "bold when true, silent otherwise" the whole deck came out bold.
+  const flag = (name: string): boolean | undefined => {
+    const v = poAttr(rPr, name);
+    return v === undefined ? undefined : isTrue(v);
+  };
+  const [b, i] = [flag('b'), flag('i')];
+  return {
+    ...(b !== undefined ? { bold: b } : {}),
+    ...(i !== undefined ? { italic: i } : {}),
+    ...(u !== undefined
+      ? { underline: u === 'none' ? ('none' as const) : ('single' as const) }
+      : {}),
+    ...(sz !== undefined ? { fontSizePt: pt(sz / 100) } : {}),
+    ...(colorHex ? { colorHex } : {}),
+    // §21.1.2.3.7 — `a:latin` is the font of everything neither East Asian nor
+    // complex script: both of WordprocessingML's slots for it. Named as the
+    // ascii slot alone, the text of a .docx's own shapes took its Cyrillic
+    // from the document's defaults: tdf143476_lockedCanvas_position.docx set
+    // the "ЮНЫЕ" of its Monotype Corsiva WordArt in Calibri.
+    ...(typeface ? { fontFamily: { ascii: typeface, hAnsi: typeface } } : {}),
+    ...capsOf(poAttr(rPr, 'cap')),
+  };
+}
+
+// §21.1.2.2.7 `@cap` — the text is DISPLAYED in capitals, whatever it stores.
+// Stated once in a master's title style it reaches every slide (themes.pptx's
+// last title is "Trade show" in the file and TRADE SHOW on the screen), so a
+// run that says `none` has to be able to take it back off.
+function capsOf(cap: string | undefined): Pick<RunProperties, 'caps' | 'smallCaps'> {
+  if (cap === 'all') return { caps: true };
+  if (cap === 'small') return { smallCaps: true };
+  if (cap === 'none') return { caps: false, smallCaps: false };
+  return {};
+}
+
+// a:solidFill → resolved 6-hex (no '#'), via the deck's colour resolver so both
+// a:srgbClr and a:schemeClr (PX5 theme) work.
+function solidFillColor(rPr: PoNode, colors: ColorResolver): string | undefined {
+  const solidFill = poChildren(rPr).find((c) => poIs(c, 'a:solidFill'));
+  if (solidFill) {
+    for (const c of poChildren(solidFill)) {
+      const hex = resolveColorNode(c, colors);
+      if (hex) return hex;
+    }
+    return undefined;
+  }
+  return gradientFillColor(rPr, colors);
+}
+
+/**
+ * §20.1.8.33 — a run may be filled with a GRADIENT, and WordArt always is: the
+ * text of tdf114848's second page runs through five stops of accent1. A run
+ * here wears one colour, so the gradient gives up the stop nearest its middle —
+ * the one most of the glyph is painted in. Unread, the run had no colour at all
+ * and every word came out in the default black.
+ */
+function gradientFillColor(rPr: PoNode, colors: ColorResolver): string | undefined {
+  const grad = poChildren(rPr).find((c) => poIs(c, 'a:gradFill'));
+  const list = grad ? poChildren(grad).find((c) => poIs(c, 'a:gsLst')) : undefined;
+  const stops = list ? poChildren(list).filter((c) => poIs(c, 'a:gs')) : [];
+  let best: { at: number; node: PoNode } | undefined;
+  for (const gs of stops) {
+    const at = Math.abs((poIntAttr(gs, 'pos') ?? 0) - 50000);
+    if (!best || at < best.at) best = { at, node: gs };
+  }
+  if (!best) return undefined;
+  for (const c of poChildren(best.node)) {
+    const hex = resolveColorNode(c, colors);
+    if (hex) return hex;
+  }
+  return undefined;
+}

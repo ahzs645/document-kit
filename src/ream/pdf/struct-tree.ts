@@ -1,0 +1,261 @@
+// ISO 32000-1:2008 §14.7–14.8 — Tagged PDF logical structure.
+//
+// Builds the document structure tree that accessible / PDF/A-1a readers use to
+// recover reading order: a /StructTreeRoot pointing at a tree of /StructElem
+// objects (Document → H1…H6 / P / L→LI→LBody / Table→TR→TD → Figure). Each
+// element ties back to one or more marked-content sequences in the page content
+// streams through marked-content references (MCRs) and the /ParentTree number
+// tree (§14.7.4.4).
+//
+// This module is a generic structure emitter. The docx → structure-type mapping
+// policy lives in the renderer; here we only assemble PDF objects. Object ids
+// are allocated by a deterministic pre-order DFS so the output stays
+// byte-identical for identical input (the writer's /ID hash depends on it).
+
+import type { PdfDict, PdfRef, PdfValue } from './objects';
+import type { PdfDocument } from './writer';
+import { PDF_NULL, dict, name, unicodeString } from './objects';
+
+/**
+ * Standard structure types (ISO 32000-1 Table 333/337). Every type here is
+ * recognised without a `/RoleMap`, so the builder never emits one.
+ */
+export type StructType =
+  | 'Document'
+  | 'Part'
+  | 'Sect'
+  | 'H1'
+  | 'H2'
+  | 'H3'
+  | 'H4'
+  | 'H5'
+  | 'H6'
+  | 'P'
+  | 'L'
+  | 'LI'
+  | 'Lbl'
+  | 'LBody'
+  | 'Table'
+  | 'TR'
+  | 'TH'
+  | 'TD'
+  | 'Caption'
+  | 'Figure'
+  | 'Link'
+  | 'Note'
+  | 'Span';
+
+// One marked-content sequence owned by a node: MCID `mcid` on page `pageIndex`.
+interface Mcref {
+  readonly pageIndex: number;
+  readonly mcid: number;
+}
+
+/** One node in the logical structure tree: a {@link StructType} plus its children, marked-content and attributes. */
+export class StructNode {
+  readonly children: Array<StructNode> = [];
+  readonly mcrefs: Array<Mcref> = [];
+  /**
+   * §14.7.4.3 object references (`/OBJR` kids) — e.g. a Link element pointing at
+   * its link annotation. The annotation's own `/StructParent` entry is recorded
+   * via {@link StructTreeBuilder.addAnnotParent}.
+   */
+  readonly objrs: Array<{ readonly annotRef: PdfRef; readonly pageIndex: number }> = [];
+  parent: StructNode | null = null;
+  ref: PdfRef | null = null;
+  /** Alternate text (`/Alt`, §14.9.4) — required on Figure for PDF/A-1a. */
+  alt: string | null = null;
+  /** Natural language (`/Lang`) when it differs from the document default. */
+  lang: string | null = null;
+  /**
+   * §14.8.5.2 Table attribute (emitted via a `/A` attribute object on the cell):
+   * `/Scope` on a TH (Row/Column) so assistive tech binds headers to data cells.
+   */
+  scope: 'Row' | 'Column' | null = null;
+  /** §14.8.5.2 — `/ColSpan` when the cell spans more than one column (gridSpan). */
+  colSpan: number | null = null;
+  /** §14.8.5.2 — `/RowSpan` when the cell spans more than one row (vertical merge). */
+  rowSpan: number | null = null;
+
+  /**
+   * @param id   The node's index, used for deterministic id assignment and `/ID`.
+   * @param type The structure type (mutable, so the renderer can retag).
+   */
+  constructor(
+    readonly id: number,
+    public type: StructType,
+  ) {}
+}
+
+/**
+ * Builds the tagged-PDF logical structure tree (ISO 32000-1 §14.7–14.8): a
+ * `/StructTreeRoot` over a tree of {@link StructNode}s, tied back to page
+ * marked-content via MCRs and the `/ParentTree`. A generic emitter — the
+ * structure-type mapping policy lives in the renderer. Object ids are assigned by
+ * a deterministic pre-order DFS so identical input yields byte-identical output.
+ */
+export class StructTreeBuilder {
+  private readonly nodes: Array<StructNode> = [];
+  /** The root logical element (the single `/Document` under `/StructTreeRoot`). */
+  readonly root: StructNode;
+
+  constructor() {
+    this.root = this.create('Document', null);
+  }
+
+  /**
+   * Create a node of `type` as the last child of `parent`.
+   *
+   * @param parent The parent node, or `null` for a free node (only the root is
+   *   created that way).
+   * @returns The new node.
+   */
+  create(type: StructType, parent: StructNode | null): StructNode {
+    const node = new StructNode(this.nodes.length, type);
+    node.parent = parent;
+    if (parent) parent.children.push(node);
+    this.nodes.push(node);
+    return node;
+  }
+
+  /**
+   * Look up a node by its id.
+   *
+   * @throws Error if no node has that id.
+   */
+  node(id: number): StructNode {
+    const n = this.nodes[id];
+    if (!n) throw new Error(`Unknown struct node id ${id}`);
+    return n;
+  }
+
+  /**
+   * Record that marked content `mcid` on page `pageIndex` is the content of node
+   * `nodeId`. Called from the emit phase as MCIDs are assigned.
+   */
+  addMcref(nodeId: number, pageIndex: number, mcid: number): void {
+    this.node(nodeId).mcrefs.push({ pageIndex, mcid });
+  }
+
+  /**
+   * §14.7.4.4: an annotation's `/StructParent` key maps DIRECTLY to its owning
+   * `/StructElem` in the parent tree (a scalar entry, unlike the per-page MCID
+   * arrays). The emit phase allocates keys above the page indices.
+   */
+  private readonly annotParents: Array<{ readonly key: number; readonly nodeId: number }> = [];
+  /**
+   * Register that annotation parent-tree key `key` resolves to node `nodeId`.
+   *
+   * @see StructTreeBuilder.annotParents
+   */
+  addAnnotParent(key: number, nodeId: number): void {
+    this.annotParents.push({ key, nodeId });
+  }
+
+  /**
+   * Emit the `/StructTreeRoot`, every `/StructElem`, and the `/ParentTree`. Must
+   * run after all pages are added (so `pageRefs` is complete) and after every
+   * {@link StructTreeBuilder.addMcref} call.
+   *
+   * @param pageRefs The page object references, indexed by page number.
+   * @returns A reference to the `/StructTreeRoot`, for the catalog.
+   */
+  emit(doc: PdfDocument, pageRefs: ReadonlyArray<PdfRef>): PdfRef {
+    // Deterministic pre-order DFS → stable object-id assignment.
+    const order: Array<StructNode> = [];
+    const walk = (n: StructNode): void => {
+      order.push(n);
+      for (const c of n.children) walk(c);
+    };
+    walk(this.root);
+
+    // Pass 1: allocate one StructElem object per node so /P and /K refs resolve.
+    const dicts = new Map<number, PdfDict>();
+    for (const n of order) {
+      const d = dict({ Type: name('StructElem'), S: name(n.type) });
+      // ISO 14289-1 §7.9 — every Note carries a unique /ID (node ids are).
+      if (n.type === 'Note') d.set('ID', `note-${n.id}`);
+      n.ref = doc.add(d);
+      dicts.set(n.id, d);
+    }
+
+    // StructTreeRoot needs a ref before we set the root element's /P to it.
+    const rootDict = dict({ Type: name('StructTreeRoot') });
+    const rootRef = doc.add(rootDict);
+
+    // Pass 2: populate /P, /Pg, /K, /Alt, /Lang now that every ref exists.
+    for (const n of order) {
+      const d = dicts.get(n.id)!;
+      d.set('P', n.parent ? n.parent.ref! : rootRef);
+      // /Pg = the page of this element's first content (bare-MCID resolution
+      // base); leaf MCRs below always carry their own /Pg so split elements are
+      // still correct.
+      const firstPage =
+        n.mcrefs.length > 0
+          ? n.mcrefs[0]!.pageIndex
+          : n.objrs.length > 0
+            ? n.objrs[0]!.pageIndex
+            : undefined;
+      if (firstPage !== undefined) d.set('Pg', pageRefs[firstPage]!);
+
+      // /K = child elements (logical order) followed by this node's own MCRs.
+      // Our construction keeps a node either a container (child elems) or a leaf
+      // (MCRs); mixing is permitted by the spec but we never need it.
+      const kids: Array<PdfValue> = [];
+      for (const c of n.children) kids.push(c.ref!);
+      for (const m of n.mcrefs) {
+        kids.push(dict({ Type: name('MCR'), Pg: pageRefs[m.pageIndex]!, MCID: m.mcid }));
+      }
+      for (const o of n.objrs) {
+        kids.push(dict({ Type: name('OBJR'), Pg: pageRefs[o.pageIndex]!, Obj: o.annotRef }));
+      }
+      if (kids.length === 1) d.set('K', kids[0]!);
+      else if (kids.length > 1) d.set('K', kids);
+
+      if (n.alt !== null) d.set('Alt', unicodeString(n.alt));
+      if (n.lang !== null) d.set('Lang', n.lang);
+      // §14.8.5.2 — table cells carry scope/span via a /Table attribute object.
+      if (n.scope !== null || n.colSpan !== null || n.rowSpan !== null) {
+        const attrs: Record<string, PdfValue> = { O: name('Table') };
+        if (n.scope !== null) attrs['Scope'] = name(n.scope);
+        if (n.colSpan !== null) attrs['ColSpan'] = n.colSpan;
+        if (n.rowSpan !== null) attrs['RowSpan'] = n.rowSpan;
+        d.set('A', dict(attrs));
+      }
+    }
+
+    // /ParentTree (§14.7.4.4): a number tree keyed by each page's
+    // /StructParents value (= pageIndex here). The value is an array indexed by
+    // MCID giving the StructElem that owns each marked-content sequence.
+    const perPage = new Map<number, Array<PdfRef>>();
+    for (const n of order) {
+      for (const m of n.mcrefs) {
+        let arr = perPage.get(m.pageIndex);
+        if (!arr) {
+          arr = [];
+          perPage.set(m.pageIndex, arr);
+        }
+        arr[m.mcid] = n.ref!;
+      }
+    }
+    const entries = new Map<number, PdfValue>();
+    for (const [k, arr] of perPage) {
+      const dense: Array<PdfValue> = [];
+      for (let i = 0; i < arr.length; i++) dense.push(arr[i] ?? PDF_NULL);
+      entries.set(k, dense);
+    }
+    for (const a of this.annotParents) entries.set(a.key, this.node(a.nodeId).ref!);
+    const sortedKeys = [...entries.keys()].sort((a, b) => a - b);
+    const nums: Array<PdfValue> = [];
+    for (const k of sortedKeys) nums.push(k, entries.get(k)!);
+    const parentTreeRef = doc.add(dict({ Nums: nums }));
+
+    rootDict.set('K', this.root.ref!);
+    rootDict.set('ParentTree', parentTreeRef);
+    rootDict.set(
+      'ParentTreeNextKey',
+      sortedKeys.length > 0 ? sortedKeys[sortedKeys.length - 1]! + 1 : 0,
+    );
+    return rootRef;
+  }
+}

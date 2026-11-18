@@ -1,0 +1,324 @@
+// E-PDF EP3 — tagged fast-path. Convert a docx to a TAGGED PDF, then rebuild a
+// FlowDoc from its /StructTreeRoot and confirm the headings, paragraphs and
+// reading order come back — the honest inverse of the tagged PDF Ream writes.
+
+import { readFileSync } from 'node:fs';
+
+import { describe, expect, it } from 'vitest';
+
+import { buildDocxFromBody } from './fixtures/build-docx';
+import type { BodyElement } from '../../src/ream/core/document-model';
+import { Ream } from '../../src/ream/core/converter/ream';
+import { PdfFile } from '../../src/ream/pdf-reader/document';
+import { reconstructTaggedPdf } from '../../src/ream/pdf-reader/tagged';
+
+const FONTS = {
+  regular: new Uint8Array(readFileSync('tests/ream/fixtures/fonts/Roboto-Regular.ttf')),
+  bold: new Uint8Array(readFileSync('tests/ream/fixtures/fonts/Roboto-Bold.ttf')),
+};
+
+const para = (text: string): string => `<w:p><w:r><w:t>${text}</w:t></w:r></w:p>`;
+const heading = (text: string, level: number): string =>
+  `<w:p><w:pPr><w:outlineLvl w:val="${level}"/></w:pPr><w:r><w:t>${text}</w:t></w:r></w:p>`;
+
+async function taggedFlow(body: string) {
+  const pdf = await Ream.parse(buildDocxFromBody(body)).convert('pdf', {
+    fonts: FONTS,
+    tagged: true,
+  });
+  const flow = reconstructTaggedPdf(PdfFile.parse(pdf));
+  if (!flow) throw new Error('reconstruction returned no FlowDoc');
+  return flow.doc;
+}
+
+const paragraphTexts = (flow: { body: ReadonlyArray<{ kind: string }> }): Array<string> =>
+  flow.body
+    .filter(
+      (b): b is { kind: 'paragraph'; paragraph: { runs: ReadonlyArray<{ text: string }> } } =>
+        b.kind === 'paragraph',
+    )
+    .map((p) =>
+      p.paragraph.runs
+        .map((r) => r.text)
+        .join('')
+        .replace(/\s+/g, ' ')
+        .trim(),
+    );
+
+/**
+ * The same PDF with every page turned by `/Rotate 90`, written as an
+ * incremental update (§7.5.6): a new revision of each page object and a
+ * cross-reference section that points at it, the way an editor turns a page.
+ */
+function turnedPages(pdf: Uint8Array): Uint8Array {
+  // Byte for byte: TextDecoder's 'latin1' is windows-1252, which rewrites
+  // 0x80–0x9F and would corrupt every compressed stream on the way back.
+  const text = Array.from(pdf, (b) => String.fromCharCode(b)).join('');
+  const size = /\/Size (\d+)/u.exec(text)![1]!;
+  const root = /\/Root (\d+ \d+ R)/u.exec(text)![1]!;
+  const prev = /startxref\s+(\d+)\s+%%EOF\s*$/u.exec(text)![1]!;
+  let out = text;
+  const entries: Array<string> = [];
+  for (const m of text.matchAll(/(\d+) 0 obj\s*<<\/Type \/Page ([^]*?)>>\s*endobj/gu)) {
+    const offset = out.length;
+    out += `${m[1]!} 0 obj\n<</Type /Page ${m[2]!} /Rotate 90>>\nendobj\n`;
+    entries.push(`${m[1]!} 1\n${String(offset).padStart(10, '0')} 00000 n \n`);
+  }
+  const xref = out.length;
+  out +=
+    `xref\n${entries.join('')}trailer\n<</Size ${size} /Root ${root} /Prev ${prev}>>\n` +
+    `startxref\n${String(xref)}\n%%EOF\n`;
+  return Uint8Array.from(out, (c) => c.charCodeAt(0));
+}
+
+const pageBreaksIn = (flow: { body: ReadonlyArray<BodyElement> }): number =>
+  flow.body.filter((b) => b.kind === 'paragraph' && b.paragraph.properties.pageBreakBefore === true)
+    .length;
+
+/**
+ * The same PDF with its /Document element naming its children in reverse, as
+ * an incremental update (§7.5.6): a tree that opens its page away from the top.
+ */
+function lowFirst(pdf: Uint8Array): Uint8Array {
+  const text = Array.from(pdf, (b) => String.fromCharCode(b)).join('');
+  const size = /\/Size (\d+)/u.exec(text)![1]!;
+  const root = /\/Root (\d+ \d+ R)/u.exec(text)![1]!;
+  const prev = /startxref\s+(\d+)\s+%%EOF\s*$/u.exec(text)![1]!;
+  const doc = /(\d+) 0 obj\s*<<\/Type \/StructElem \/S \/Document ([^]*?)\/K \[([^\]]*)\]>>/u.exec(
+    text,
+  )!;
+  const kids = doc[3]!
+    .trim()
+    .split(/(?<=R)\s+/u)
+    .reverse()
+    .join(' ');
+  const offset = text.length;
+  let out = `${text}${doc[1]!} 0 obj\n<</Type /StructElem /S /Document ${doc[2]!}/K [${kids}]>>\nendobj\n`;
+  const xref = out.length;
+  out +=
+    `xref\n${doc[1]!} 1\n${String(offset).padStart(10, '0')} 00000 n \ntrailer\n` +
+    `<</Size ${size} /Root ${root} /Prev ${prev}>>\nstartxref\n${String(xref)}\n%%EOF\n`;
+  return Uint8Array.from(out, (c) => c.charCodeAt(0));
+}
+
+describe('the pages a tagged document is set on (§14.8)', () => {
+  it('opens a page of its own where the source page ended short', async () => {
+    // bug793632.pdf is four pages of a line each — three of front matter and
+    // the first of the body. A tree names the lines and not the pages, and
+    // read as one flow they came back as one page.
+    const brk = '<w:p><w:r><w:br w:type="page"/></w:r></w:p>';
+    const flow = await taggedFlow(
+      para('Page one.') + brk + para('Page two.') + brk + para('Page three.'),
+    );
+    expect(paragraphTexts(flow).filter((t) => t.length > 0)).toEqual([
+      'Page one.',
+      'Page two.',
+      'Page three.',
+    ]);
+    expect(pageBreaksIn(flow)).toBe(2);
+  });
+
+  it('spaces a page’s first element down only where it is the page’s first line', async () => {
+    // A tree may open a page anywhere on it: chrome-text-selection-markedContent.pdf
+    // names the guidance box at the foot of its sidebar first, and spaced down
+    // to where that box stands, the whole report began at the foot of its
+    // sheet. Here the tree is re-ordered to name the LOWER paragraph first.
+    const pdf = await Ream.parse(
+      buildDocxFromBody(
+        para('Top line') +
+          '<w:p><w:pPr><w:spacing w:before="6000"/></w:pPr><w:r><w:t>Low line</w:t></w:r></w:p>',
+      ),
+    ).convert('pdf', { fonts: FONTS, tagged: true });
+    const flow = reconstructTaggedPdf(PdfFile.parse(lowFirst(pdf)))?.doc;
+    const first = flow?.body.find((b) => b.kind === 'paragraph' && b.paragraph.runs.length > 0);
+    if (first?.kind !== 'paragraph') throw new Error('expected a paragraph');
+    expect(first.paragraph.runs.map((r) => r.text).join('')).toBe('Low line');
+    expect(first.paragraph.properties.spacingBefore ?? 0).toBe(0);
+  });
+
+  it('lets the words of a page they filled run on, as the paper broke them', async () => {
+    // A page the words filled was broken by the paper, and re-set they break
+    // wherever the new setting puts them: bug1997343.pdf's two-column first
+    // page read as one column ran on past a page, and broken again where the
+    // source page broke, a sheet of it stood alone.
+    const long = Array.from({ length: 60 }, (_, i) =>
+      para(`Line ${String(i + 1)} of a page the words fill to its foot.`),
+    ).join('');
+    const flow = await taggedFlow(long);
+    expect(paragraphTexts(flow)).toContain('Line 60 of a page the words fill to its foot.');
+    expect(pageBreaksIn(flow)).toBe(0);
+  });
+});
+
+describe('tagged-PDF reconstruction (E-PDF EP3)', () => {
+  it('turns the words with pages the turn leaves running down their sheets (§17.6.20)', async () => {
+    // Every viewer shows a portrait page turned by /Rotate 90 as a landscape
+    // sheet with its words running down it — and so is the document read back.
+    const pdf = await Ream.parse(buildDocxFromBody(para('Turned with its page.'))).convert('pdf', {
+      fonts: FONTS,
+      tagged: true,
+    });
+    const flow = reconstructTaggedPdf(PdfFile.parse(turnedPages(pdf)))?.doc;
+    expect(flow?.section?.textDirection).toBe('tbRl');
+    expect(flow?.section?.pageSize?.orientation).toBe('landscape');
+    expect(paragraphTexts(flow!)).toContain('Turned with its page.');
+    // …and the same document unturned reads across its sheet, as before.
+    expect(reconstructTaggedPdf(PdfFile.parse(pdf))?.doc.section?.textDirection).toBeUndefined();
+  });
+
+  it('measures the margins the source set instead of leaving them at zero', async () => {
+    // A tagged reading re-sets the words exactly as an untagged one does, and
+    // needs the same margins. Without them every tagged PDF came back with its
+    // text against all four edges of the paper.
+    const flow = await taggedFlow(para('A paragraph inside the page’s margins.'));
+    const margins = flow.section?.margins;
+    expect(margins).toBeDefined();
+    expect(margins!.left as number).toBeGreaterThan(20);
+    expect(margins!.top as number).toBeGreaterThan(20);
+  });
+
+  it('declines a tree that reaches none of the page’s words', async () => {
+    // annotation-choice-widget.pdf carries a structure tree whose nodes name
+    // marked content the page never marks: not one run has an MCID, so every
+    // node came back empty while the artwork kept the body non-empty — and the
+    // file converted to list boxes with no text in them at all. Declining
+    // hands the page to the heuristic reading, which has all of it to read.
+    const pdf = await Ream.parse(buildDocxFromBody(para('Words the tree cannot reach.'))).convert(
+      'pdf',
+      { fonts: FONTS, tagged: true },
+    );
+    // The same file WITH its ids is read through the tree, so the two verdicts
+    // differ by the join alone.
+    expect(reconstructTaggedPdf(PdfFile.parse(pdf))).toBeDefined();
+    const stripped = stripMarkedContent(pdf);
+    expect(reconstructTaggedPdf(PdfFile.parse(stripped))).toBeUndefined();
+  });
+
+  it('recovers headings, paragraphs and reading order', async () => {
+    const flow = await taggedFlow(
+      heading('Chapter One', 0) + para('First paragraph body.') + para('Second paragraph body.'),
+    );
+    const texts = paragraphTexts(flow);
+    expect(texts.some((t) => t.includes('Chapter One'))).toBe(true);
+    expect(texts.some((t) => t.includes('First paragraph body'))).toBe(true);
+    expect(texts.some((t) => t.includes('Second paragraph body'))).toBe(true);
+    // reading order: the heading precedes the first body paragraph.
+    const joined = texts.join(' | ');
+    expect(joined.indexOf('Chapter One')).toBeLessThan(joined.indexOf('First paragraph'));
+  });
+
+  it('maps an H1 structure element back to outline level 0', async () => {
+    const flow = await taggedFlow(heading('A Heading', 0) + para('Body text here.'));
+    const headingPara = flow.body.find(
+      (b) =>
+        b.kind === 'paragraph' &&
+        b.paragraph.runs
+          .map((r) => r.text)
+          .join('')
+          .includes('A Heading'),
+    );
+    expect(headingPara?.kind).toBe('paragraph');
+    expect(
+      headingPara?.kind === 'paragraph' ? headingPara.paragraph.properties.outlineLevel : undefined,
+    ).toBe(0);
+  });
+
+  it('returns undefined for an untagged PDF', async () => {
+    const pdf = await Ream.parse(buildDocxFromBody(para('Plain untagged text.'))).convert('pdf', {
+      fonts: FONTS,
+    });
+    expect(reconstructTaggedPdf(PdfFile.parse(pdf))).toBeUndefined();
+  });
+
+  it('reconstructs a table as a Table element with its cell text (EP3b)', async () => {
+    const cell = (t: string): string => `<w:tc><w:p><w:r><w:t>${t}</w:t></w:r></w:p></w:tc>`;
+    const tbl =
+      '<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr>' +
+      '<w:tblGrid><w:gridCol w:w="2400"/><w:gridCol w:w="2400"/></w:tblGrid>' +
+      `<w:tr>${cell('NameCol')}${cell('ScoreCol')}</w:tr>` +
+      `<w:tr>${cell('AlphaRow')}${cell('NinetyNine')}</w:tr></w:tbl>`;
+    const flow = await taggedFlow(tbl);
+    const table = flow.body.find((b) => b.kind === 'table');
+    expect(table).toBeDefined();
+    if (table?.kind !== 'table') throw new Error('expected a table');
+    expect(table.table.rows).toHaveLength(2);
+    expect(table.table.rows[0]!.cells).toHaveLength(2);
+    const dump = JSON.stringify(table);
+    for (const word of ['NameCol', 'ScoreCol', 'AlphaRow', 'NinetyNine']) {
+      expect(dump).toContain(word);
+    }
+  });
+
+  it('reads the column grid from where the cells sit, not in equal shares', async () => {
+    // A structure tree states no widths, so an equal share was the old answer.
+    // It is right only for a table whose columns really are equal: here the
+    // first is four times the second, and a form's are further apart still.
+    const cell = (t: string): string => `<w:tc><w:p><w:r><w:t>${t}</w:t></w:r></w:p></w:tc>`;
+    const tbl =
+      '<w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr>' +
+      '<w:tblGrid><w:gridCol w:w="6400"/><w:gridCol w:w="1600"/></w:tblGrid>' +
+      `<w:tr>${cell('WideColumnHere')}${cell('Nx')}</w:tr>` +
+      `<w:tr>${cell('AlsoWideHere')}${cell('Ny')}</w:tr></w:tbl>`;
+    const flow = await taggedFlow(tbl);
+    const table = flow.body.find((b) => b.kind === 'table');
+    if (table?.kind !== 'table') throw new Error('expected a table');
+    const [first, second] = table.table.grid;
+    expect(first).toBeDefined();
+    expect(second).toBeDefined();
+    expect(first!).toBeGreaterThan(second!);
+  });
+
+  it('keeps the colour the glyphs were painted in', async () => {
+    // §8.6.8. Dropped, 160F-2019.pdf's blue field labels and its red warning
+    // all came back plain black.
+    const flow = await taggedFlow(
+      '<w:p><w:r><w:rPr><w:color w:val="0000FF"/></w:rPr><w:t>BlueText</w:t></w:r></w:p>',
+    );
+    const colours = flow.body.flatMap((b) =>
+      b.kind === 'paragraph' ? b.paragraph.runs.map((r) => r.properties.colorHex) : [],
+    );
+    expect(colours).toContain('0000FF');
+  });
+
+  it('keeps the size the glyphs were shown at', async () => {
+    // §9.3.1 Tf. Dropped, every run came back at the 11pt default, and a form
+    // set in 7pt grew by half again — 160F-2019.pdf rebuilt one page as five.
+    const flow = await taggedFlow(
+      '<w:p><w:r><w:rPr><w:sz w:val="14"/></w:rPr><w:t>SevenPointText</w:t></w:r></w:p>',
+    );
+    const sizes = flow.body.flatMap((b) =>
+      b.kind === 'paragraph' ? b.paragraph.runs.map((r) => r.properties.fontSizePt) : [],
+    );
+    expect(sizes.some((s) => s !== undefined && Math.abs(s - 7) < 0.5)).toBe(true);
+  });
+
+  it('reconstructs list items as paragraphs carrying their text (EP3b)', async () => {
+    const numbering =
+      '<w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:numFmt w:val="bullet"/>' +
+      '<w:lvlText w:val="•"/></w:lvl></w:abstractNum>' +
+      '<w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num>';
+    const item = (t: string): string =>
+      `<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr></w:pPr>` +
+      `<w:r><w:t>${t}</w:t></w:r></w:p>`;
+    const docx = buildDocxFromBody(item('ItemOne') + item('ItemTwo'), { numberingXml: numbering });
+    const pdf = await Ream.parse(docx).convert('pdf', { fonts: FONTS, tagged: true });
+    const flow = reconstructTaggedPdf(PdfFile.parse(pdf));
+    if (!flow) throw new Error('reconstruction returned no FlowDoc');
+    const texts = paragraphTexts(flow.doc);
+    expect(texts.some((t) => t.includes('ItemOne'))).toBe(true);
+    expect(texts.some((t) => t.includes('ItemTwo'))).toBe(true);
+  });
+});
+
+/**
+ * The same file with every `BDC` turned into a `BMC`, which drops the marked
+ * content ids while leaving the structure tree that names them. What comes out
+ * is the shape annotation-choice-widget.pdf is in: a tree joined to nothing.
+ */
+function stripMarkedContent(pdf: Uint8Array): Uint8Array {
+  const out = new Uint8Array(pdf);
+  for (let i = 0; i + 2 < out.length; i++) {
+    if (out[i] === 0x42 && out[i + 1] === 0x44 && out[i + 2] === 0x43) out[i + 1] = 0x4d; // BDC → BMC
+  }
+  return out;
+}

@@ -1,0 +1,1092 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
+
+import { strToU8, zipSync } from 'fflate';
+import { describe, expect, it } from 'vitest';
+
+import { buildXlsx } from './fixtures/build-xlsx';
+import { countShown, showPattern } from './fixtures/pdf-show';
+import { decodeXstring } from '../../src/ream/excel/escaped-text';
+import { convertXlsxToPdfSync } from '../../src/ream/core/converter';
+import { parseTtf } from '../../src/ream/core/font';
+import {
+  formatCellRef,
+  parseAreaRef,
+  parseCellRef,
+  parseSharedStrings,
+  parseTitleRowRange,
+  parseWorkbook,
+  parseWorksheet,
+} from '../../src/ream/excel';
+import { OpcPackage } from '../../src/ream/core/opc';
+import { readXlsx } from '../../src/ream/excel/xlsx-reader';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const FONTS = {
+  regular: new Uint8Array(readFileSync(resolve(here, 'fixtures/fonts/Roboto-Regular.ttf'))),
+};
+const BOLD = new Uint8Array(readFileSync(resolve(here, 'fixtures/fonts/Roboto-Bold.ttf')));
+
+const latin1 = new TextDecoder('latin1');
+const asLatin1 = (b: Uint8Array): string => latin1.decode(b);
+
+describe('cell reference (A1 ↔ {row, col})', () => {
+  it('round-trips A1 / B2 / Z1 / AA1 / AB12', () => {
+    const cases: Array<[string, { column: number; row: number }]> = [
+      ['A1', { column: 0, row: 0 }],
+      ['B2', { column: 1, row: 1 }],
+      ['Z1', { column: 25, row: 0 }],
+      ['AA1', { column: 26, row: 0 }],
+      ['AB12', { column: 27, row: 11 }],
+      ['BA100', { column: 52, row: 99 }],
+    ];
+    for (const [ref, expected] of cases) {
+      expect(parseCellRef(ref)).toEqual(expected);
+      expect(formatCellRef(expected)).toBe(ref);
+    }
+  });
+
+  it('throws on invalid refs', () => {
+    expect(() => parseCellRef('')).toThrow();
+    expect(() => parseCellRef('A')).toThrow();
+    expect(() => parseCellRef('1A')).toThrow();
+  });
+});
+
+describe('xlsx parsers', () => {
+  it('parses sheets from workbook.xml', () => {
+    const xlsx = buildXlsx([['A', 'B']]);
+    const pkg = OpcPackage.open(xlsx);
+    const { sheets, date1904 } = parseWorkbook(pkg.requirePart('xl/workbook.xml'));
+    expect(sheets).toHaveLength(1);
+    expect(sheets[0]!.name).toBe('Sheet1');
+    expect(sheets[0]!.relationshipId).toBe('rId1');
+    expect(date1904).toBe(false);
+  });
+
+  it('parses shared strings', () => {
+    const xlsx = buildXlsx([
+      ['Hello', 'World'],
+      ['Hello', 42],
+    ]);
+    const pkg = OpcPackage.open(xlsx);
+    const strs = parseSharedStrings(pkg.requirePart('xl/sharedStrings.xml')).texts;
+    expect(strs).toEqual(['Hello', 'World']);
+  });
+
+  it('parses row heights, pageMargins and pageSetup from worksheet.xml', () => {
+    const xlsx = buildXlsx({
+      rows: [['A'], ['B'], ['C']],
+      rowHeights: [{ row: 0, heightPt: 30, customHeight: true }],
+      pageMargins: { left: 0.7, right: 0.7, top: 0.75, bottom: 0.75, header: 0.3, footer: 0.3 },
+      pageSetup: { paperSize: 1, orientation: 'landscape' },
+    });
+    const pkg = OpcPackage.open(xlsx);
+    const ws = parseWorksheet(pkg.requirePart('xl/worksheets/sheet1.xml'));
+    expect(ws.rowHeights).toEqual([{ row: 0, heightPt: 30, customHeight: true }]);
+    expect(ws.pageMargins).toEqual({
+      leftInches: 0.7,
+      rightInches: 0.7,
+      topInches: 0.75,
+      bottomInches: 0.75,
+      headerInches: 0.3,
+      footerInches: 0.3,
+    });
+    expect(ws.pageSetup).toEqual({ paperSize: 1, orientation: 'landscape' });
+  });
+
+  it('parses workbookPr date1904 flag', () => {
+    const xlsxA = buildXlsx({ rows: [['x']] });
+    const a = parseWorkbook(OpcPackage.open(xlsxA).requirePart('xl/workbook.xml'));
+    expect(a.date1904).toBe(false);
+
+    const xlsxB = buildXlsx({ rows: [['x']], date1904: true });
+    const b = parseWorkbook(OpcPackage.open(xlsxB).requirePart('xl/workbook.xml'));
+    expect(b.date1904).toBe(true);
+  });
+
+  it('parses worksheet cells with types', () => {
+    const xlsx = buildXlsx([
+      ['Name', 'Value', 'Active'],
+      ['Alice', 42, true],
+      ['Bob', 3.14, false],
+    ]);
+    const pkg = OpcPackage.open(xlsx);
+    const ws = parseWorksheet(pkg.requirePart('xl/worksheets/sheet1.xml'));
+    expect(ws.maxRow).toBe(2);
+    expect(ws.maxColumn).toBe(2);
+    expect(ws.cells).toHaveLength(9);
+    const a1 = ws.cells.find((c) => c.row === 0 && c.column === 0);
+    const b2 = ws.cells.find((c) => c.row === 1 && c.column === 1);
+    const c2 = ws.cells.find((c) => c.row === 1 && c.column === 2);
+    expect(a1!.type).toBe('s');
+    expect(b2!.type).toBe('n');
+    expect(b2!.rawValue).toBe('42');
+    expect(c2!.type).toBe('b');
+    expect(c2!.rawValue).toBe('1');
+  });
+
+  // Regression: some producers (e.g. Haansoft HCell) write SpreadsheetML with
+  // an explicit `x:` namespace prefix instead of the default namespace. Before
+  // the parsers stripped prefixes, workbook.xml yielded 0 sheets → the whole
+  // file failed with "xlsx has no sheets" (found across 6 POI corpus files).
+  it('tolerates an explicit x: namespace prefix (workbook / sst / worksheet)', () => {
+    const enc = (s: string): Uint8Array => new TextEncoder().encode(s);
+    const X = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+    const R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+
+    // workbook.xml: x: on elements, r: on the relationship id.
+    const { sheets } = parseWorkbook(
+      enc(
+        `<x:workbook xmlns:r="${R}" xmlns:x="${X}">` +
+          `<x:sheets><x:sheet name="Features" sheetId="1" r:id="rId7"/></x:sheets></x:workbook>`,
+      ),
+    );
+    expect(sheets).toHaveLength(1);
+    expect(sheets[0]!.name).toBe('Features');
+    expect(sheets[0]!.relationshipId).toBe('rId7'); // r:id resolved via prefix strip
+
+    // sharedStrings.xml with x: prefix.
+    expect(
+      parseSharedStrings(
+        enc(
+          `<x:sst xmlns:x="${X}"><x:si><x:t>Hi</x:t></x:si><x:si><x:t>There</x:t></x:si></x:sst>`,
+        ),
+      ).texts,
+    ).toEqual(['Hi', 'There']);
+
+    // worksheet.xml with x: prefix: one shared-string cell + one number cell.
+    const ws = parseWorksheet(
+      enc(
+        `<x:worksheet xmlns:x="${X}"><x:sheetData><x:row r="1">` +
+          `<x:c r="A1" t="s"><x:v>0</x:v></x:c><x:c r="B1"><x:v>42</x:v></x:c>` +
+          `</x:row></x:sheetData></x:worksheet>`,
+      ),
+    );
+    expect(ws.cells).toHaveLength(2);
+    const a1 = ws.cells.find((c) => c.row === 0 && c.column === 0);
+    const b1 = ws.cells.find((c) => c.row === 0 && c.column === 1);
+    expect(a1!.type).toBe('s');
+    expect(a1!.rawValue).toBe('0');
+    expect(b1!.type).toBe('n');
+    expect(b1!.rawValue).toBe('42');
+  });
+});
+
+describe('convertXlsxToPdfSync end-to-end', () => {
+  it('renders a small grid as a bordered table', () => {
+    const xlsx = buildXlsx([
+      ['Region', 'Revenue', 'Growth'],
+      ['Moscow', 1200000, true],
+      ['SPb', 720000, false],
+    ]);
+    const pdf = convertXlsxToPdfSync(xlsx, { fonts: FONTS });
+    const text = asLatin1(pdf);
+
+    expect(text.startsWith('%PDF-1.7\n')).toBe(true);
+    expect(text).toContain('/Type /Page');
+
+    const parsed = parseTtf(FONTS.regular);
+
+    expect(text).toMatch(showPattern(parsed, 'Region'));
+    expect(text).toMatch(showPattern(parsed, 'Moscow'));
+    expect(text).toMatch(showPattern(parsed, '1200000'));
+    expect(text).toMatch(showPattern(parsed, 'TRUE'));
+  });
+
+  it('skips empty cells gracefully', () => {
+    const xlsx = buildXlsx([
+      ['A', null, 'C'],
+      [null, 'B', null],
+    ]);
+    const pdf = convertXlsxToPdfSync(xlsx, { fonts: FONTS });
+    expect(pdf.byteLength).toBeGreaterThan(100);
+  });
+
+  it('applies font properties (bold + colour) from cellXfs', () => {
+    const stylesXml = `
+      <fonts count="2">
+        <font><sz val="11"/><name val="Calibri"/></font>
+        <font><b/><sz val="14"/><color rgb="FFFF0000"/><name val="Calibri"/></font>
+      </fonts>
+      <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+      <borders count="1"><border/></borders>
+      <cellXfs count="2">
+        <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+        <xf numFmtId="0" fontId="1" fillId="0" borderId="0" applyFont="1"/>
+      </cellXfs>`;
+    const xlsx = buildXlsx({
+      rows: [
+        [{ value: 'Title', styleIndex: 1 }, 'Plain'],
+        ['Body', 'More'],
+      ],
+      stylesXml,
+    });
+    const pdf = convertXlsxToPdfSync(xlsx, { fonts: { regular: FONTS.regular, bold: BOLD } });
+    const text = asLatin1(pdf);
+
+    expect(text).toMatch(/\/BaseFont \/[A-Z]{6}\+Roboto-Bold\b/);
+    // Red colour: 255/255 → "1" component for r in rg operator.
+    expect(text).toMatch(/\b1 0 0 rg\b/);
+  });
+
+  it('applies built-in number format (thousands separator)', () => {
+    const stylesXml = `
+      <fonts count="1"><font/></fonts>
+      <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+      <borders count="1"><border/></borders>
+      <cellXfs count="2">
+        <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+        <xf numFmtId="3" fontId="0" fillId="0" borderId="0" applyNumberFormat="1"/>
+      </cellXfs>`;
+    const xlsx = buildXlsx({
+      rows: [[{ value: 1234567, styleIndex: 1 }]],
+      stylesXml,
+    });
+    const pdf = convertXlsxToPdfSync(xlsx, { fonts: FONTS });
+    const text = asLatin1(pdf);
+
+    const parsed = parseTtf(FONTS.regular);
+    expect(text).toMatch(showPattern(parsed, '1,234,567'));
+  });
+
+  it('applies custom number format (#,##0.00) to currency-like value', () => {
+    const stylesXml = `
+      <numFmts count="1">
+        <numFmt numFmtId="164" formatCode="#,##0.00"/>
+      </numFmts>
+      <fonts count="1"><font/></fonts>
+      <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+      <borders count="1"><border/></borders>
+      <cellXfs count="2">
+        <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+        <xf numFmtId="164" fontId="0" fillId="0" borderId="0" applyNumberFormat="1"/>
+      </cellXfs>`;
+    const xlsx = buildXlsx({
+      rows: [[{ value: 50000.5, styleIndex: 1 }]],
+      stylesXml,
+    });
+    const pdf = convertXlsxToPdfSync(xlsx, { fonts: FONTS });
+    const text = asLatin1(pdf);
+
+    const parsed = parseTtf(FONTS.regular);
+    expect(text).toMatch(showPattern(parsed, '50,000.50'));
+  });
+
+  it('paints cell background fill as a re + f rectangle', () => {
+    const stylesXml = `
+      <fonts count="1"><font/></fonts>
+      <fills count="3">
+        <fill><patternFill patternType="none"/></fill>
+        <fill><patternFill patternType="gray125"/></fill>
+        <fill><patternFill patternType="solid"><fgColor rgb="FF4472C4"/></patternFill></fill>
+      </fills>
+      <borders count="1"><border/></borders>
+      <cellXfs count="2">
+        <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+        <xf numFmtId="0" fontId="0" fillId="2" borderId="0" applyFill="1"/>
+      </cellXfs>`;
+    const xlsx = buildXlsx({
+      rows: [[{ value: 'Header', styleIndex: 1 }, 'Plain']],
+      stylesXml,
+    });
+    const pdf = convertXlsxToPdfSync(xlsx, { fonts: FONTS });
+    const text = asLatin1(pdf);
+
+    // Filled rectangle with #4472C4 → r/g/b roughly (0.267, 0.447, 0.769).
+    expect(text).toMatch(/0\.267 0\.447 0\.769 rg/);
+    expect(text).toMatch(/[\d.]+ [\d.]+ [\d.]+ [\d.]+ re\nf/);
+  });
+
+  it('applies per-cell border style + colour from xf.borderId', () => {
+    const stylesXml = `
+      <fonts count="1"><font/></fonts>
+      <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+      <borders count="2">
+        <border/>
+        <border>
+          <left style="thick"><color rgb="FFD92020"/></left>
+          <right style="thick"><color rgb="FFD92020"/></right>
+          <top style="thick"><color rgb="FFD92020"/></top>
+          <bottom style="thick"><color rgb="FFD92020"/></bottom>
+        </border>
+      </borders>
+      <cellXfs count="2">
+        <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+        <xf numFmtId="0" fontId="0" fillId="0" borderId="1" applyBorder="1"/>
+      </cellXfs>`;
+    const xlsx = buildXlsx({
+      rows: [[{ value: 'Box', styleIndex: 1 }]],
+      stylesXml,
+    });
+    const pdf = convertXlsxToPdfSync(xlsx, { fonts: FONTS });
+    const text = asLatin1(pdf);
+
+    // §18.18.3 names a screen weight: thick is 3 px at 96 DPI = 2.25 pt. The
+    // eighth-point scale these were once mapped onto is WordprocessingML's, and
+    // it drew every spreadsheet rule a third too light.
+    expect(text).toMatch(/2\.25 w/);
+    // Stroke colour FFD92020 → ~(0.851, 0.125, 0.125)
+    expect(text).toMatch(/0\.851 0\.125 0\.125 RG/);
+  });
+
+  it('renders every sheet on its own page', () => {
+    const xlsx = buildXlsx({
+      sheets: [
+        {
+          name: 'Income',
+          rows: [
+            ['Year', 'Total'],
+            ['2024', 100],
+          ],
+        },
+        {
+          name: 'Expenses',
+          rows: [
+            ['Year', 'Total'],
+            ['2024', 60],
+          ],
+        },
+        {
+          name: 'Summary',
+          rows: [
+            ['Year', 'Profit'],
+            ['2024', 40],
+          ],
+        },
+      ],
+    });
+    const pdf = convertXlsxToPdfSync(xlsx, { fonts: FONTS });
+    const text = asLatin1(pdf);
+
+    const pageCount = (text.match(/\/Type \/Page\b/g) ?? []).filter(
+      (m) => !m.includes('Pages'),
+    ).length;
+    expect(pageCount).toBeGreaterThanOrEqual(3);
+
+    const parsed = parseTtf(FONTS.regular);
+    // Each sheet's distinct data renders (one sheet per page).
+    expect(text).toMatch(showPattern(parsed, '100'));
+    expect(text).toMatch(showPattern(parsed, '60'));
+    expect(text).toMatch(showPattern(parsed, '40'));
+    // The sheet NAMES are NOT printed — Calc/Excel `--convert-to pdf` emit them
+    // nowhere; a synthetic title is pure extra text vs the print golden.
+    expect(text).not.toMatch(showPattern(parsed, 'Income'));
+    expect(text).not.toMatch(showPattern(parsed, 'Summary'));
+  });
+
+  it('honours per-row heights from <row ht customHeight="1">', () => {
+    // 6 rows total. Without explicit heights every row is roughly the body's
+    // computed text height (~ font size * 1.2 = 13.2pt). Pinning row 1 to
+    // 60pt should expand at least one row by ~47pt vs the unpinned variant.
+    const rows = [['A'], ['B'], ['C'], ['D'], ['E'], ['F']];
+    const baseline = convertXlsxToPdfSync(buildXlsx({ rows }), { fonts: FONTS });
+    const expanded = convertXlsxToPdfSync(
+      buildXlsx({ rows, rowHeights: [{ row: 1, heightPt: 60, customHeight: true }] }),
+      { fonts: FONTS },
+    );
+    const tallerBy = expanded.byteLength - baseline.byteLength;
+    // The expanded PDF carries the same number of glyphs, so any byte-size
+    // diff is irrelevant. Instead check that the actual text baselines have
+    // shifted by parsing every Tm y-coordinate. The baseline of row 2+ should
+    // sit ~47pt lower in the expanded variant.
+    void tallerBy;
+    const baselinesOf = (pdf: Uint8Array): Array<number> =>
+      Array.from(asLatin1(pdf).matchAll(/1 0 0 1 [\d.]+ ([\d.]+) Tm/g)).map((m) => Number(m[1]));
+    const baseY = baselinesOf(baseline);
+    const expandedY = baselinesOf(expanded);
+    // The last grid baseline (row F) — body grows top-down so we look at the
+    // minimum y across cell text baselines (smallest = closest to page bottom).
+    const minBase = Math.min(...baseY);
+    const minExpanded = Math.min(...expandedY);
+    // Expanded variant must place its bottom text lower (smaller y) by at least
+    // ~30pt (allowing for slight padding adjustments).
+    expect(minBase - minExpanded).toBeGreaterThan(30);
+  });
+
+  it('uses pageSetup paperSize=1 (Letter) for MediaBox', () => {
+    const xlsx = buildXlsx({
+      rows: [['x']],
+      pageSetup: { paperSize: 1, orientation: 'portrait' },
+      pageMargins: { left: 0.7, right: 0.7, top: 0.75, bottom: 0.75 },
+    });
+    const pdf = convertXlsxToPdfSync(xlsx, { fonts: FONTS });
+    const text = asLatin1(pdf);
+    // Letter portrait = 612 × 792 pt.
+    expect(text).toMatch(/\/MediaBox \[0 0 612 792\]/);
+  });
+
+  it('uses landscape orientation by swapping width and height', () => {
+    const xlsx = buildXlsx({
+      rows: [['x']],
+      pageSetup: { paperSize: 9, orientation: 'landscape' },
+      pageMargins: { left: 0.5, right: 0.5, top: 0.5, bottom: 0.5 },
+    });
+    const pdf = convertXlsxToPdfSync(xlsx, { fonts: FONTS });
+    const text = asLatin1(pdf);
+    // A4 landscape: 16838twips × 11906twips = 841.9pt × 595.3pt (rounded).
+    expect(text).toMatch(/\/MediaBox \[0 0 841\.9 595\.3\]/);
+  });
+
+  it('applies date1904 epoch when workbookPr date1904="1" is set', () => {
+    // Excel 1900-mode serial 0 = 1900-01-01 (after the Lotus bug). The same
+    // calendar date in 1904 mode is serial -1462. Picking serial 0 in each
+    // mode demonstrates the offset directly:
+    //   1900 mode: 1899-12-30 (rendered as "12/30/1899" by m/d/yyyy)
+    //   1904 mode: 1904-01-01 (rendered as "1/1/1904")
+    const stylesXml = `
+      <fonts count="1"><font/></fonts>
+      <fills count="1"><fill><patternFill patternType="none"/></fill></fills>
+      <borders count="1"><border/></borders>
+      <cellXfs count="2">
+        <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+        <xf numFmtId="14" fontId="0" fillId="0" borderId="0" applyNumberFormat="1"/>
+      </cellXfs>`;
+    const xlsx = buildXlsx({
+      rows: [[{ value: 0, styleIndex: 1 }]],
+      stylesXml,
+      date1904: true,
+    });
+    const pdf = convertXlsxToPdfSync(xlsx, { fonts: FONTS });
+    const text = asLatin1(pdf);
+
+    const parsed = parseTtf(FONTS.regular);
+    expect(text).toMatch(showPattern(parsed, '1/1/1904'));
+  });
+
+  it('handles merged cells by emitting gridSpan on the origin', () => {
+    const xlsx = buildXlsx({
+      rows: [
+        ['Title', null, null],
+        ['A', 'B', 'C'],
+      ],
+      mergeRefs: ['A1:C1'],
+    });
+    const pdf = convertXlsxToPdfSync(xlsx, { fonts: FONTS });
+    // The merged cell should still be emitted (with text 'Title') and only
+    // once per row. If we naively wrote 3 cells in row 0, we'd see two extra
+    // empty cell rectangles. Easier check: just confirm the PDF builds and
+    // renders the title text exactly once.
+    const text = asLatin1(pdf);
+    const parsed = parseTtf(FONTS.regular);
+    const titleHex = [...'Title']
+      .map((c) =>
+        parsed.glyphForCodepoint(c.codePointAt(0)!).toString(16).padStart(4, '0').toUpperCase(),
+      )
+      .join('');
+    const matches = text.match(new RegExp(`<${titleHex}> Tj`, 'g')) ?? [];
+    expect(matches).toHaveLength(1);
+  });
+});
+
+// A hand-built minimal xlsx (fflate) lets us seed cells the dense buildXlsx
+// fixture can't — here a stray empty styled cell far out in the sheet.
+function rawXlsx(sheetDataXml: string): Uint8Array {
+  const rel = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+  const main = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+  return zipSync({
+    '[Content_Types].xml': strToU8(
+      `<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">` +
+        `<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>` +
+        `<Default Extension="xml" ContentType="application/xml"/>` +
+        `<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>` +
+        `<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>`,
+    ),
+    '_rels/.rels': strToU8(
+      `<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+        `<Relationship Id="rId1" Type="${rel}/officeDocument" Target="xl/workbook.xml"/></Relationships>`,
+    ),
+    'xl/workbook.xml': strToU8(
+      `<?xml version="1.0"?><workbook xmlns="${main}" xmlns:r="${rel}">` +
+        `<sheets><sheet name="S1" sheetId="1" r:id="rId1"/></sheets></workbook>`,
+    ),
+    'xl/_rels/workbook.xml.rels': strToU8(
+      `<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">` +
+        `<Relationship Id="rId1" Type="${rel}/worksheet" Target="worksheets/sheet1.xml"/></Relationships>`,
+    ),
+    'xl/worksheets/sheet1.xml': strToU8(
+      `<?xml version="1.0"?><worksheet xmlns="${main}"><sheetData>${sheetDataXml}</sheetData></worksheet>`,
+    ),
+  });
+}
+
+describe('xlsx robustness', () => {
+  it('bounds the grid to the used range (stray far cells do not explode it)', () => {
+    // Content in A1:B1 plus an EMPTY styled cell seeded at XFD1000 (column
+    // 16384, row 1000) — the whole-row-styling artifact that OOM'd CVLKRA-KYC.
+    // The grid must trim to the used range (1×2), not materialize 16384×1000.
+    const CONTENT = `<row r="1"><c r="A1"><v>11</v></c><c r="B1"><v>22</v></c></row>`;
+    const clean = convertXlsxToPdfSync(rawXlsx(CONTENT), { fonts: FONTS });
+    const stray = convertXlsxToPdfSync(
+      rawXlsx(CONTENT + `<row r="1000"><c r="XFD1000" s="0"/></row>`),
+      { fonts: FONTS },
+    );
+    const text = asLatin1(stray);
+    expect(text.startsWith('%PDF')).toBe(true);
+    // The stray empty far cell is trimmed to the used range → output is
+    // byte-for-byte identical to the no-stray render, not a 16384×1000 grid
+    // (which would also exhaust memory).
+    expect(stray.length).toBe(clean.length);
+    const parsed = parseTtf(FONTS.regular);
+    expect(text).toMatch(showPattern(parsed, '11')); // real content kept
+  });
+
+  it('caps over-long cell strings to the 32 767-char limit (DoS guard)', () => {
+    // A crafted ~1 MB string referenced by thousands of cells would be
+    // shaped/measured per cell and hang the renderer (poc-shared-strings.xlsx).
+    // Cap each cell string to Excel's hard limit on both code paths.
+    const big = 'A'.repeat(100_000);
+    const enc = (s: string): Uint8Array => new TextEncoder().encode(s);
+    const M = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+    const shared = parseSharedStrings(enc(`<sst xmlns="${M}"><si><t>${big}</t></si></sst>`)).texts;
+    expect(shared[0]!.length).toBe(32_767);
+    const ws = parseWorksheet(
+      enc(
+        `<worksheet xmlns="${M}"><sheetData><row r="1">` +
+          `<c r="A1" t="inlineStr"><is><t>${big}</t></is></c>` +
+          `</row></sheetData></worksheet>`,
+      ),
+    );
+    expect(ws.cells[0]!.inlineText!.length).toBe(32_767);
+  });
+});
+
+const M_NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+const R_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+const enc = (s: string): Uint8Array => new TextEncoder().encode(s);
+
+describe('xlsx print-model parsing', () => {
+  it('parses pageSetup scale/fit, fitToPage, printOptions and row/col breaks', () => {
+    const ws = parseWorksheet(
+      enc(
+        `<worksheet xmlns="${M_NS}">` +
+          `<sheetPr><pageSetUpPr fitToPage="1"/></sheetPr>` +
+          `<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>` +
+          `<printOptions gridLines="1" horizontalCentered="1"/>` +
+          `<pageSetup paperSize="9" orientation="landscape" scale="80" fitToWidth="1" fitToHeight="0"/>` +
+          `<rowBreaks count="1" manualBreakCount="1"><brk id="10" max="16383" man="1"/></rowBreaks>` +
+          `<colBreaks count="1"><brk id="3" man="1"/></colBreaks>` +
+          `</worksheet>`,
+      ),
+    );
+    expect(ws.fitToPage).toBe(true);
+    expect(ws.printOptions).toEqual({ gridLines: true, horizontalCentered: true });
+    expect(ws.pageSetup).toEqual({
+      paperSize: 9,
+      orientation: 'landscape',
+      scale: 80,
+      fitToWidth: 1,
+      fitToHeight: 0,
+    });
+    expect(ws.rowBreaks).toEqual([10]);
+    expect(ws.colBreaks).toEqual([3]);
+  });
+
+  it('fitToHeight shrinks a tall sheet onto fewer pages', () => {
+    const rows = Array.from({ length: 120 }, (_, i) => [`row ${i}`]);
+    const countPages = (b: Uint8Array): number =>
+      (asLatin1(b).match(/\/Type \/Page(?![s])/g) ?? []).length;
+    const tall = convertXlsxToPdfSync(buildXlsx({ rows }), { fonts: FONTS });
+    const fit = convertXlsxToPdfSync(
+      buildXlsx({ rows, fitToPage: true, pageSetup: { fitToWidth: 0, fitToHeight: 1 } }),
+      { fonts: FONTS },
+    );
+    // The unscaled sheet spans several pages; fitToHeight="1" shrinks it down.
+    expect(countPages(tall)).toBeGreaterThan(1);
+    expect(countPages(fit)).toBeLessThan(countPages(tall));
+  });
+
+  it('leaves the print model undefined when no print elements are present', () => {
+    const ws = parseWorksheet(
+      enc(
+        `<worksheet xmlns="${M_NS}"><sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData></worksheet>`,
+      ),
+    );
+    expect(ws.fitToPage).toBeUndefined();
+    expect(ws.printOptions).toBeUndefined();
+    expect(ws.rowBreaks).toBeUndefined();
+    expect(ws.colBreaks).toBeUndefined();
+  });
+
+  it('parses workbook definedNames with localSheetId', () => {
+    const wb = parseWorkbook(
+      enc(
+        `<workbook xmlns="${M_NS}" xmlns:r="${R_NS}">` +
+          `<sheets><sheet name="S1" sheetId="1" r:id="rId1"/></sheets>` +
+          `<definedNames>` +
+          `<definedName name="_xlnm.Print_Area" localSheetId="0">S1!$A$1:$B$2</definedName>` +
+          `<definedName name="MyGlobal">S1!$Z$9</definedName>` +
+          `</definedNames>` +
+          `</workbook>`,
+      ),
+    );
+    expect(wb.definedNames).toEqual([
+      { name: '_xlnm.Print_Area', localSheetId: 0, value: 'S1!$A$1:$B$2' },
+      { name: 'MyGlobal', value: 'S1!$Z$9' },
+    ]);
+  });
+});
+
+describe('parseAreaRef', () => {
+  it('resolves qualified, absolute, single-cell and multi-area refs', () => {
+    expect(parseAreaRef('Sheet1!$A$1:$D$20')).toEqual({
+      startColumn: 0,
+      startRow: 0,
+      endColumn: 3,
+      endRow: 19,
+    });
+    expect(parseAreaRef("'My Sheet'!$B$2")).toEqual({
+      startColumn: 1,
+      startRow: 1,
+      endColumn: 1,
+      endRow: 1,
+    });
+    // Bounding box across two disjoint areas.
+    expect(parseAreaRef('S!$A$1:$B$2,S!$D$1:$E$3')).toEqual({
+      startColumn: 0,
+      startRow: 0,
+      endColumn: 4,
+      endRow: 2,
+    });
+  });
+
+  it('returns undefined for empty / whole-row / whole-column refs', () => {
+    expect(parseAreaRef('')).toBeUndefined();
+    expect(parseAreaRef('S!$A:$A')).toBeUndefined();
+    expect(parseAreaRef('S!$1:$1')).toBeUndefined();
+  });
+});
+
+describe('implicit cell/row positions (§18.3.1.4 — r= optional)', () => {
+  it('assigns positions by document order when rows/cells omit r=', () => {
+    const M = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+    // No r= anywhere: 2 rows × 2 cells → A1,B1,A2,B2 by order.
+    const ws = parseWorksheet(
+      enc(
+        `<worksheet xmlns="${M}"><sheetData>` +
+          `<row><c t="inlineStr"><is><t>A1</t></is></c><c t="inlineStr"><is><t>B1</t></is></c></row>` +
+          `<row><c t="inlineStr"><is><t>A2</t></is></c><c t="inlineStr"><is><t>B2</t></is></c></row>` +
+          `</sheetData></worksheet>`,
+      ),
+    );
+    expect(ws.cells).toHaveLength(4);
+    const at = (r: number, c: number) =>
+      ws.cells.find((x) => x.row === r && x.column === c)?.inlineText;
+    expect(at(0, 0)).toBe('A1');
+    expect(at(0, 1)).toBe('B1');
+    expect(at(1, 0)).toBe('A2');
+    expect(at(1, 1)).toBe('B2');
+    expect(ws.maxRow).toBe(1);
+    expect(ws.maxColumn).toBe(1);
+  });
+
+  it('treats an UNPARSEABLE r= as absent rather than dropping the cell', () => {
+    const M = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+    // tdf122336.xlsx ships r="11_2"-style garbage refs from a third-party
+    // producer. A ref that cannot be read carries no position, which is the
+    // case §18.3.1.4 already covers: fall back to document order. Dropping the
+    // cell instead turned a 9-page sheet into a blank page.
+    const ws = parseWorksheet(
+      enc(
+        `<worksheet xmlns="${M}"><sheetData>` +
+          `<row r="1"><c r="11_2" t="str"><v>first</v></c><c r="13_2" t="str"><v>second</v></c></row>` +
+          `</sheetData></worksheet>`,
+      ),
+    );
+    expect(ws.cells).toHaveLength(2);
+    expect(ws.cells.map((c) => [c.row, c.column])).toEqual([
+      [0, 0],
+      [0, 1],
+    ]);
+    expect(ws.cells.map((c) => c.rawValue)).toEqual(['first', 'second']);
+  });
+
+  it('falls back to <v> when t="inlineStr" is written without <is>', () => {
+    const M = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+    // duplicate-filename.xlsx declares the inline-string type and then writes
+    // the text into <v>. A real <is> still wins where both are present.
+    const ws = parseWorksheet(
+      enc(
+        `<worksheet xmlns="${M}"><sheetData><row r="1">` +
+          `<c r="A1" t="inlineStr"><v>v2</v></c>` +
+          `<c r="B1" t="inlineStr"><is><t>proper</t></is><v>ignored</v></c>` +
+          `</row></sheetData></worksheet>`,
+      ),
+    );
+    expect(ws.cells.map((c) => c.inlineText)).toEqual(['v2', 'proper']);
+  });
+
+  it('places a numeric "<column>_<row>" ref by document order, not by its number', () => {
+    const M = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+    // tdf122336.xlsx's producer writes the address as two 1-based numbers
+    // rather than A1 notation. It looks like <column>_<row>, and the row half
+    // even agrees with the row the cell sits in — but the columns it yields are
+    // wrong. That sheet's header row is 11 labels in columns 1..11 and its data
+    // row is 11 values; read as columns the values scatter over 1, 4, 5, 7, 11,
+    // 13, 22, 29..32, filing the start time under "Klantnaam". LibreOffice
+    // places them consecutively, and consecutively is where each value lands
+    // under its own heading. The first number is a producer field id.
+    const ws = parseWorksheet(
+      enc(
+        `<worksheet xmlns="${M}"><sheetData>` +
+          `<row r="2"><c r="1_2"><v>a</v></c><c r="4_2"><v>b</v></c><c r="22_2"><v>c</v></c></row>` +
+          `</sheetData></worksheet>`,
+      ),
+    );
+    expect(ws.cells.map((c) => [c.row, c.column])).toEqual([
+      [1, 0],
+      [1, 1],
+      [1, 2],
+    ]);
+  });
+
+  it('honours explicit r= and resumes implicit numbering after it', () => {
+    const M = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main';
+    // Row pinned to r="3"; cell pinned to C → next cell resumes at D.
+    const ws = parseWorksheet(
+      enc(
+        `<worksheet xmlns="${M}"><sheetData>` +
+          `<row r="3"><c r="C3"><v>1</v></c><c><v>2</v></c></row>` +
+          `</sheetData></worksheet>`,
+      ),
+    );
+    const c1 = ws.cells.find((x) => x.rawValue === '1')!;
+    const c2 = ws.cells.find((x) => x.rawValue === '2')!;
+    expect([c1.row, c1.column]).toEqual([2, 2]); // C3 → row 2, col 2
+    expect([c2.row, c2.column]).toEqual([2, 3]); // resumes at D3
+  });
+});
+
+describe('projection losses (never silently wrong)', () => {
+  // The defence-in-depth caps in the print model are correct — a pathological
+  // sheet must not exhaust memory — but a cap that fires without saying so is
+  // exactly the silent wrongness the loss report exists to prevent. Reading a
+  // capped sheet must come back with a Loss naming what was clipped.
+
+  it('does not clip a merely wide sheet', () => {
+    // There used to be a 1024-column cap here, and this test asserted the loss
+    // it reported. The cap was ours, not the format's, and it truncated
+    // documents that are simply wide — see the geometry suite. The only column
+    // limit left is SpreadsheetML's own, which a valid document cannot exceed.
+    const wide = buildXlsx([Array.from({ length: 1200 }, (_, i) => `c${i}`)]);
+    const { doc, losses } = readXlsx(wide);
+    expect(doc.body.length).toBeGreaterThan(0);
+    expect(losses.filter((l) => /column/i.test(l.detail))).toEqual([]);
+  });
+
+  it('reports a loss when the grid is clipped to the row cap', () => {
+    const tall = buildXlsx(Array.from({ length: 50_010 }, (_, i) => [`r${i}`]));
+    const { losses } = readXlsx(tall);
+    const clip = losses.find((l) => /row/i.test(l.detail));
+    expect(clip).toBeDefined();
+    expect(clip!.severity).toBe('dropped');
+  });
+
+  it('reports a loss when the per-sheet text budget is exhausted', () => {
+    // 40 cells × 30 000 chars = 1.2M, past the 1M per-sheet budget. Cells past
+    // the budget render empty — the caller has to be told.
+    const big = 'x'.repeat(30_000);
+    const heavy = buildXlsx(Array.from({ length: 40 }, () => [big]));
+    const { losses } = readXlsx(heavy);
+    const budget = losses.find((l) => /text budget/i.test(l.detail));
+    expect(budget).toBeDefined();
+    expect(budget!.severity).toBe('dropped');
+  });
+
+  it('bounds the grid by TOTAL cells, not per-dimension (tiny file, astronomic extent)', () => {
+    // LibreOffice's too-many-cols-rows.xlsx: a 2.5 KB sheet holding five real
+    // cells but spanning A1:XFE16777217. Capping rows and columns separately
+    // still admits their product — 50 000 × 1024 = 51.2M cells — so the sheet
+    // exhausted the heap. Amplification needs no zip bomb: a declared extent
+    // is enough.
+    const sheetData =
+      `<row r="1"><c r="A1"><v>1</v></c><c r="XFB1"><v>2</v></c><c r="XFE1"><v>3</v></c></row>` +
+      `<row r="16777214"><c r="A16777214"><v>11</v></c></row>` +
+      `<row r="16777217"><c r="A16777217"><v>21</v></c></row>`;
+    const { doc, losses } = readXlsx(rawXlsx(sheetData));
+
+    let cells = 0;
+    for (const element of doc.body) {
+      if (element.kind === 'table') {
+        for (const row of element.table.rows) cells += row.cells.length;
+      }
+    }
+    expect(cells).toBeGreaterThan(0);
+    expect(cells).toBeLessThanOrEqual(2_000_000);
+    // …and it must say the sheet was clipped rather than pass off a corner of
+    // it as the whole thing.
+    expect(losses.some((l) => l.severity === 'dropped')).toBe(true);
+  });
+
+  it('stays silent for an ordinary sheet', () => {
+    const plain = buildXlsx([
+      ['Region', 'Revenue'],
+      ['Moscow', 1200000],
+    ]);
+    expect(readXlsx(plain).losses).toEqual([]);
+  });
+});
+
+describe('parseTitleRowRange', () => {
+  it('extracts the repeated row range, ignoring column-title parts', () => {
+    expect(parseTitleRowRange('Sheet1!$1:$2')).toEqual({ startRow: 0, endRow: 1 });
+    expect(parseTitleRowRange('Sheet1!$1:$1')).toEqual({ startRow: 0, endRow: 0 });
+    expect(parseTitleRowRange("'My Sheet'!$A:$B,'My Sheet'!$1:$3")).toEqual({
+      startRow: 0,
+      endRow: 2,
+    });
+    expect(parseTitleRowRange('Sheet1!$A:$B')).toBeUndefined(); // columns only
+    expect(parseTitleRowRange('')).toBeUndefined();
+  });
+});
+
+describe('xlsx print-model rendering', () => {
+  const parsed = parseTtf(FONTS.regular);
+
+  it('suppresses cell gridlines by default; draws them with printOptions gridLines="1"', () => {
+    const rows = [
+      ['A', 'B'],
+      ['C', 'D'],
+    ];
+    const plain = asLatin1(convertXlsxToPdfSync(buildXlsx({ rows }), { fonts: FONTS }));
+    const gridded = asLatin1(
+      convertXlsxToPdfSync(buildXlsx({ rows, printOptions: { gridLines: true } }), {
+        fonts: FONTS,
+      }),
+    );
+    // The synthetic grid strokes a light-grey hairline (C0C0C0 → 0.7529…).
+    // Text fills use lowercase "rg", so the absence of the stroke colour proves
+    // no grid was drawn. It is grey and not black on purpose: a gridline that
+    // paints as heavily as a declared cell border swamps the borders the sheet
+    // actually asked for.
+    const grey = '0.753';
+    expect(plain).not.toContain(`${grey} ${grey} ${grey} RG`);
+    expect(gridded).toContain(`${grey} ${grey} ${grey} RG`);
+    expect(gridded).not.toContain('0 0 0 RG');
+    // Cell text is identical either way.
+    expect(plain).toMatch(showPattern(parsed, 'A'));
+    expect(gridded).toMatch(showPattern(parsed, 'A'));
+  });
+
+  it('decodes the _xHHHH_ escape SpreadsheetML writes for a control character', () => {
+    // §22.9.2.19 ST_Xstring. XML cannot carry a carriage return inside <t> —
+    // any parser would normalise it away — so Excel writes `_x000D_` and every
+    // reader decodes it. Drawn as it stands the escape is gibberish mid
+    // sentence: escape-unicode.xlsx renders "Line 1_x000D_Line 2".
+    expect(decodeXstring('Line 1_x000D_Line 2')).toBe('Line 1\rLine 2');
+    // `_` itself is escaped when it would start a sequence, and decoding is a
+    // single pass: the literal text `_x005F_x000D_` is `_x000D_`, not a return.
+    expect(decodeXstring('_x005F_x000D_')).toBe('_x000D_');
+    // Text with no escape comes back untouched, and a lone surrogate is not a
+    // character — the escape stays as written rather than becoming half of one.
+    expect(decodeXstring('plain text')).toBe('plain text');
+    expect(decodeXstring('_xD800_')).toBe('_xD800_');
+  });
+
+  it('clips rendering to _xlnm.Print_Area (A1-anchored)', () => {
+    const xlsx = buildXlsx({
+      rows: [
+        ['In1', 'In2', 'Out1'],
+        ['In3', 'In4', 'Out2'],
+        ['Out3', 'Out4', 'Out5'],
+      ],
+      definedNames: [{ name: '_xlnm.Print_Area', localSheetId: 0, value: 'Sheet1!$A$1:$B$2' }],
+    });
+    const text = asLatin1(convertXlsxToPdfSync(xlsx, { fonts: FONTS }));
+    const has = (s: string): boolean => showPattern(parsed, s).test(text);
+    expect(has('In1')).toBe(true);
+    expect(has('In4')).toBe(true);
+    expect(has('Out1')).toBe(false);
+    expect(has('Out3')).toBe(false);
+    expect(has('Out5')).toBe(false);
+  });
+
+  it('renders a print area that does not start at A1 (offset window)', () => {
+    const xlsx = buildXlsx({
+      rows: [
+        ['o', 'o', 'o', 'o'],
+        ['o', 'B2', 'C2', 'o'],
+        ['o', 'B3', 'C3', 'o'],
+        ['o', 'o', 'o', 'o'],
+      ],
+      definedNames: [{ name: '_xlnm.Print_Area', localSheetId: 0, value: 'Sheet1!$B$2:$C$3' }],
+    });
+    const text = asLatin1(convertXlsxToPdfSync(xlsx, { fonts: FONTS }));
+    const count = (s: string): number => countShown(parsed, text, s);
+    expect(count('B2')).toBe(1);
+    expect(count('C2')).toBe(1);
+    expect(count('B3')).toBe(1);
+    expect(count('C3')).toBe(1);
+    // Every 'o' filler lies outside B2:C3 → none rendered.
+    expect(count('o')).toBe(0);
+  });
+
+  it('ignores a print area scoped to a different sheet', () => {
+    // Print_Area is localSheetId=1 (a second sheet that does not exist here),
+    // so sheet 0 renders in full.
+    const xlsx = buildXlsx({
+      rows: [
+        ['P', 'Q'],
+        ['R', 'S'],
+      ],
+      definedNames: [{ name: '_xlnm.Print_Area', localSheetId: 1, value: 'Other!$A$1:$A$1' }],
+    });
+    const text = asLatin1(convertXlsxToPdfSync(xlsx, { fonts: FONTS }));
+    for (const v of ['P', 'Q', 'R', 'S']) {
+      expect(showPattern(parsed, v).test(text)).toBe(true);
+    }
+  });
+
+  // Font sizes emitted as "/Fn <sizePt> Tf" in the content stream.
+  const tfSizes = (pdf: Uint8Array): Array<number> =>
+    Array.from(asLatin1(pdf).matchAll(/\/[A-Za-z0-9]+ ([\d.]+) Tf/g)).map((m) => Number(m[1]));
+
+  it('shrinks cell fonts for an explicit <pageSetup scale="50">', () => {
+    const rows = [
+      ['Hello', 'World'],
+      ['Foo', 'Bar'],
+    ];
+    const plain = tfSizes(convertXlsxToPdfSync(buildXlsx({ rows }), { fonts: FONTS }));
+    const scaled = tfSizes(
+      convertXlsxToPdfSync(buildXlsx({ rows, pageSetup: { scale: 50 } }), { fonts: FONTS }),
+    );
+    // Default body text is 11pt → 5.5pt at 50%. The sheet-title (14pt) is not
+    // scaled, so 5.5 appears only in the scaled variant.
+    expect(scaled).toContain(5.5);
+    expect(plain).not.toContain(5.5);
+  });
+
+  it('shrinks fonts under fitToPage when the columns overflow the page width', () => {
+    // 6 columns × 40 chars ≈ 25 200 twips ≫ ~9 026 twip content width → fit to
+    // one page wide forces a strong uniform shrink.
+    const columns = Array.from({ length: 6 }, (_, i) => ({
+      min: i + 1,
+      max: i + 1,
+      widthChars: 40,
+    }));
+    const rows = [['a', 'b', 'c', 'd', 'e', 'f']];
+    const plain = tfSizes(convertXlsxToPdfSync(buildXlsx({ rows, columns }), { fonts: FONTS }));
+    const fitted = tfSizes(
+      convertXlsxToPdfSync(
+        buildXlsx({ rows, columns, fitToPage: true, pageSetup: { fitToWidth: 1, fitToHeight: 1 } }),
+        { fonts: FONTS },
+      ),
+    );
+    // The smallest font (the body cells) must shrink below the unscaled body.
+    expect(Math.min(...fitted)).toBeLessThan(Math.min(...plain));
+  });
+
+  it('treats scale=100 as a true no-op (byte-identical output)', () => {
+    const rows = [['X', 'Y']];
+    const a = convertXlsxToPdfSync(buildXlsx({ rows }), { fonts: FONTS });
+    const b = convertXlsxToPdfSync(buildXlsx({ rows, pageSetup: { scale: 100 } }), {
+      fonts: FONTS,
+    });
+    expect(asLatin1(b)).toBe(asLatin1(a));
+  });
+
+  // A tall sheet that overflows one page, with a distinctive header row.
+  const tallRows = (): Array<Array<string | number>> => {
+    const rows: Array<Array<string | number>> = [['HDR', 'COL2']];
+    for (let i = 0; i < 90; i++) rows.push([`r${i}`, i]);
+    return rows;
+  };
+  const hdrCount = (pdf: Uint8Array): number => countShown(parsed, asLatin1(pdf), 'HDR');
+
+  it('repeats _xlnm.Print_Titles header rows on every continuation page', () => {
+    const pdf = convertXlsxToPdfSync(
+      buildXlsx({
+        rows: tallRows(),
+        definedNames: [{ name: '_xlnm.Print_Titles', localSheetId: 0, value: 'Sheet1!$1:$1' }],
+      }),
+      { fonts: FONTS },
+    );
+    // The sheet spills onto ≥2 pages, so the header row's text repeats.
+    const pages = (asLatin1(pdf).match(/\/Type \/Page\b/g) ?? []).filter(
+      (m) => !m.includes('Pages'),
+    ).length;
+    expect(pages).toBeGreaterThanOrEqual(2);
+    expect(hdrCount(pdf)).toBeGreaterThanOrEqual(2);
+  });
+
+  it('does not repeat the first row without Print_Titles', () => {
+    const pdf = convertXlsxToPdfSync(buildXlsx({ rows: tallRows() }), { fonts: FONTS });
+    expect(hdrCount(pdf)).toBe(1);
+  });
+
+  const pageCount = (pdf: Uint8Array): number =>
+    (asLatin1(pdf).match(/\/Type \/Page\b/g) ?? []).filter((m) => !m.includes('Pages')).length;
+
+  it('forces a page break at a manual <rowBreaks> entry', () => {
+    // A 5-row sheet fits one page; a manual break before row index 2 splits it.
+    const rows = [['r0'], ['r1'], ['r2'], ['r3'], ['r4']];
+    const baseline = convertXlsxToPdfSync(buildXlsx({ rows }), { fonts: FONTS });
+    const broken = convertXlsxToPdfSync(buildXlsx({ rows, rowBreaks: [2] }), { fonts: FONTS });
+    expect(pageCount(baseline)).toBe(1);
+    expect(pageCount(broken)).toBe(2);
+    // Content is preserved across the break.
+    expect(asLatin1(broken)).toMatch(showPattern(parsed, 'r2'));
+  });
+
+  it('centers the table with <printOptions horizontalCentered="1">', () => {
+    // One styled (filled) cell so we can read the table's left edge from the
+    // fill rectangle's x — unaffected by the always-centered sheet title.
+    const stylesXml = `
+      <fonts count="1"><font/></fonts>
+      <fills count="3">
+        <fill><patternFill patternType="none"/></fill>
+        <fill><patternFill patternType="gray125"/></fill>
+        <fill><patternFill patternType="solid"><fgColor rgb="FF00FF00"/></patternFill></fill>
+      </fills>
+      <borders count="1"><border/></borders>
+      <cellXfs count="2">
+        <xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>
+        <xf numFmtId="0" fontId="0" fillId="2" borderId="0" applyFill="1"/>
+      </cellXfs>`;
+    const rows = [
+      [
+        { value: 'A', styleIndex: 1 },
+        { value: 'B', styleIndex: 1 },
+      ],
+    ];
+    const minRectX = (pdf: Uint8Array): number => {
+      const xs = Array.from(asLatin1(pdf).matchAll(/([\d.]+) [\d.]+ [\d.]+ [\d.]+ re/g)).map((m) =>
+        Number(m[1]),
+      );
+      return Math.min(...xs);
+    };
+    const left = convertXlsxToPdfSync(buildXlsx({ rows, stylesXml }), { fonts: FONTS });
+    const centered = convertXlsxToPdfSync(
+      buildXlsx({ rows, stylesXml, printOptions: { horizontalCentered: true } }),
+      { fonts: FONTS },
+    );
+    // The narrow table shifts well right of the left margin when centered.
+    expect(minRectX(centered)).toBeGreaterThan(minRectX(left) + 1);
+  });
+
+  it('clips cell text blocked by an occupied neighbour, overflows into empty ones', () => {
+    // Column A is 5 chars wide. Row 1: A1 long, B1 occupied → A1 is cut at the
+    // column's edge. Row 2: A2 long, B2 empty → A2 overflows. Repeated narrow
+    // chars (no kerning/ligatures) render each run as a single Tj.
+    const blocked = 'l'.repeat(18);
+    const overflow = 'i'.repeat(18);
+    const xlsx = buildXlsx({
+      rows: [[blocked, 'X'], [overflow]],
+      columns: [{ min: 1, max: 1, widthChars: 5 }],
+    });
+    const text = asLatin1(convertXlsxToPdfSync(xlsx, { fonts: FONTS }));
+    // A2 overflows into the empty B2 → full text kept.
+    expect(text).toMatch(showPattern(parsed, overflow));
+    // A1 keeps its whole text as well: the page's text is the cell's, as
+    // Excel's own PDF has it, and what the column cannot show is cut by a CLIP
+    // the column's width — not by dropping the letters, which lost the rest of
+    // the value from every text the page gave up ("Монтаж кровл").
+    expect(text).toMatch(showPattern(parsed, blocked));
+    const clip = /([\d.]+) ([\d.]+) ([\d.]+) ([\d.]+) re W n\s+BT[^]*?Tj/u.exec(text);
+    expect(clip?.[0]).toMatch(showPattern(parsed, blocked));
+    // Five characters of Calibri's digit, as the column is wide.
+    expect(Number(clip?.[3])).toBeGreaterThan(20);
+    expect(Number(clip?.[3])).toBeLessThan(45);
+  });
+});

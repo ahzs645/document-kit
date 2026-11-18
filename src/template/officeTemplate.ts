@@ -1,0 +1,438 @@
+/**
+ * Fill a document template's `{{placeholder}}` tags with data and get back new document(s): officeParser
+ * 8.9.0's `src/OfficeTemplate.ts` (MIT, Harsh Ankur), moved into document-kit to run in a browser.
+ *
+ * This is deliberately separate from parsing and generation: it does not build an AST or convert
+ * anything, it copies the template and substitutes only the placeholders, so every bit of the
+ * original formatting, layout and structure is preserved. Give it one data object to get one
+ * document back, or a list to get one document per entry (a batch mail-merge).
+ *
+ * Changes from officeParser (see docs/template-upstream.md): input is bytes (`Uint8Array`,
+ * `ArrayBuffer` or a `Blob`), never a file path; password-protected templates are refused with
+ * `TEMPLATE_ENCRYPTED` instead of decrypted (officeParser decrypts with Node's `crypto`); the class
+ * `OfficeTemplate` is replaced by the functions in `index.ts`.
+ *
+ * @module template/officeTemplate
+ */
+
+import { isCfb, isEncryptedOoxml } from './cfb.js';
+import { decompressionLimitsOf, DEFAULT_DECOMPRESSION_LIMITS, DEFAULT_TEMPLATE_CONFIG, PROTOTYPE_POLLUTION_KEYS } from './defaults.js';
+import { buildOfficeError, getOfficeError, logWarning } from './errors.js';
+import { ODT_DIALECT, odtEntries, renderOdtTemplate } from './odtTemplate.js';
+import { CompiledTemplate, compileTemplate, DOCX_DIALECT, openPackage, renderDocxTemplate, renderParts, TAG_SKIPPED, TemplateOptions, TemplatePlace, templateTags as listTags, unlistedNearTags } from './templateEngine.js';
+import { MAX_NUMBER_TEXT_WAYS, NumberTextSeparators, PictureSettings } from './templateFormat.js';
+import { utf8Text } from './utf8.js';
+import { BlobLike, IssueHandler, OfficeErrorType, OfficeWarningType, TemplateConfig, TemplateData, TemplateDataDetails, TemplateFormatter, TemplateNumbersAsTextDetails, TemplateProblem, TemplateSyntaxDetails, TemplateTagInfo } from './types.js';
+
+/** A template: a `.docx`, `.odt` or `.ott` file's bytes, or a `Blob`/`File` holding them. Never a path. */
+export type TemplateInput = Uint8Array | ArrayBuffer | BlobLike;
+
+/** The template's bytes (a Uint8Array as given, without copying, as officeParser's Buffer view did). */
+async function readInput(input: TemplateInput, errCfg: IssueHandler): Promise<Uint8Array> {
+    if (input instanceof ArrayBuffer) return new Uint8Array(input);
+    if (input instanceof Uint8Array) return input;
+    if (input && typeof (input as BlobLike).arrayBuffer === 'function') return new Uint8Array(await (input as BlobLike).arrayBuffer());
+    throw getOfficeError(OfficeErrorType.INVALID_INPUT, errCfg);
+}
+
+/** True when an OpenDocument package's manifest marks an entry encrypted (officeParser's `isEncryptedOdf` test). */
+function isEncryptedOdf(entries: Record<string, Uint8Array>): boolean {
+    const manifest = entries['META-INF/manifest.xml'];
+    return !!manifest && !entries['word/document.xml'] && utf8Text(manifest).includes('encryption-data');
+}
+
+/** The names a filter of the caller's own may have: a word, not one of the built-in filters. */
+const FORMATTER_NAME = /^[\p{L}_][\p{L}\p{N}_]*$/u;
+const BUILT_IN_FILTER_NAMES = new Set(['format', 'upper', 'lower']);
+
+/** Every option render takes (the compiler holds this to TemplateConfig's own keys). */
+const TEMPLATE_OPTIONS: Record<keyof TemplateConfig, true> = {
+    data: true, delimiters: true, onMissing: true, numberSeparators: true, dataNumberSeparators: true, numericTextComparison: true, dateNames: true, utcOffsetMinutes: true, formatters: true,
+    fileType: true, decompressionLimits: true, onWarning: true,
+};
+
+/**
+ * The options of a render's config that it does not take, as dotted paths: at the top, and inside
+ * `delimiters` and `decompressionLimits` (`numberSeparators`, `dataNumberSeparators` and `dateNames` are checked with their
+ * values). A misspelt one left its default in place without a word; each is now reported.
+ */
+function unknownTemplateOptions(config: TemplateConfig): string[] {
+    const unknown: string[] = [];
+    const check = (container: unknown, path: string, known: object): void => {
+        if (!container || typeof container !== 'object' || Array.isArray(container)) return;
+        for (const key of Object.keys(container)) {
+            if (!PROTOTYPE_POLLUTION_KEYS.has(key) && !Object.prototype.hasOwnProperty.call(known, key)) unknown.push(path ? `${path}.${key}` : key);
+        }
+    };
+    check(config, '', TEMPLATE_OPTIONS);
+    check(config.delimiters, 'delimiters', DEFAULT_TEMPLATE_CONFIG.delimiters);
+    check(config.decompressionLimits, 'decompressionLimits', DEFAULT_DECOMPRESSION_LIMITS);
+    return unknown;
+}
+
+/**
+ * What a picture writes, from the config and the defaults; a setting of the wrong shape is refused, typed.
+ * A name `numberSeparators` or `dateNames` does not have is added to `unknown`, to be reported.
+ */
+function pictureSettings(config: TemplateConfig, errCfg: IssueHandler, unknown: string[]): PictureSettings {
+    const refuse = (detail: string): never => { throw getOfficeError(OfficeErrorType.IMPROPER_ARGUMENTS, errCfg, detail); };
+    const own = <T extends object>(option: 'numberSeparators' | 'dateNames', defaults: T, shape: string): Partial<T> => {
+        const given: unknown = config[option];
+        if (given === undefined || given === null) return {};
+        if (typeof given !== 'object' || Array.isArray(given)) refuse(`${option} is an object: ${shape}`);
+        const taken: Record<string, unknown> = {};
+        for (const key of Object.keys(given as object)) {
+            if (Object.prototype.hasOwnProperty.call(defaults, key)) taken[key] = (given as Record<string, unknown>)[key];
+            else unknown.push(`${option}.${key}`);
+        }
+        return taken as Partial<T>;
+    };
+    const separators = { ...DEFAULT_TEMPLATE_CONFIG.numberSeparators, ...own('numberSeparators', DEFAULT_TEMPLATE_CONFIG.numberSeparators, 'decimal and group') };
+    const names = { ...DEFAULT_TEMPLATE_CONFIG.dateNames, ...own('dateNames', DEFAULT_TEMPLATE_CONFIG.dateNames, 'months, monthsShort, days, daysShort, am and pm') };
+    const offset = config.utcOffsetMinutes ?? DEFAULT_TEMPLATE_CONFIG.utcOffsetMinutes;
+    const strings = (list: unknown, length: number): boolean => Array.isArray(list) && list.length === length && list.every(x => typeof x === 'string');
+    if (typeof separators.decimal !== 'string' || typeof separators.group !== 'string') refuse('numberSeparators.decimal and .group are text');
+    if (!strings(names.months, 12) || !strings(names.monthsShort, 12)) refuse('dateNames.months and .monthsShort are twelve names each');
+    if (!strings(names.days, 7) || !strings(names.daysShort, 7)) refuse('dateNames.days and .daysShort are seven names each, Sunday first');
+    if (typeof names.am !== 'string' || typeof names.pm !== 'string') refuse('dateNames.am and .pm are text');
+    if (!Number.isInteger(offset) || Math.abs(offset) > MAX_UTC_OFFSET_MINUTES) refuse(`utcOffsetMinutes is a whole number of minutes, at most ${MAX_UTC_OFFSET_MINUTES} either way`);
+    return {
+        decimal: separators.decimal, group: separators.group, months: names.months, monthsShort: names.monthsShort,
+        days: names.days, daysShort: names.daysShort, am: names.am, pm: names.pm, utcOffsetMinutes: offset,
+    };
+}
+
+/**
+ * `onMissing` as given when it is one the renderer knows; another value is reported (INVALID_CONFIG_VALUE)
+ * and the default used. One such as `'skip'` emptied fields but kept the blocks they decide as typed.
+ */
+function onMissingOf(config: TemplateConfig, errCfg: IssueHandler): TemplateOptions['onMissing'] {
+    const value: unknown = config.onMissing;
+    if (value === 'keep' || value === 'empty' || value === 'error') return value;
+    if (value !== undefined && value !== null && value !== '') {
+        logWarning(OfficeWarningType.INVALID_CONFIG_VALUE, errCfg, { option: 'onMissing', value, expected: "'keep', 'empty' or 'error'", fallback: DEFAULT_TEMPLATE_CONFIG.onMissing });
+    }
+    return DEFAULT_TEMPLATE_CONFIG.onMissing;
+}
+
+/**
+ * `numericTextComparison` as given when it is `'text'` or `'number'`; null when not given (the default:
+ * as text, an order comparison warned). Another value is reported (INVALID_CONFIG_VALUE) and the default used.
+ */
+function numericTextsOf(config: TemplateConfig, errCfg: IssueHandler): TemplateOptions['numericTexts'] {
+    const value: unknown = config.numericTextComparison;
+    if (value === 'text' || value === 'number') return value;
+    if (value !== undefined && value !== null) logWarning(OfficeWarningType.INVALID_CONFIG_VALUE, errCfg, { option: 'numericTextComparison', value, expected: "'text' or 'number'", fallback: '' });
+    return null;
+}
+
+/**
+ * The tag delimiters, each as given or its default when left out or empty. Delimiters that are not an
+ * object, or one that is not text, are refused, typed: a number crashed the render untyped, and text
+ * or a list in place of the object was passed over without a word.
+ */
+function delimitersOf(config: TemplateConfig, errCfg: IssueHandler): { start: string; end: string } {
+    const given: unknown = config.delimiters;
+    const defaults = DEFAULT_TEMPLATE_CONFIG.delimiters;
+    if (given === undefined || given === null) return { ...defaults };
+    const refuse = (): never => { throw getOfficeError(OfficeErrorType.IMPROPER_ARGUMENTS, errCfg, 'delimiters is an object: start and end, each text'); };
+    if (typeof given !== 'object' || Array.isArray(given)) refuse();
+    const { start, end } = given as { start?: unknown; end?: unknown };
+    if ((start !== undefined && start !== null && typeof start !== 'string') || (end !== undefined && end !== null && typeof end !== 'string')) refuse();
+    return { start: (start as string | undefined) || defaults.start, end: (end as string | undefined) || defaults.end };
+}
+
+/** Characters a number's text uses for itself, which cannot separate its parts. */
+const NUMBER_CHARACTERS = '0123456789+-eE';
+
+/**
+ * How text in the data is read as a number (`dataNumberSeparators`): the ways to try, in turn (one for an
+ * object, as many as a list of one to 8 gives); null when not given, which reads it as before the option
+ * was (`.` for the point, no group separator). Each separator is one character, the point not white
+ * space, neither a digit, a sign or an exponent's `e`, and the two not the same; another value is
+ * refused, typed, a list's entry named by its place (`dataNumberSeparators[1].decimal`). A name an entry
+ * does not have is added to `unknown`, to be reported.
+ */
+function numberTextOf(config: TemplateConfig, errCfg: IssueHandler, unknown: string[]): NumberTextSeparators[] | null {
+    const given: unknown = config.dataNumberSeparators;
+    if (given === undefined || given === null) return null;
+    const refuse = (detail: string): never => { throw getOfficeError(OfficeErrorType.IMPROPER_ARGUMENTS, errCfg, detail); };
+    const shape = `dataNumberSeparators is an object: decimal and group, or a list of one to ${MAX_NUMBER_TEXT_WAYS} of them`;
+    const way = (entry: unknown, name: string): NumberTextSeparators => {
+        if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) refuse(`${name} is an object: decimal and group`);
+        const { decimal = '.', group = '' } = entry as { decimal?: unknown; group?: unknown };
+        for (const key of Object.keys(entry as object)) if (key !== 'decimal' && key !== 'group') unknown.push(`${name}.${key}`);
+        if (typeof decimal !== 'string' || decimal.length !== 1 || /\s/.test(decimal) || NUMBER_CHARACTERS.includes(decimal)) refuse(`${name}.decimal is one character, not white space, a digit, a sign or e`);
+        if (typeof group !== 'string' || group.length > 1 || (group !== '' && NUMBER_CHARACTERS.includes(group)) || group === decimal) refuse(`${name}.group is one character (or empty for none), not a digit, a sign or e, nor the decimal point`);
+        return { decimal: decimal as string, group: group as string };
+    };
+    if (Array.isArray(given)) {
+        if (given.length < 1 || given.length > MAX_NUMBER_TEXT_WAYS) refuse(shape);
+        // By index, not map: map passes over a hole ([, { decimal: ',' }]), which would reach the reader as no way.
+        const listed: NumberTextSeparators[] = [];
+        for (let place = 0; place < given.length; place++) listed.push(way(given[place], `dataNumberSeparators[${place}]`));
+        return listed;
+    }
+    if (typeof given !== 'object') refuse(shape);
+    return [way(given, 'dataNumberSeparators')];
+}
+
+/** The most a UTC offset can be: a day, either way. */
+const MAX_UTC_OFFSET_MINUTES = 24 * 60;
+
+/** The caller's own filters: functions, named as words, none named as a built-in filter. */
+function templateFormatters(config: TemplateConfig, errCfg: IssueHandler): Record<string, TemplateFormatter> {
+    const formatters = config.formatters ?? {};
+    if (typeof formatters !== 'object' || formatters === null || Array.isArray(formatters)) throw getOfficeError(OfficeErrorType.IMPROPER_ARGUMENTS, errCfg, 'formatters is an object of functions by name');
+    const own: Record<string, TemplateFormatter> = Object.create(null);
+    for (const [name, run] of Object.entries(formatters)) {
+        if (typeof run !== 'function') throw getOfficeError(OfficeErrorType.IMPROPER_ARGUMENTS, errCfg, `formatters.${name} is not a function`);
+        if (!FORMATTER_NAME.test(name) || BUILT_IN_FILTER_NAMES.has(name)) throw getOfficeError(OfficeErrorType.IMPROPER_ARGUMENTS, errCfg, `formatters.${name} is not a word, or is the name of a built-in filter (format, upper, lower)`);
+        own[name] = run;
+    }
+    return own;
+}
+
+/** A single data entry must be a plain object (not null/array/primitive). */
+function isDataObject(d: unknown): d is TemplateData {
+    return typeof d === 'object' && d !== null && !Array.isArray(d);
+}
+
+/**
+ * Template renderer. See {@link module:OfficeTemplate} for an overview and {@link TemplateConfig} for
+ * the options.
+ */
+/**
+ * At most this many problems a check lists for one data entry. Past it, the check stops and says so
+ * (`TEMPLATE_CHECK_LIMITED`): each problem holds its message and loops, so a long list of rows each
+ * missing fields would otherwise hold more than the process can.
+ */
+const MAX_TEMPLATE_PROBLEMS = 1000;
+
+/** At most this many problems a check of a batch lists in all: past it, the entries after are not checked (`TEMPLATE_CHECK_LIMITED`). */
+const MAX_BATCH_PROBLEMS = 10_000;
+
+/** Thrown when a check has listed {@link MAX_TEMPLATE_PROBLEMS}: it stops there. */
+const CHECK_FULL: unique symbol = Symbol('check full');
+
+/** A template read and compiled, with the options a render, a listing and a check share. */
+interface PreparedTemplate { compiled: CompiledTemplate; options: TemplateOptions; errCfg: IssueHandler; write: (compiled: CompiledTemplate, data: TemplateData, options: TemplateOptions) => Uint8Array }
+
+/** The formats a template may be in, as `fileType` names them. */
+const TEMPLATE_FILE_TYPES = new Set(['docx', 'odt', 'ott']);
+
+/**
+ * Reads, decrypts and compiles a template: every tag error is raised here, before any data is used.
+ * `options` throw the caller's typed errors, as a render reports them.
+ */
+async function prepareTemplate(template: TemplateInput, config: Omit<TemplateConfig, 'data'>, errCfg: IssueHandler): Promise<PreparedTemplate> {
+    // The options themselves, before the template is read: a setting of the wrong shape is refused,
+    // and one render does not take is reported, as a parse reports its own.
+    const unknownOptions = unknownTemplateOptions(config as TemplateConfig);
+    const pictures = pictureSettings(config as TemplateConfig, errCfg, unknownOptions);
+    const numberText = numberTextOf(config as TemplateConfig, errCfg, unknownOptions);
+    const delimiters = delimitersOf(config as TemplateConfig, errCfg);
+    if (unknownOptions.length) logWarning(OfficeWarningType.UNRECOGNIZED_CONFIG_OPTION, errCfg, { keys: unknownOptions });
+
+    // The limits a render is held to, each a number of 0 or more (another value is reported, and the default used).
+    const limits = decompressionLimitsOf(config.decompressionLimits, errCfg);
+    const bytes = await readInput(template, errCfg);
+
+    // An encrypted template is refused, typed: document-kit does not decrypt (officeParser decrypted
+    // here with Node's crypto). A CFB container that is not encrypted OOXML is a legacy binary file,
+    // which the package check below refuses as officeParser did.
+    if (isCfb(bytes) && isEncryptedOoxml(bytes)) throw getOfficeError(OfficeErrorType.TEMPLATE_ENCRYPTED, errCfg);
+
+    // The format is the package's own, whatever `fileType` says: a Word document, or an OpenDocument
+    // text or text template (whose output is a text).
+    const opened = await openPackage(bytes, limits, errCfg);
+    if (opened && isEncryptedOdf(opened)) throw getOfficeError(OfficeErrorType.TEMPLATE_ENCRYPTED, errCfg);
+    const odt = opened && !opened['word/document.xml'] ? odtEntries(opened, false) : null;
+    const entries = odt ?? (opened?.['word/document.xml'] ? opened : null);
+    if (!entries) {
+        const hint = config.fileType && !TEMPLATE_FILE_TYPES.has(config.fileType) ? `'${config.fileType}' is not supported` : 'the input is not a .docx, .odt or .ott';
+        throw getOfficeError(OfficeErrorType.TEMPLATE_UNSUPPORTED_FORMAT, errCfg, hint);
+    }
+
+    // Each tag is reported once in a render or a check (one prepareTemplate each), at its first order
+    // comparison of two number texts compared as text: one key per tag, its compiled record (compiled once
+    // for the call). Not its typed text, which two tags can share, nor its place among its part's tags,
+    // counted from 0 again in each note that only a loop refers to (compiled on its own).
+    const reportedNumbersAsText = new Set<object>();
+    const options: TemplateOptions = {
+        start: delimiters.start,
+        end: delimiters.end,
+        onMissing: onMissingOf(config as TemplateConfig, errCfg),
+        // A fixed local-time instant: fflate stamps zip entries from local-time fields, so building the
+        // date from local fields makes the DOS timestamp identical in every timezone (deterministic
+        // output cross-machine) and safely inside fflate's 1980-2099 range everywhere.
+        mtime: new Date(2001, 0, 1, 0, 0, 0),
+        onFieldMissing: (key: string): never => { throw getOfficeError(OfficeErrorType.TEMPLATE_FIELD_MISSING, errCfg, key); },
+        maxRepeatedContent: limits.maxRepeatedContent,
+        onRepeatLimit: (): never => { throw getOfficeError(OfficeErrorType.OUTPUT_TOO_LARGE, errCfg, { repeatedLimit: options.maxRepeatedContent }); },
+        onSyntax: (details: TemplateSyntaxDetails): never => { throw getOfficeError(OfficeErrorType.TEMPLATE_SYNTAX, errCfg, details); },
+        onDataInvalid: (details: TemplateDataDetails): never => { throw getOfficeError(OfficeErrorType.TEMPLATE_DATA_INVALID, errCfg, details); },
+        onNestingLimit: (): never => { throw getOfficeError(OfficeErrorType.MAX_NESTING_DEPTH_EXCEEDED, errCfg); },
+        onOutputLimit: (): never => { throw getOfficeError(OfficeErrorType.OUTPUT_TOO_LARGE, errCfg); },
+        pictures,
+        numberText,
+        numericTexts: numericTextsOf(config as TemplateConfig, errCfg),
+        reportNumbersAsText: (tag: object) => {
+            if (reportedNumbersAsText.has(tag)) return null;
+            return (details: TemplateNumbersAsTextDetails): void => {
+                reportedNumbersAsText.add(tag);
+                logWarning(OfficeWarningType.TEMPLATE_NUMBERS_COMPARED_AS_TEXT, errCfg, details);
+            };
+        },
+        formatters: templateFormatters(config as TemplateConfig, errCfg),
+        maxXmlElements: limits.maxXmlElements,
+        onElementLimit: (): never => { throw getOfficeError(OfficeErrorType.XML_ELEMENT_LIMIT_EXCEEDED, errCfg, options.maxXmlElements); },
+    };
+
+    // Compiled once: the tags are read, their blocks paired and scoped, and every tag error raised
+    // before any document is rendered; then each data entry renders from the same compiled template.
+    return odt
+        ? { compiled: compileTemplate(entries, options, ODT_DIALECT), options, errCfg, write: renderOdtTemplate }
+        : { compiled: compileTemplate(entries, options, DOCX_DIALECT), options, errCfg, write: renderDocxTemplate };
+}
+
+/**
+ * Reports the template's text that looks like a tag and is not one (`TEMPLATE_NOT_A_TAG`), once: each
+ * text listed (at most 1,000), and how many were found in all (`found`). With `onlyWhenCut`, only when
+ * more were found than listed: `tags()` lists them itself, and is told only that its list was cut.
+ */
+function warnNotATag(compiled: CompiledTemplate, tags: TemplateTagInfo[], errCfg: IssueHandler, onlyWhenCut = false): void {
+    const texts = tags.filter(t => t.kind === 'text').map(t => ({ text: t.tag, part: t.part, reason: t.reason! }));
+    const found = texts.length + unlistedNearTags(compiled);
+    if (found && (!onlyWhenCut || found > texts.length)) logWarning(OfficeWarningType.TEMPLATE_NOT_A_TAG, errCfg, { texts, found });
+}
+
+/** The data given: one object, or an array of objects, refused (typed) otherwise. */
+function dataRows(config: TemplateConfig, errCfg: IssueHandler): TemplateData[] {
+    if (!config || config.data == null) throw getOfficeError(OfficeErrorType.IMPROPER_ARGUMENTS, errCfg, 'data is required: an object, or an array of objects');
+    // Validate the data up front: one object, or an array of objects. Rejects a null/primitive
+    // batch entry with a typed error instead of a raw TypeError mid-render.
+    const rows = Array.isArray(config.data) ? config.data : [config.data];
+    if (!rows.every(isDataObject)) throw getOfficeError(OfficeErrorType.IMPROPER_ARGUMENTS, errCfg, 'data is an object, or an array of objects');
+    return rows;
+}
+
+/**
+ * officeParser's `OfficeTemplate.render`: one document for one data map, one per entry for a list.
+ * See {@link TemplateConfig} for the options.
+ */
+export async function render(template: TemplateInput, config: TemplateConfig): Promise<Uint8Array | Uint8Array[]> {
+    // A config object (even without onWarning) suppresses errorUtils' console fallback, so a thrown
+    // rejection is not also printed to stderr; a caller-supplied onWarning is still honored.
+    const errCfg: IssueHandler = { onWarning: config?.onWarning };
+    const rows = dataRows(config, errCfg);
+    const { compiled, options, write } = await prepareTemplate(template, config, errCfg);
+    warnNotATag(compiled, listTags(compiled, options), errCfg);
+    // A batch's entries are rendered each with its place, which what a render reports names.
+    return Array.isArray(config.data) ? rows.map((data, entry) => write(compiled, data, { ...options, entry })) : write(compiled, config.data, options);
+}
+
+/**
+ * Lists a template's tags: each field, and each tag that opens a block or a branch, with the part
+ * holding it, what it reads from the data, and the loops it is inside. The template is read as a
+ * render reads it, so a tag error rejects as a render's would. No data is needed. Text that looks like
+ * a tag is listed at most 1,000 times: when the template holds more, a `TEMPLATE_NOT_A_TAG` warning
+ * says how many (`details.found`).
+ */
+export async function tags(template: TemplateInput, config: Omit<TemplateConfig, 'data'> = {}): Promise<TemplateTagInfo[]> {
+    const errCfg: IssueHandler = { onWarning: config?.onWarning };
+    const { compiled, options } = await prepareTemplate(template, config ?? {}, errCfg);
+    const tags = listTags(compiled, options);
+    // Text that looks like a tag is listed up to 1,000 times: past that, the warning says how many there were.
+    warnNotATag(compiled, tags, errCfg, true);
+    return tags;
+}
+
+/**
+ * Checks data against a template without writing a document. The data is read as a render with
+ * `onMissing: 'error'` reads it, whatever `onMissing` says: each field, condition and loop the data
+ * leads to, every pass of every loop, and the branch each condition picks (a field only another
+ * branch uses is not needed). Where a render would reject, the problem is noted and the check goes
+ * on, passing over that tag: a missing field writes nothing, and a branch or loop whose condition or
+ * list is missing or does not fit is not entered, so the fields inside it are not checked until it is
+ * given. A template's own errors, the limits a render is held to, and an error a filter of your own
+ * throws reject as a render's do. At most 1,000 problems are listed for one data entry, and 10,000 for a
+ * whole batch: past them the check stops, and says so with a `TEMPLATE_CHECK_LIMITED` warning (for a
+ * batch, the entries after the one it stopped in are not checked, and their lists are empty).
+ */
+export async function check(template: TemplateInput, config: TemplateConfig): Promise<TemplateProblem[] | TemplateProblem[][]> {
+    const errCfg: IssueHandler = { onWarning: config?.onWarning };
+    const rows = dataRows(config, errCfg);
+    const { compiled, options } = await prepareTemplate(template, config, errCfg);
+    warnNotATag(compiled, listTags(compiled, options), errCfg);
+    // What problems share, made once: each text's number (a key holds numbers, not the texts, which a
+    // template can make long), and each field's or tag's message.
+    const numbers = new Map<string, number>();
+    const numberOf = (text: string): number => {
+        let n = numbers.get(text);
+        if (n === undefined) numbers.set(text, n = numbers.size);
+        return n;
+    };
+    const messages = new Map<string, string>();
+    const messageOf = (key: string, make: () => string): string => {
+        let message = messages.get(key);
+        if (message === undefined) messages.set(key, message = make());
+        return message;
+    };
+    let total = 0;
+    const checkOne = (data: TemplateData, entry?: number): TemplateProblem[] => {
+        const problems: TemplateProblem[] = [];
+        // A problem met again (a field used twice in a pass, a tag in a note copied per reference) is noted
+        // once: by its place (one object per pass, see placeOf), then by what it is, a short key.
+        const seenAt = new WeakMap<TemplatePlace, Set<string>>();
+        const note = (place: TemplatePlace, key: string, make: () => TemplateProblem): void => {
+            let seen = seenAt.get(place);
+            if (!seen) seenAt.set(place, seen = new Set());
+            if (seen.has(key)) return;
+            seen.add(key);
+            problems.push(make());
+            total++;
+            if (problems.length >= MAX_TEMPLATE_PROBLEMS || total >= MAX_BATCH_PROBLEMS) throw CHECK_FULL;
+        };
+        // The part being rendered, which a missing field is noted in.
+        let part = '';
+        const checking: TemplateOptions = {
+            ...options,
+            onMissing: 'error',
+            checking: true,
+            ...(entry === undefined ? {} : { entry }),
+            onFieldMissing: (field, place) => {
+                const fieldNumber = numberOf(field);
+                note(place, `m${fieldNumber} ${numberOf(part)}`, () => ({
+                    code: OfficeErrorType.TEMPLATE_FIELD_MISSING,
+                    message: messageOf(`m${fieldNumber}`, () => buildOfficeError(OfficeErrorType.TEMPLATE_FIELD_MISSING, field).officeIssue!.message),
+                    field, part, loops: place.loops(),
+                }));
+            },
+            onDataInvalid: (details, place): never => {
+                // (Two different texts refused as ambiguous at one place are two problems: their readings differ.)
+                const readings = details.readings?.map(r => `${r.separators}:${r.value}`).join(' ') ?? '';
+                const detailKey = numberOf(`${details.reason}\u0000${details.tag}\u0000${details.part}\u0000${details.kind}\u0000${details.otherKind ?? ''}\u0000${details.filter ?? ''}\u0000${details.takes ?? ''}\u0000${readings}`);
+                note(place, `d${detailKey}`, () => ({
+                    code: OfficeErrorType.TEMPLATE_DATA_INVALID,
+                    message: messageOf(`d${detailKey}`, () => buildOfficeError(OfficeErrorType.TEMPLATE_DATA_INVALID, details).officeIssue!.message),
+                    details, part: details.part, loops: place.loops(),
+                }));
+                throw TAG_SKIPPED;
+            },
+        };
+        try { renderParts(compiled, data, checking, name => { part = name; }); }
+        catch (e) {
+            if (e !== CHECK_FULL) throw e;
+            // (The batch's limit, where both are reached: the entries after are not checked.)
+            const batch = entry !== undefined && total >= MAX_BATCH_PROBLEMS;
+            const limit = batch ? MAX_BATCH_PROBLEMS : MAX_TEMPLATE_PROBLEMS;
+            logWarning(OfficeWarningType.TEMPLATE_CHECK_LIMITED, errCfg, entry === undefined ? { limit } : batch ? { limit, entry, batch, unchecked: rows.length - entry - 1 } : { limit, entry });
+        }
+        return problems;
+    };
+    if (!Array.isArray(config.data)) return checkOne(config.data);
+    // A batch: once its problems reach MAX_BATCH_PROBLEMS, the entries after are not checked.
+    return rows.map((data, entry) => total >= MAX_BATCH_PROBLEMS ? [] : checkOne(data, entry));
+}
+

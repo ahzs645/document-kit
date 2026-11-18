@@ -1,0 +1,276 @@
+// Annex D.2 — the Latin-text encodings a simple font's codes are read through.
+//
+// A font says what its codes mean in three ways, and a reader that knows only
+// the last two is wrong about the rest: `/ToUnicode`, `/Encoding /Differences`
+// — and the BASE encoding underneath them, which is either named in the font
+// dictionary or is the one built into the face. Read as Latin-1, which is all
+// that is left without these tables, ZapfDingbats.pdf's title —
+// "Character Sets — Zapf Dingbats", set in Times with no `/Encoding` at all —
+// came back as "Character Sets Ð Zapf Dingbats": 0xD0 is Eth in Latin-1 and an
+// em dash in StandardEncoding.
+//
+// Codes 0x20–0x7E are ASCII in all three (StandardEncoding's two quotes aside),
+// and WinAnsiEncoding's upper half is Latin-1 by construction. So the tables
+// hold what DIFFERS from Latin-1, and a code no table names keeps that reading.
+
+/** One of the base encodings this reader has a table for (Annex D.2). */
+export type BaseEncodingName = 'StandardEncoding' | 'WinAnsiEncoding' | 'MacRomanEncoding';
+
+/**
+ * Code → glyph name, from names read in code order. `.` marks a code the
+ * encoding leaves unused, and the rows are the spec's own — sixteen to a line,
+ * so a row can be checked against Annex D at a glance.
+ */
+function table(start: number, ...rows: ReadonlyArray<string>): Map<number, string> {
+  const out = new Map<number, string>();
+  let code = start;
+  for (const row of rows) {
+    for (const name of row.split(/\s+/u).filter(Boolean)) {
+      if (name !== '.') out.set(code, name);
+      code++;
+    }
+  }
+  return out;
+}
+
+// Annex D.2 — the low half, which all three share. It says nothing Latin-1 does
+// not, and it is here for the other thing a base encoding answers: which GLYPH
+// a code selects in a program addressed by name (§9.6.6). A legacy eight-bit
+// face is reached that way and no other.
+const ASCII = table(
+  0x20,
+  'space exclam quotedbl numbersign dollar percent ampersand quotesingle parenleft parenright asterisk plus comma hyphen period slash',
+  'zero one two three four five six seven eight nine colon semicolon less equal greater question',
+  'at A B C D E F G H I J K L M N O',
+  'P Q R S T U V W X Y Z bracketleft backslash bracketright asciicircum underscore',
+  'grave a b c d e f g h i j k l m n o',
+  'p q r s t u v w x y z braceleft bar braceright asciitilde .',
+);
+
+/** Annex D.2 STD — the built-in encoding of the standard Latin text faces. */
+const STANDARD: ReadonlyMap<number, string> = new Map([
+  ...ASCII,
+  // The typewriter apostrophe and grave are the typographic quotes here, which
+  // is how a TeX page writes `don't` and `‘this’`.
+  ...table(0x27, 'quoteright'),
+  ...table(0x60, 'quoteleft'),
+  ...table(
+    0xa0,
+    '. exclamdown cent sterling fraction yen florin section currency quotesingle quotedblleft guillemotleft guilsinglleft guilsinglright fi fl',
+    '. endash dagger daggerdbl periodcentered . paragraph bullet quotesinglbase quotedblbase quotedblright guillemotright ellipsis perthousand . questiondown',
+    '. grave acute circumflex tilde macron breve dotaccent dieresis . ring cedilla . hungarumlaut ogonek caron',
+    'emdash . . . . . . . . . . . . . . .',
+    '. AE . ordfeminine . . . . Lslash Oslash OE ordmasculine . . . .',
+    '. ae . . . dotlessi . . lslash oslash oe germandbls . . . .',
+  ),
+]);
+
+/** Annex D.2 WIN — CP-1252. Only its punctuation block departs from Latin-1. */
+const WIN_ANSI: ReadonlyMap<number, string> = new Map([
+  ...ASCII,
+  ...table(
+    0x80,
+    'Euro . quotesinglbase florin quotedblbase ellipsis dagger daggerdbl circumflex perthousand Scaron guilsinglleft OE . Zcaron .',
+    '. quoteleft quoteright quotedblleft quotedblright bullet endash emdash tilde trademark scaron guilsinglright oe . zcaron Ydieresis',
+  ),
+  // Annex D.2 names 0xA0 `space` and 0xAD `hyphen` — the drawn glyphs, since a
+  // PDF has no line to break. Left to Latin-1 they read as the no-break space
+  // and the SOFT hyphen, which say the same about the ink and more about the
+  // text: the soft hyphen is how a producer marks a word broken across a line,
+  // and it is what the reconstruction joins that word back together on.
+]);
+
+/** Annex D.2 MAC — Mac OS Roman, as the PDF variant states it. */
+const MAC_ROMAN: ReadonlyMap<number, string> = new Map([
+  ...ASCII,
+  ...table(
+    0x80,
+    'Adieresis Aring Ccedilla Eacute Ntilde Odieresis Udieresis aacute agrave acircumflex adieresis atilde aring ccedilla eacute egrave',
+    'ecircumflex edieresis iacute igrave icircumflex idieresis ntilde oacute ograve ocircumflex odieresis otilde uacute ugrave ucircumflex udieresis',
+    'dagger degree cent sterling section bullet paragraph germandbls registered copyright trademark acute dieresis notequal AE Oslash',
+    'infinity plusminus lessequal greaterequal yen mu partialdiff summation product pi integral ordfeminine ordmasculine Omega ae oslash',
+    'questiondown exclamdown logicalnot radical florin approxequal Delta guillemotleft guillemotright ellipsis space Agrave Atilde Otilde OE oe',
+    'endash emdash quotedblleft quotedblright quoteleft quoteright divide lozenge ydieresis Ydieresis fraction currency guilsinglleft guilsinglright fi fl',
+    'daggerdbl periodcentered quotesinglbase quotedblbase perthousand Acircumflex Ecircumflex Aacute Edieresis Egrave Iacute Icircumflex Idieresis Igrave Oacute Ocircumflex',
+    '. Ograve Uacute Ucircumflex Ugrave dotlessi circumflex tilde macron breve dotaccent ring cedilla hungarumlaut ogonek caron',
+  ),
+]);
+
+/**
+ * Annex D.2 WIN — the glyph NAMES of CP-1252's upper half, which the table
+ * above leaves to Latin-1 for the TEXT. A program addressed by name still has
+ * to be told which glyph 0xE9 is: `eacute`, looked up by name or through the
+ * character a Unicode `cmap` keys it by. (0xA0 is `space` and 0xAD `hyphen`
+ * here, as Annex D names the glyphs they draw.)
+ */
+const WIN_ANSI_LATIN: ReadonlyMap<number, string> = table(
+  0xa0,
+  'space exclamdown cent sterling currency yen brokenbar section dieresis copyright ordfeminine guillemotleft logicalnot hyphen registered macron',
+  'degree plusminus twosuperior threesuperior acute mu paragraph periodcentered cedilla onesuperior ordmasculine guillemotright onequarter onehalf threequarters questiondown',
+  'Agrave Aacute Acircumflex Atilde Adieresis Aring AE Ccedilla Egrave Eacute Ecircumflex Edieresis Igrave Iacute Icircumflex Idieresis',
+  'Eth Ntilde Ograve Oacute Ocircumflex Otilde Odieresis multiply Oslash Ugrave Uacute Ucircumflex Udieresis Yacute Thorn germandbls',
+  'agrave aacute acircumflex atilde adieresis aring ae ccedilla egrave eacute ecircumflex edieresis igrave iacute icircumflex idieresis',
+  'eth ntilde ograve oacute ocircumflex otilde odieresis divide oslash ugrave uacute ucircumflex udieresis yacute thorn ydieresis',
+);
+
+/**
+ * The glyph a code of WinAnsiEncoding's Latin-1 half selects, by name (see
+ * `WIN_ANSI_LATIN`).
+ *
+ * @param code A one-byte code.
+ * @returns The Annex D.2 glyph name, or `undefined` outside 0xA0–0xFF.
+ */
+export function winAnsiLatinName(code: number): string | undefined {
+  return WIN_ANSI_LATIN.get(code);
+}
+
+const TABLES: Readonly<Record<BaseEncodingName, ReadonlyMap<number, string>>> = {
+  StandardEncoding: STANDARD,
+  WinAnsiEncoding: WIN_ANSI,
+  MacRomanEncoding: MAC_ROMAN,
+};
+
+/**
+ * The glyph names of a base encoding, or `undefined` for a name this has no
+ * table for — `/MacExpertEncoding`, whose repertory no reader here can set.
+ *
+ * @param name The `/Encoding` or `/BaseEncoding` name, without the slash.
+ */
+export function baseEncodingTable(name: string): ReadonlyMap<number, string> | undefined {
+  return name in TABLES ? TABLES[name as BaseEncodingName] : undefined;
+}
+
+/** The encoding built into the standard Latin text faces (§9.6.2.2). */
+export function standardEncodingTable(): ReadonlyMap<number, string> {
+  return STANDARD;
+}
+
+// §9.6.2.2 Table 109 — the fourteen, by their PostScript names. Only an exact
+// name counts: a file that says `Arial` and embeds nothing is asking for a
+// substitute, and what a substitute's codes mean is whatever the producer
+// assumed — nearly always Latin-1. The four the reader answers for with
+// StandardEncoding are the Latin text faces; Symbol and ZapfDingbats have
+// built-in encodings of their own (see `./dingbats`).
+const STANDARD_LATIN_FACES = new Set([
+  'courier',
+  'courier-bold',
+  'courier-oblique',
+  'courier-boldoblique',
+  'helvetica',
+  'helvetica-bold',
+  'helvetica-oblique',
+  'helvetica-boldoblique',
+  'times-roman',
+  'times-bold',
+  'times-italic',
+  'times-bolditalic',
+]);
+
+// The Macintosh standard glyph ORDER — the names a `post` table means by an
+// index below 258 (§post, format 2.0). Three names of its own, then the
+// MacRoman repertory in code order, then a tail Apple appended later. A legacy
+// eight-bit font is reached through this and nothing else: its program carries
+// no `cmap`, and the shapes it draws are whatever the foundry put under those
+// names — Masis, an Armenian face, draws ի under `i`.
+const MAC_ORDER = `
+.notdef .null nonmarkingreturn space exclam quotedbl numbersign dollar
+percent ampersand quotesingle parenleft parenright asterisk plus comma
+hyphen period slash zero one two three four
+five six seven eight nine colon semicolon less
+equal greater question at A B C D
+E F G H I J K L
+M N O P Q R S T
+U V W X Y Z bracketleft backslash
+bracketright asciicircum underscore grave a b c d
+e f g h i j k l
+m n o p q r s t
+u v w x y z braceleft bar
+braceright asciitilde Adieresis Aring Ccedilla Eacute Ntilde Odieresis
+Udieresis aacute agrave acircumflex adieresis atilde aring ccedilla
+eacute egrave ecircumflex edieresis iacute igrave icircumflex idieresis
+ntilde oacute ograve ocircumflex odieresis otilde uacute ugrave
+ucircumflex udieresis dagger degree cent sterling section bullet
+paragraph germandbls registered copyright trademark acute dieresis notequal
+AE Oslash infinity plusminus lessequal greaterequal yen mu
+partialdiff summation product pi integral ordfeminine ordmasculine Omega
+ae oslash questiondown exclamdown logicalnot radical florin approxequal
+Delta guillemotleft guillemotright ellipsis nonbreakingspace Agrave Atilde Otilde
+OE oe endash emdash quotedblleft quotedblright quoteleft quoteright
+divide lozenge ydieresis Ydieresis fraction currency guilsinglleft guilsinglright
+fi fl daggerdbl periodcentered quotesinglbase quotedblbase perthousand Acircumflex
+Ecircumflex Aacute Edieresis Egrave Iacute Icircumflex Idieresis Igrave
+Oacute Ocircumflex apple Ograve Uacute Ucircumflex Ugrave dotlessi
+circumflex tilde macron breve dotaccent ring cedilla hungarumlaut
+ogonek caron Lslash lslash Scaron scaron Zcaron zcaron
+brokenbar Eth eth Yacute yacute Thorn thorn minus
+multiply onesuperior twosuperior threesuperior onehalf onequarter threequarters franc
+Gbreve gbreve Idotaccent Scedilla scedilla Cacute cacute Ccaron
+ccaron dcroat
+`
+  .split(/\s+/u)
+  .filter(Boolean);
+
+/**
+ * The name a `post` table's glyph-name index below 258 stands for.
+ *
+ * @param index The index as the table states it.
+ * @returns The name, or `undefined` for an index outside the standard order.
+ */
+export function macGlyphName(index: number): string | undefined {
+  return MAC_ORDER[index];
+}
+
+/**
+ * Whether a `/BaseFont` names one of the standard Latin faces, whose built-in
+ * encoding is StandardEncoding.
+ *
+ * @param baseFont The name as the font dictionary states it.
+ */
+export function isStandardLatinFace(baseFont: string): boolean {
+  return STANDARD_LATIN_FACES.has(
+    baseFont
+      .trim()
+      .replace(/^[A-Za-z]{6}\+/u, '')
+      .toLowerCase(),
+  );
+}
+
+// Annex D.2 PDF — where PDFDocEncoding parts from Latin-1: the spacing accents
+// it puts among the control codes, and the typographer's punctuation, the two
+// ligatures and the Central European letters it puts where CP-1252 has them,
+// in an order of its own. 0x9F is unused, and 0xA0 is the euro sign.
+const PDF_DOC: ReadonlyMap<number, number> = new Map([
+  ...[0x02d8, 0x02c7, 0x02c6, 0x02d9, 0x02dd, 0x02db, 0x02da, 0x02dc].map(
+    (cp, i) => [0x18 + i, cp] as const,
+  ),
+  ...[
+    0x2022, 0x2020, 0x2021, 0x2026, 0x2014, 0x2013, 0x0192, 0x2044, 0x2039, 0x203a, 0x2212, 0x2030,
+    0x201e, 0x201c, 0x201d, 0x2018, 0x2019, 0x201a, 0x2122, 0xfb01, 0xfb02, 0x0141, 0x0152, 0x0160,
+    0x0178, 0x017d, 0x0131, 0x0142, 0x0153, 0x0161, 0x017e,
+  ].map((cp, i) => [0x80 + i, cp] as const),
+  [0xa0, 0x20ac],
+]);
+
+/**
+ * §7.9.2.2 — the characters of a text string: UTF-16BE behind its byte-order
+ * mark, UTF-8 behind its own (PDF 2.0), and otherwise PDFDocEncoding, one byte
+ * to a character.
+ *
+ * @param bytes The string's bytes, as written literal or in hex.
+ * @returns The text it stands for.
+ */
+export function pdfTextString(bytes: Uint8Array): string {
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) {
+    let out = '';
+    for (let i = 2; i + 1 < bytes.length; i += 2) {
+      out += String.fromCharCode((bytes[i]! << 8) | bytes[i + 1]!);
+    }
+    return out;
+  }
+  if (bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+    return new TextDecoder('utf-8').decode(bytes.subarray(3));
+  }
+  let out = '';
+  for (const b of bytes) out += String.fromCodePoint(PDF_DOC.get(b) ?? b);
+  return out;
+}

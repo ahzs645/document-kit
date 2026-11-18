@@ -1,0 +1,626 @@
+// E-PDF EP2/EP8/EP13 — page text extraction. Interprets the page content (and,
+// recursively, the Form XObjects it paints — EP13, whose text would otherwise be
+// missed) into positioned runs, then tags any run whose origin falls inside a
+// /Link annotation's /Rect with that link's URI (EP8) so hyperlinks survive.
+
+import { IDENTITY, interpretContent, multiply } from './content';
+import { buildContentFont } from './font';
+import { appearanceContent, collectPageAppearances } from './annots';
+import { textMarkupOf } from './annot-draw';
+import { patternTint, tintedHex } from './pattern-tint';
+import { hiddenProperties, hiddenXObject } from './optional-content';
+import { buildColorSpaceMap, buildShadingMap } from './shading';
+import { addShown } from './face-outlines';
+import { pdfTextString } from './encodings';
+import type { Quad, TextMarkup, TextMarkupAnnot } from './annot-draw';
+import type { ContentFont, Matrix, TextRun } from './content';
+import type { ShownCodes } from './face-outlines';
+import type { PdfDict } from '../pdf/objects';
+import type { PdfFile, PdfPage, Rectangle } from './document';
+
+import { PDF_NULL, PdfHexString, PdfName, PdfStream } from '../pdf/objects';
+
+const MAX_FORM_DEPTH = 8;
+
+/**
+ * Extract a page's text as positioned {@link TextRun}s (E-PDF EP2/EP8/EP13).
+ * Interprets the page content stream and, recursively, the Form XObjects it
+ * paints (EP13 — their text would otherwise be missed), then tags any run whose
+ * origin falls inside a `/Link` annotation's `/Rect` with that link's URI (EP8)
+ * so hyperlinks survive.
+ *
+ * @param file  The owning {@link PdfFile}.
+ * @param page  The page to extract.
+ * @param painted Where to gather the codes each font painted, for a caller
+ *                that embeds the faces (see `./face-outlines`).
+ * @returns The page's runs, each carrying an `href` when it sits under a link.
+ */
+export function extractPageText(
+  file: PdfFile,
+  page: PdfPage,
+  painted?: ShownCodes,
+): Array<TextRun> {
+  const runs: Array<TextRun> = [];
+  collectRuns(file, page.resources, file.pageContent(page), IDENTITY, 0, new Set(), runs, painted);
+  // §12.5.5 — an annotation draws in its own appearance stream, and the words
+  // it draws are the page's words too: a field's value, a button's caption.
+  // Only its ARTWORK was being lifted, so 160F-2019.pdf's reset button arrived
+  // as a tinted rectangle with nothing written on it.
+  const own = runs.length;
+  for (const appearance of collectPageAppearances(file, page)) {
+    collectRuns(
+      file,
+      appearance.resources ?? page.resources,
+      appearanceContent(file, appearance),
+      appearance.ctm,
+      1,
+      new Set([appearance.stream]),
+      runs,
+      painted,
+    );
+  }
+  for (let i = own; i < runs.length; i++) runs[i] = { ...runs[i]!, annotation: true };
+  const links = collectLinks(file, page);
+  const marks = collectTextMarkup(file, page);
+  const shown = withCyrillicSchwa(withAccentsComposed(withoutRestrikes(runs)));
+  if (links.length === 0 && marks.length === 0) return shown;
+  return shown.flatMap((run) => {
+    const link = links.find((l) => inRect(run.x, run.y, l.rect));
+    const linked = link ? { ...run, href: link.href } : run;
+    const marked = marks.find((m) => m.quads.some((q) => touches(q, linked)));
+    if (!marked) return [linked];
+    const quad = marked.quads.find((q) => touches(q, linked));
+    return quad ? markedPieces(linked, quad, marked.mark) : [linked];
+  });
+}
+
+/**
+ * §12.5.6.10 — whether a marked quad reaches this run at all.
+ *
+ * The quad is a box round a run of text and the run is a baseline with an
+ * advance, so the test is the baseline falling inside the box's height while
+ * the two overlap horizontally by more than a hair.
+ */
+function touches(q: Quad, run: TextRun): boolean {
+  if (run.y < q.y0 || run.y > q.y0 + q.h) return false;
+  const left = Math.min(run.x, run.endX);
+  const right = Math.max(run.x, run.endX);
+  return Math.min(right, q.x1) - Math.max(left, q.x0) > 0.5;
+}
+
+/**
+ * The run cut at the quad's edges, so only what the quad covers is marked.
+ *
+ * A quad round ONE WORD of a line must not claim the line: highlight_popup.pdf
+ * marks "PDF.js" in "Hello PDF.js World", which is one run, and the whole line
+ * came back highlighted. The run states its advance and its text and not where
+ * each glyph fell inside it, so the cut is made by proportion of the advance —
+ * a word off by a fraction of a letter where the face is proportional, against
+ * a line marked entirely wrongly.
+ */
+function markedPieces(run: TextRun, q: Quad, mark: TextMarkup): Array<TextRun> {
+  const left = Math.min(run.x, run.endX);
+  const right = Math.max(run.x, run.endX);
+  const advance = right - left;
+  const chars = [...run.text];
+  if (!(advance > 0) || chars.length === 0) return [{ ...run, markup: mark }];
+  const at = (x: number): number =>
+    Math.max(0, Math.min(chars.length, Math.round(((x - left) / advance) * chars.length)));
+  const from = at(q.x0);
+  const to = at(q.x1);
+  if (from <= 0 && to >= chars.length) return [{ ...run, markup: mark }];
+  if (to <= from) return [run];
+  const per = advance / chars.length;
+  const piece = (a: number, b: number, marked: boolean): TextRun => ({
+    ...run,
+    text: chars.slice(a, b).join(''),
+    x: left + a * per,
+    endX: left + b * per,
+    ...(marked ? { markup: mark } : {}),
+  });
+  return [
+    ...(from > 0 ? [piece(0, from, false)] : []),
+    piece(from, to, true),
+    ...(to < chars.length ? [piece(to, chars.length, false)] : []),
+  ];
+}
+
+/** Every text-markup annotation on the page, with the boxes it marks. */
+function collectTextMarkup(file: PdfFile, page: PdfPage): Array<TextMarkupAnnot> {
+  const annots = file.get(page.dict, 'Annots');
+  if (!Array.isArray(annots)) return [];
+  const out: Array<TextMarkupAnnot> = [];
+  for (const entry of annots) {
+    const annot = file.resolve(entry);
+    if (!(annot instanceof Map)) continue;
+    const mark = textMarkupOf(file, annot);
+    if (mark) out.push(mark);
+  }
+  return out;
+}
+
+/**
+ * §9.4.3 — the same text struck again in the same place, dropped.
+ *
+ * A page with no bold face to hand fakes one by drawing its text several times
+ * a fraction of a point apart, and every copy is a run of its own.
+ * bug900822.pdf draws one line FOUR times — twice 0.16pt apart across, twice
+ * 0.32pt apart down — and read as four lines its letters came back interleaved:
+ * "TTTTeeeesssstttt" where the page shows "Test test".
+ *
+ * A copy is a run with the SAME text and size within a small fraction of an em
+ * of another. That is well inside the advance of even the narrowest letter, so
+ * a word that really does repeat a character is never mistaken for one. The
+ * LAST copy is the one kept: it is the one painted on top.
+ *
+ * The extra strikes are not read as WEIGHT. It is tempting — the offset is
+ * exactly how a face with no bold cut is emboldened — but two strikes a tenth
+ * of a point apart are a hair of ink and not a bold face:
+ * issue11150_reduced.pdf strikes each of its three letters twice and every
+ * renderer shows them at the weight of the text around them.
+ *
+ * @param runs The page's runs, in painting order.
+ * @returns The runs a reader sees, each drawn once.
+ */
+function withoutRestrikes(runs: ReadonlyArray<TextRun>): Array<TextRun> {
+  const kept = new Map<string, number>();
+  const out: Array<TextRun> = [];
+  for (const run of runs) {
+    if (run.text.length === 0) {
+      out.push(run);
+      continue;
+    }
+    const tol = Math.max((run.fontSizePt || 10) * RESTRIKE_EM, 0.05);
+    const cell = (x: number, y: number): string =>
+      `${run.text}|${run.fontSizePt.toFixed(1)}|${String(Math.round(x / tol))}|${String(Math.round(y / tol))}`;
+    // The copy may fall the other side of a cell boundary, so its neighbours
+    // are asked too.
+    let at = -1;
+    for (const dx of [-1, 0, 1]) {
+      for (const dy of [-1, 0, 1]) {
+        const had = kept.get(cell(run.x + dx * tol, run.y + dy * tol));
+        if (had !== undefined) at = had;
+      }
+    }
+    if (at >= 0) {
+      out[at] = run; // the last copy is the one on top
+      kept.set(cell(run.x, run.y), at);
+      continue;
+    }
+    kept.set(cell(run.x, run.y), out.length);
+    out.push(run);
+  }
+  return out;
+}
+
+/** How near, in ems, a re-strike of the same text lands to the one it thickens. */
+const RESTRIKE_EM = 0.08;
+
+/**
+ * §9.4.3 — an accent struck over a letter, composed with it.
+ *
+ * TeX sets an accented letter its font has no glyph for as two: the accent,
+ * and the letter drawn back under it — "ï" is a dieresis and a dotless i.
+ * Read as they come, comments.pdf's "naïve" came back "na¨ıve", the accent a
+ * character of the word. A run that is one spacing accent, with the pen taken
+ * back under it for the run after it, is the accent of that run's first letter
+ * — or, where the accent was struck after its letter, of the last letter of the
+ * run before it. The two are written as the one character Unicode composes them
+ * into, a dotless i or j taking back its dot's place under the accent.
+ *
+ * @param runs The page's runs, in painting order.
+ * @returns The runs with each such accent composed into its letter.
+ */
+function withAccentsComposed(runs: ReadonlyArray<TextRun>): Array<TextRun> {
+  const out: Array<TextRun> = [];
+  for (let i = 0; i < runs.length; i++) {
+    const run = runs[i]!;
+    const mark = ACCENTS.get(run.text);
+    const next = runs[i + 1];
+    const prev = out[out.length - 1];
+    if (mark !== undefined && next !== undefined && struckOver(run, next, 'first')) {
+      const [first = '', ...rest] = [...next.text];
+      out.push({ ...next, text: accented(first, mark) + rest.join('') });
+      i++;
+      continue;
+    }
+    if (mark !== undefined && prev !== undefined && struckOver(run, prev, 'last')) {
+      const chars = [...prev.text];
+      const last = chars.pop() ?? '';
+      out[out.length - 1] = { ...prev, text: chars.join('') + accented(last, mark) };
+      continue;
+    }
+    out.push(run);
+  }
+  return out;
+}
+
+/**
+ * The Latin schwa a page wrote for the Cyrillic one, read as the Cyrillic.
+ *
+ * Arial, Times New Roman and Courier New draw ә (U+04D9) with the glyph of the
+ * Latin schwa ə (U+0259), Ә with that of Ə, and a writer that names a glyph
+ * after the first character reaching it says Latin: Word, Excel and PowerPoint
+ * for Mac export every ә of a Kazakh, Tatar, Bashkir or Azerbaijani document
+ * set in those faces as ə (probes of 2026-11-06), and Ream itself did until
+ * it named each glyph after the letter it drew. Read as written, "және" is a
+ * Cyrillic word with a Latin letter in it, which no language spells.
+ *
+ * A schwa is read as Cyrillic where its word's other letters are Cyrillic and
+ * none Latin, and a word that is nothing but schwas (an alphabet's "Әә") where
+ * its line's letters are: Cyrillic, at least three of them, and no Latin besides.
+ * An Azerbaijani word in the Latin alphabet — "Azərbaycan" — is left as it is.
+ *
+ * @param runs The page's runs.
+ * @returns The runs, each schwa among Cyrillic letters made Cyrillic.
+ */
+function withCyrillicSchwa(runs: ReadonlyArray<TextRun>): Array<TextRun> {
+  if (!runs.some((r) => /[\u0259\u018f]/u.test(r.text))) return [...runs];
+  const out = [...runs];
+  // Word for Mac shows the schwa from a font object of its own, so the word
+  // "және" arrives as three runs, "ж", "ə", "не": the runs that touch on one
+  // baseline are read together, as the line they draw.
+  let from = 0;
+  for (let i = 1; i <= runs.length; i++) {
+    const prev = runs[i - 1]!;
+    const run = runs[i];
+    if (run && continuesLine(prev, run)) continue;
+    if (runs.slice(from, i).some((r) => /[\u0259\u018f]/u.test(r.text))) {
+      const texts = runs.slice(from, i).map((r) => r.text);
+      // One schwa for another: the same length in UTF-16, so each run gets back
+      // the stretch of the line it gave.
+      const line = cyrillicSchwas(texts.join(''));
+      let at = 0;
+      texts.forEach((t, k) => {
+        const mine = line.slice(at, at + t.length);
+        at += t.length;
+        if (mine !== t) out[from + k] = { ...runs[from + k]!, text: mine };
+      });
+    }
+    from = i;
+  }
+  return out;
+}
+
+/** Whether one run takes up where another left off, on its baseline. */
+function continuesLine(a: TextRun, b: TextRun): boolean {
+  if (a.angleDeg !== undefined || b.angleDeg !== undefined) return false;
+  const size = b.fontSizePt || a.fontSizePt || 10;
+  return Math.abs(a.y - b.y) < size * 0.3 && Math.abs(b.x - a.endX) < size * 0.3;
+}
+
+/** A line's schwas among Cyrillic letters, made Cyrillic (see {@link withCyrillicSchwa}). */
+function cyrillicSchwas(line: string): string {
+  const letters = [...line].filter((ch) => /\p{L}/u.test(ch));
+  const cyrillic = letters.filter((ch) => /\p{Script=Cyrillic}/u.test(ch)).length;
+  const otherLatin = letters.some((ch) => /\p{Script=Latin}/u.test(ch) && !SCHWA.has(ch));
+  const lineIsCyrillic = cyrillic >= 3 && !otherLatin;
+  return line.replace(/[\p{L}\p{M}]+/gu, (word) => {
+    if (!/[\u0259\u018f]/u.test(word)) return word;
+    const rest = [...word].filter((ch) => !SCHWA.has(ch) && /\p{L}/u.test(ch));
+    const cyrillicWord =
+      rest.length > 0
+        ? rest.some((ch) => /\p{Script=Cyrillic}/u.test(ch)) &&
+          !rest.some((ch) => /\p{Script=Latin}/u.test(ch))
+        : lineIsCyrillic;
+    return cyrillicWord ? word.replace(/[\u0259\u018f]/gu, (ch) => SCHWA.get(ch)!) : word;
+  });
+}
+
+/** The Latin schwas, and the Cyrillic letters a page drawn in Cyrillic meant by them. */
+const SCHWA: ReadonlyMap<string, string> = new Map([
+  ['\u0259', '\u04d9'],
+  ['\u018f', '\u04d8'],
+]);
+
+/**
+ * Whether an accent stands over the first letter of a run (the pen taken back
+ * under it) or over the last (the pen taken back to strike it): on one
+ * baseline, give or take the lift an accent over a capital takes, and
+ * overlapping it by more than a hair.
+ */
+function struckOver(accent: TextRun, base: TextRun, which: 'first' | 'last'): boolean {
+  if (accent.angleDeg !== undefined || base.angleDeg !== undefined) return false;
+  const size = base.fontSizePt || accent.fontSizePt || 10;
+  if (Math.abs(accent.y - base.y) > size * ACCENT_LIFT_EM) return false;
+  if (!/^\p{L}/u.test(which === 'first' ? base.text : ([...base.text].at(-1) ?? ''))) return false;
+  const hair = size * ACCENT_OVERLAP_EM;
+  return which === 'first'
+    ? base.x < accent.endX - hair && base.x > accent.x - size
+    : accent.x < base.endX - hair && accent.x > base.x;
+}
+
+/** A letter with an accent composed onto it: a dotless i or j takes back its dot's place. */
+function accented(letter: string, mark: string): string {
+  const base = letter === '\u0131' ? 'i' : letter === '\u0237' ? 'j' : letter;
+  return (base + mark).normalize('NFC');
+}
+
+/** How far over the line, in ems, TeX lifts an accent to stand over a capital. */
+const ACCENT_LIFT_EM = 0.6;
+
+/** How far, in ems, an accent must overlap its letter to stand over it. */
+const ACCENT_OVERLAP_EM = 0.05;
+
+/** The spacing accents TeX strikes over a letter, and the combining marks they are. */
+const ACCENTS: ReadonlyMap<string, string> = new Map([
+  ['\u0060', '\u0300'],
+  ['\u00b4', '\u0301'],
+  ['\u02c6', '\u0302'],
+  ['\u005e', '\u0302'],
+  ['\u02dc', '\u0303'],
+  ['\u007e', '\u0303'],
+  ['\u00af', '\u0304'],
+  ['\u02c9', '\u0304'],
+  ['\u02d8', '\u0306'],
+  ['\u02d9', '\u0307'],
+  ['\u00a8', '\u0308'],
+  ['\u02da', '\u030a'],
+  ['\u02dd', '\u030b'],
+  ['\u02c7', '\u030c'],
+  ['\u00b8', '\u0327'],
+  ['\u02db', '\u0328'],
+]);
+
+// §8.6 — the colour spaces one resource dictionary names, read once. A page's
+// forms nearly all share one, and reading the same `/Separation`'s tint
+// transform for every stream is work with one answer.
+const spaceCache = new WeakMap<PdfDict, ReturnType<typeof buildColorSpaceMap>>();
+
+/** The page's shading patterns, read once per resource dictionary. */
+const shadingCache = new WeakMap<PdfDict, ReturnType<typeof buildShadingMap>>();
+
+function shadingsOf(
+  file: PdfFile,
+  resources: PdfDict | undefined,
+): ReturnType<typeof buildShadingMap> {
+  if (!resources) return new Map();
+  const had = shadingCache.get(resources);
+  if (had) return had;
+  const made = buildShadingMap(file, resources);
+  shadingCache.set(resources, made);
+  return made;
+}
+
+function spacesOf(
+  file: PdfFile,
+  resources: PdfDict | undefined,
+): ReturnType<typeof buildColorSpaceMap> {
+  if (!resources) return new Map();
+  const had = spaceCache.get(resources);
+  if (had) return had;
+  const made = buildColorSpaceMap(file, resources);
+  spaceCache.set(resources, made);
+  return made;
+}
+
+/**
+ * §14.9.4 — the replacement text of each property list the page's
+ * `/Properties` names: the content says `/Span /P1 BDC` and the `/ActualText`
+ * is in the resources, not in the stream.
+ *
+ * @param file      The owning file.
+ * @param resources The resource dictionary in force.
+ * @returns Name → the text, for the lists that hold one.
+ */
+export function actualTextsOf(file: PdfFile, resources: PdfDict | undefined): Map<string, string> {
+  const out = new Map<string, string>();
+  const props = resources ? file.get(resources, 'Properties') : undefined;
+  if (!(props instanceof Map)) return out;
+  for (const [name, value] of props) {
+    const list = file.resolve(value);
+    const text = list instanceof Map ? file.get(list, 'ActualText') : undefined;
+    if (text instanceof PdfHexString) out.set(name, pdfTextString(text.bytes));
+    else if (typeof text === 'string') {
+      out.set(name, pdfTextString(Uint8Array.from(text, (c) => c.charCodeAt(0) & 0xff)));
+    }
+  }
+  return out;
+}
+
+// Interpret one content stream (a page or a Form XObject) into runs, then recurse
+// into the Form XObjects it paints — each composing its /Matrix onto the
+// placement CTM and using its own /Resources fonts.
+function collectRuns(
+  file: PdfFile,
+  resources: PdfDict | undefined,
+  content: Uint8Array,
+  baseCtm: Matrix,
+  depth: number,
+  visiting: Set<PdfStream>,
+  out: Array<TextRun>,
+  shown?: ShownCodes,
+): void {
+  const result = interpretContent(
+    content,
+    buildFonts(file, resources),
+    baseCtm,
+    // §8.6.6.2 — the shading patterns the page NAMES. Type painted with one is
+    // painted with a gradient, and without the map the pattern says nothing
+    // here and the colour in force stands: ShowText-ShadingPattern.pdf sets two
+    // of its four lines in a blue-to-red sweep and both came back black.
+    shadingsOf(file, resources),
+    undefined,
+    // §8.6.8 — the spaces the page NAMES. Without them `1 scn` says nothing
+    // and the colour in force stands: TAMReview.pdf fills its figure boxes
+    // white, then sets their labels in `/Cs8 cs 1 scn` — a `/Separation` whose
+    // full tint is black — and the labels came out white on white, invisible
+    // on a page that shows them plainly.
+    spacesOf(file, resources),
+    hiddenProperties(file, resources),
+    actualTextsOf(file, resources),
+  );
+  out.push(...result.texts.map((r) => withPatternColour(file, resources, r, visiting)));
+  if (shown) addShown(shown, result.shown);
+  if (depth >= MAX_FORM_DEPTH) return;
+  // §9.6.5 — a Type 3 glyph's procedure may show text of its own, and it is
+  // text the page shows. ContentStreamCycleType3insideType3.pdf sets a word
+  // inside the glyph of another word.
+  for (const glyph of result.glyphs) {
+    if (visiting.has(glyph.stream)) continue;
+    visiting.add(glyph.stream);
+    collectRuns(
+      file,
+      glyph.resources ?? resources,
+      file.streamData(glyph.stream),
+      glyph.ctm,
+      depth + 1,
+      visiting,
+      out,
+      shown,
+    );
+    visiting.delete(glyph.stream);
+  }
+  if (!resources) return;
+  const xobjects = file.get(resources, 'XObject');
+  if (!(xobjects instanceof Map)) return;
+  for (const placement of result.images) {
+    const stream = file.resolve(xobjects.get(placement.name) ?? PDF_NULL);
+    if (!(stream instanceof PdfStream) || visiting.has(stream)) continue;
+    // §8.11.3.1 — a form the file's own configuration turns off shows no text.
+    if (hiddenXObject(file, stream)) continue;
+    const sub = file.get(stream.dict, 'Subtype');
+    if (!(sub instanceof PdfName) || sub.value !== 'Form') continue;
+    visiting.add(stream);
+    const formRes = file.get(stream.dict, 'Resources');
+    collectRuns(
+      file,
+      formRes instanceof Map ? formRes : resources,
+      file.streamData(stream),
+      multiply(matrixOf(file, stream.dict), placement.ctm),
+      depth + 1,
+      visiting,
+      out,
+      shown,
+    );
+    visiting.delete(stream);
+  }
+}
+
+/**
+ * §8.6.6.2 — a run whose glyphs the page fills with a tiling PATTERN, given the
+ * pattern's own colour.
+ *
+ * A pattern is a content stream, not a colour, and type cannot be filled with
+ * one here: what a run carries is a single colour. Painting it in whatever was
+ * set before the pattern was is simply wrong — it comes out black where the
+ * page shows magenta. The pattern's first mark says what colour the page meant,
+ * and the glyphs take that. A documented approximation: the shape of the
+ * pattern is lost, its colour is not.
+ *
+ * @param file      The owning file.
+ * @param resources The resources the run was drawn with.
+ * @param run       The run, which may name a fill pattern.
+ * @param visiting  The streams already being interpreted, against a cycle.
+ * @returns The run, its colour taken from the pattern where there is one.
+ */
+function withPatternColour(
+  file: PdfFile,
+  resources: PdfDict | undefined,
+  run: TextRun,
+  visiting: Set<PdfStream>,
+): TextRun {
+  const name = run.fillPatternName;
+  if (name === undefined || !resources) return run;
+  const patterns = file.get(resources, 'Pattern');
+  if (!(patterns instanceof Map)) return run;
+  const stream = file.resolve(patterns.get(name) ?? PDF_NULL);
+  if (!(stream instanceof PdfStream) || visiting.has(stream)) return run;
+  visiting.add(stream);
+  try {
+    const tint = patternTint(file, resources, name);
+    // The pattern's colour at the pattern's own strength: a tile that covers a
+    // third of its cell reads as a third-strength tint, and painting it solid
+    // is as wrong in the other direction as painting it black was.
+    return tint ? { ...run, colorHex: tintedHex(tint.colorHex, tint.coverage) } : run;
+  } catch {
+    return run; // A pattern the reader cannot run says nothing about colour.
+  } finally {
+    visiting.delete(stream);
+  }
+}
+
+/**
+ * The `/Font` resources of one dictionary, built into interpreter fonts. Shared
+ * with the path and picture walks, which need them for one thing only: a Type 3
+ * font's glyphs are content streams (§9.6.5), and a walk that interprets with
+ * no fonts at all cannot see that there is anything to run.
+ *
+ * @param file      The owning file.
+ * @param resources The resource dictionary to read `/Font` from.
+ * @returns Resource name → font, skipping any the reader cannot build.
+ */
+export function buildFonts(
+  file: PdfFile,
+  resources: PdfDict | undefined,
+): Map<string, ContentFont> {
+  const fonts = new Map<string, ContentFont>();
+  if (!resources) return fonts;
+  const fontContainer = file.get(resources, 'Font');
+  if (!(fontContainer instanceof Map)) return fonts;
+  for (const [fontName, fontRef] of fontContainer) {
+    const fontDict = file.resolve(fontRef);
+    if (fontDict instanceof Map) {
+      try {
+        fonts.set(fontName, buildContentFont(file, fontDict));
+      } catch {
+        // A malformed font is skipped — its text falls back to Latin-1.
+      }
+    }
+  }
+  return fonts;
+}
+
+function matrixOf(file: PdfFile, dict: PdfDict): Matrix {
+  const m = file.resolve(dict.get('Matrix') ?? PDF_NULL);
+  if (Array.isArray(m) && m.length >= 6 && m.every((v) => typeof v === 'number')) {
+    return [m[0], m[1], m[2], m[3], m[4], m[5]] as Matrix;
+  }
+  return IDENTITY;
+}
+
+interface LinkRect {
+  readonly rect: Rectangle; // [x0, y0, x1, y1], normalised
+  readonly href: string;
+}
+
+// §12.5.6.5 — /Link annotations with a §12.6.4.7 URI action. Internal GoTo links
+// (named destinations) are skipped: the reconstruction has no page anchors.
+function collectLinks(file: PdfFile, page: PdfPage): Array<LinkRect> {
+  const annots = file.get(page.dict, 'Annots');
+  if (!Array.isArray(annots)) return [];
+  const out: Array<LinkRect> = [];
+  for (const a of annots) {
+    const annot = file.resolve(a);
+    if (!(annot instanceof Map)) continue;
+    const sub = file.get(annot, 'Subtype');
+    if (!(sub instanceof PdfName) || sub.value !== 'Link') continue;
+    const rect = normRect(file.get(annot, 'Rect'));
+    if (!rect) continue;
+    const action = file.get(annot, 'A');
+    if (!(action instanceof Map)) continue;
+    const s = file.get(action, 'S');
+    if (!(s instanceof PdfName) || s.value !== 'URI') continue;
+    const uri = file.get(action, 'URI');
+    if (typeof uri === 'string' && uri.length > 0) out.push({ rect, href: uri });
+  }
+  return out;
+}
+
+function normRect(v: unknown): Rectangle | undefined {
+  if (!Array.isArray(v) || v.length < 4) return undefined;
+  const n = v.slice(0, 4).map((x) => (typeof x === 'number' ? x : NaN));
+  if (n.some((x) => !Number.isFinite(x))) return undefined;
+  return [
+    Math.min(n[0]!, n[2]!),
+    Math.min(n[1]!, n[3]!),
+    Math.max(n[0]!, n[2]!),
+    Math.max(n[1]!, n[3]!),
+  ];
+}
+
+// A run's glyph origin (baseline) lies within the rect (small tolerances absorb
+// the baseline-to-rect-bottom gap).
+function inRect(x: number, y: number, r: Rectangle): boolean {
+  return x >= r[0] - 1 && x <= r[2] + 1 && y >= r[1] - 2 && y <= r[3] + 2;
+}

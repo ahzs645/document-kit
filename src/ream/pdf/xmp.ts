@@ -1,0 +1,166 @@
+// XMP metadata packet (ISO 16684-1 / Adobe XMP) for the document /Metadata
+// stream. PDF/A-1 requires document-level XMP carrying the PDF/A identifier
+// (pdfaid:part + pdfaid:conformance) and that the standard properties agree
+// with the /Info dictionary.
+
+/** The document metadata projected into an XMP packet by {@link buildXmpPacket}. */
+export interface XmpInput {
+  readonly title?: string;
+  readonly author?: string;
+  readonly subject?: string;
+  readonly keywords?: string;
+  /** Application that created the doc (`xmp:CreatorTool`). */
+  readonly creator?: string;
+  readonly producer?: string;
+  readonly createDate?: Date;
+  readonly modifyDate?: Date;
+  /**
+   * PDF/A identifier: part 1 (ISO 19005-1) / 2 / 3; conformance level
+   * `'A'` (tagged) / `'B'` (visual) / `'U'` (Unicode — parts 2/3 only).
+   */
+  readonly pdfaPart?: '1' | '2' | '3';
+  /** PDF/UA identification (ISO 14289-1) — `pdfuaid:part`. */
+  readonly pdfuaPart?: '1';
+  readonly pdfaConformance?: 'A' | 'B' | 'U';
+}
+
+function escapeXml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// XMP dates are ISO 8601. We emit UTC with a 'Z' suffix for determinism.
+function xmpDate(d: Date): string {
+  const pad = (n: number, w = 2) => String(n).padStart(w, '0');
+  return (
+    `${pad(d.getUTCFullYear(), 4)}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}` +
+    `T${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}Z`
+  );
+}
+
+/**
+ * Build an XMP metadata packet (ISO 16684-1) for the document `/Metadata`
+ * stream, emitting only the sections the supplied {@link XmpInput} populates
+ * (PDF/A and PDF/UA identifiers, Dublin Core, XMP basic, Adobe PDF). For PDF/A
+ * the standard properties must agree with the `/Info` dictionary.
+ *
+ * @param input The metadata to project.
+ * @returns The UTF-8 encoded XMP packet bytes.
+ */
+export function buildXmpPacket(input: XmpInput): Uint8Array {
+  const props: Array<string> = [];
+
+  // pdfaid (PDF/A identification) — required for PDF/A.
+  if (input.pdfaPart) {
+    props.push(
+      `      <rdf:Description rdf:about="" xmlns:pdfaid="http://www.aiim.org/pdfa/ns/id/">`,
+      `        <pdfaid:part>${input.pdfaPart}</pdfaid:part>`,
+      `        <pdfaid:conformance>${input.pdfaConformance ?? 'B'}</pdfaid:conformance>`,
+      `      </rdf:Description>`,
+    );
+  }
+  // PDF/UA identification (ISO 14289-1 §5).
+  if (input.pdfuaPart) {
+    props.push(
+      `      <rdf:Description rdf:about="" xmlns:pdfuaid="http://www.aiim.org/pdfua/ns/id/">`,
+      `        <pdfuaid:part>${input.pdfuaPart}</pdfuaid:part>`,
+      `      </rdf:Description>`,
+    );
+    // PDF/A treats pdfuaid as a non-predefined schema: when both identifiers
+    // share the packet, declare it via the PDF/A extension-schema mechanism
+    // (ISO 19005-2 §6.6.2.3.1; boilerplate from ISO 14289-1 §5 / TechNote 0009).
+    if (input.pdfaPart) {
+      props.push(
+        `      <rdf:Description rdf:about="" xmlns:pdfaExtension="http://www.aiim.org/pdfa/ns/extension/" xmlns:pdfaSchema="http://www.aiim.org/pdfa/ns/schema#" xmlns:pdfaProperty="http://www.aiim.org/pdfa/ns/property#">`,
+        `        <pdfaExtension:schemas>`,
+        `          <rdf:Bag>`,
+        `            <rdf:li rdf:parseType="Resource">`,
+        `              <pdfaSchema:namespaceURI>http://www.aiim.org/pdfua/ns/id/</pdfaSchema:namespaceURI>`,
+        `              <pdfaSchema:prefix>pdfuaid</pdfaSchema:prefix>`,
+        `              <pdfaSchema:schema>PDF/UA identification schema</pdfaSchema:schema>`,
+        `              <pdfaSchema:property>`,
+        `                <rdf:Seq>`,
+        `                  <rdf:li rdf:parseType="Resource">`,
+        `                    <pdfaProperty:category>internal</pdfaProperty:category>`,
+        `                    <pdfaProperty:description>PDF/UA version identifier</pdfaProperty:description>`,
+        `                    <pdfaProperty:name>part</pdfaProperty:name>`,
+        `                    <pdfaProperty:valueType>Integer</pdfaProperty:valueType>`,
+        `                  </rdf:li>`,
+        `                </rdf:Seq>`,
+        `              </pdfaSchema:property>`,
+        `            </rdf:li>`,
+        `          </rdf:Bag>`,
+        `        </pdfaExtension:schemas>`,
+        `      </rdf:Description>`,
+      );
+    }
+  }
+
+  // Dublin Core.
+  const dc: Array<string> = [];
+  if (input.title) {
+    dc.push(
+      `        <dc:title><rdf:Alt><rdf:li xml:lang="x-default">${escapeXml(input.title)}</rdf:li></rdf:Alt></dc:title>`,
+    );
+  }
+  if (input.author) {
+    dc.push(
+      `        <dc:creator><rdf:Seq><rdf:li>${escapeXml(input.author)}</rdf:li></rdf:Seq></dc:creator>`,
+    );
+  }
+  if (input.subject) {
+    dc.push(
+      `        <dc:description><rdf:Alt><rdf:li xml:lang="x-default">${escapeXml(input.subject)}</rdf:li></rdf:Alt></dc:description>`,
+    );
+  }
+  if (dc.length > 0) {
+    props.push(
+      `      <rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/">`,
+      ...dc,
+      `      </rdf:Description>`,
+    );
+  }
+
+  // XMP basic.
+  const xmp: Array<string> = [];
+  if (input.creator)
+    xmp.push(`        <xmp:CreatorTool>${escapeXml(input.creator)}</xmp:CreatorTool>`);
+  if (input.createDate)
+    xmp.push(`        <xmp:CreateDate>${xmpDate(input.createDate)}</xmp:CreateDate>`);
+  if (input.modifyDate)
+    xmp.push(`        <xmp:ModifyDate>${xmpDate(input.modifyDate)}</xmp:ModifyDate>`);
+  if (xmp.length > 0) {
+    props.push(
+      `      <rdf:Description rdf:about="" xmlns:xmp="http://ns.adobe.com/xap/1.0/">`,
+      ...xmp,
+      `      </rdf:Description>`,
+    );
+  }
+
+  // Adobe PDF schema (Producer + Keywords).
+  const pdf: Array<string> = [];
+  if (input.producer) pdf.push(`        <pdf:Producer>${escapeXml(input.producer)}</pdf:Producer>`);
+  if (input.keywords) pdf.push(`        <pdf:Keywords>${escapeXml(input.keywords)}</pdf:Keywords>`);
+  if (pdf.length > 0) {
+    props.push(
+      `      <rdf:Description rdf:about="" xmlns:pdf="http://ns.adobe.com/pdf/1.3/">`,
+      ...pdf,
+      `      </rdf:Description>`,
+    );
+  }
+
+  const body = [
+    `<?xpacket begin="\uFEFF" id="W5M0MpCehiHzreSzNTczkc9d"?>`,
+    `<x:xmpmeta xmlns:x="adobe:ns:meta/">`,
+    `  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">`,
+    ...props,
+    `  </rdf:RDF>`,
+    `</x:xmpmeta>`,
+    `<?xpacket end="w"?>`,
+  ].join('\n');
+
+  return new TextEncoder().encode(body);
+}

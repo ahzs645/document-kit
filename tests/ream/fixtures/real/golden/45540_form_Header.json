@@ -1,0 +1,36 @@
+{
+  "file": "45540_form_Header.xlsx",
+  "paperDeclared": true,
+  "libreOffice": {
+    "pages": 4,
+    "pageSizes": [
+      {
+        "widthPt": 595,
+        "heightPt": 842
+      }
+    ],
+    "chars": 2879,
+    "firstLines": [
+      "testdoc test phrase",
+      "testdoc test phrase",
+      "testdoc test phrase",
+      "testdoc test phrase"
+    ]
+  },
+  "ream": {
+    "pages": 4,
+    "pageSizes": [
+      {
+        "widthPt": 595,
+        "heightPt": 842
+      }
+    ],
+    "chars": 2844,
+    "firstLines": [
+      "testdoc test phrase",
+      "testdoc test phrase",
+      "testdoc test phrase",
+      "testdoc test phrase"
+    ]
+  }
+}

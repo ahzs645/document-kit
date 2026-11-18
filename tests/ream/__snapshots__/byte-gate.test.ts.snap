@@ -1,0 +1,65 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`byte gate: images and PDF/A emit paths > images.docx (PDF/A-1a: tagged structure tree) 1`] = `"d3f10afc6db9fc5de7377ca0c7e364f082f1e05e7bc19cea5c6907e5d2618145"`;
+
+exports[`byte gate: images and PDF/A emit paths > images.docx (PDF/A-1b: alpha flattened) 1`] = `"95a7f45f0ab3f03c21345a6ebe41c24f64930965d0cde2b9dc52038020af4686"`;
+
+exports[`byte gate: images and PDF/A emit paths > images.docx (PDF/A-2b: transparency group) 1`] = `"2612d46f89428f54d3afc3a0ba8f4abaacb9d186bd3e8a504b6e4eafd32952df"`;
+
+exports[`byte gate: images and PDF/A emit paths > images.docx (plain: SMask kept) 1`] = `"0a2dd18ab5569b57bf98aecd0ae54eb0bed880fe9ac3df73d440ae309e278121"`;
+
+exports[`byte gate: static fixtures > header-footer.docx 1`] = `"4ac01c1da22d221691c6f5e827ab13693484365dff63f2a3e7346e6dfe141541"`;
+
+exports[`byte gate: static fixtures > list-basic.docx 1`] = `"b1c2b8b3c05029334a932fadfd513f91ae916807e895166fd8e603b3de776aa4"`;
+
+exports[`byte gate: static fixtures > sheet-basic.xlsx 1`] = `"390f1605e9662f54d0b5b10dc47bb5a241f07de87d2bc2f209f07ec92d947641"`;
+
+exports[`byte gate: static fixtures > sheet-fit-scale.xlsx 1`] = `"d401d1ae97f0f30858991a1cc6ae3e440eceea2234c5c637fc3a2e0921e466c0"`;
+
+exports[`byte gate: static fixtures > sheet-formats.xlsx 1`] = `"b6449f4b070bacc5c79e3de2edd64e927b06c54408ab5c1e4d551f60f846bdbf"`;
+
+exports[`byte gate: static fixtures > sheet-print-area.xlsx 1`] = `"3578433179159aa6d7c81abe128ef3b9d6118141343e4cda1b3a8957a60b7580"`;
+
+exports[`byte gate: static fixtures > sheet-print-titles.xlsx 1`] = `"d20c3502bb7b47421caf0d883caf4423d6e5c80d2ad57090af3efff997e5e253"`;
+
+exports[`byte gate: static fixtures > sheet-row-breaks.xlsx 1`] = `"3cdd87abc1f4d034ed470a43b7510a22224c8887047560dac69dcb544c93db60"`;
+
+exports[`byte gate: static fixtures > table-basic.docx 1`] = `"3d7eed38b1a1b5f16d05f2c1a61b3a875d63e5bbb17ec98d15f9d2f0ad9cb2ef"`;
+
+exports[`byte gate: static fixtures > text-basic.docx 1`] = `"33591dd2224fa1d7d531d2379f51429bfe8abc11d114577c7ac376061138bd33"`;
+
+exports[`byte gate: static fixtures > text-justified.docx 1`] = `"86b6815ee063b80603b1615d3548a2d56ddb06b605a8473fe4afafb754dcbfea"`;
+
+exports[`byte gate: static fixtures > text-styled.docx 1`] = `"e2a54735e04e4c44802f22602da051c4c77ba61da923dfa95a4a1a256143cabc"`;
+
+exports[`byte gate: xlsx feature surface (E-SHEET SA0) > xlsx: cell-styles 1`] = `"89ae3f6445278484f94fe590b3f3514141f3c54b6fc86b0f24cdf3b58d804a30"`;
+
+exports[`byte gate: xlsx feature surface (E-SHEET SA0) > xlsx: centering 1`] = `"8cbb450149ffd4f71bf3a0f9617f32bbd391dc09c9951ab42cd9c57dcaf280ba"`;
+
+exports[`byte gate: xlsx feature surface (E-SHEET SA0) > xlsx: column-bands 1`] = `"de83ae4c8cf197e50a8ed48b65c8f56aa43965b9cd10eddf44daf8e87222a673"`;
+
+exports[`byte gate: xlsx feature surface (E-SHEET SA0) > xlsx: column-breaks 1`] = `"3956773b29b50f8b46641012e3fc849249d33d68182837514dfb2b90c22e4064"`;
+
+exports[`byte gate: xlsx feature surface (E-SHEET SA0) > xlsx: date-1904 1`] = `"670ec849412b2681995b81e447f739892196c7059f94549b4154207aa7fb907c"`;
+
+exports[`byte gate: xlsx feature surface (E-SHEET SA0) > xlsx: fit-to-page 1`] = `"c3039092805d0162b4199546d9e448fc65b74098b64df8371cf536b4045e12ba"`;
+
+exports[`byte gate: xlsx feature surface (E-SHEET SA0) > xlsx: gridlines 1`] = `"0f8cddedb4c05d3afed5686a23c95e2d962b907453c75b0074332371a368676f"`;
+
+exports[`byte gate: xlsx feature surface (E-SHEET SA0) > xlsx: landscape 1`] = `"afd3dccab12b726bc1697bbfce48b6db8fa982085f9254fb165255ae00798dba"`;
+
+exports[`byte gate: xlsx feature surface (E-SHEET SA0) > xlsx: merges 1`] = `"9de2acabee44cea843651d6262f69d691ea7b5eb2859f512b04068f2d0d4bf6f"`;
+
+exports[`byte gate: xlsx feature surface (E-SHEET SA0) > xlsx: multi-sheet 1`] = `"35d1d2458c0ed138465862bb32670879bf900f6b2a3bab9b535c2d6c75c85264"`;
+
+exports[`byte gate: xlsx feature surface (E-SHEET SA0) > xlsx: print-area 1`] = `"0322c2fec7c72be1571ff6516b5f982169354e69c4b58747be201a33bb692940"`;
+
+exports[`byte gate: xlsx feature surface (E-SHEET SA0) > xlsx: print-titles 1`] = `"db03e3284448779f6e1149becd59e2cf23c583af8d0753dbf785a3901b1cd33c"`;
+
+exports[`byte gate: xlsx feature surface (E-SHEET SA0) > xlsx: row-breaks 1`] = `"1fda6c9e87c93cbcd191f6c9432525ff242fd40ba3fd52eca6a71407beaa7055"`;
+
+exports[`byte gate: xlsx feature surface (E-SHEET SA0) > xlsx: scale 1`] = `"748b5fddf0c47cf101bf8d8b78665a085a14e61d5366852d229216ea396d46ca"`;
+
+exports[`byte gate: xlsx feature surface (E-SHEET SA0) > xlsx: sheet-chart 1`] = `"e77278013abd3763ffb743a6468d27d5807f4ae84f96e214fbbec39de4b515c8"`;
+
+exports[`byte gate: xlsx feature surface (E-SHEET SA0) > xlsx: tracks 1`] = `"af6a24c8dc21d43a40dc66d95dbaa6c9b501f601ba6ba12c4ec3ae28621419db"`;

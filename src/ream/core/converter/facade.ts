@@ -1,0 +1,334 @@
+// Conversion facade (ir-design §7): the registry-driven entry point that
+// composes readers → layout → writers. v0 dispatches format detection through
+// reader sniffing and delegates the PDF pipeline to the existing converters
+// (which themselves run on the readers) — so the facade is byte-identical to
+// calling convertDocxToPdf/convertXlsxToPdf directly.
+//
+// The async boundary lives HERE (font fetching); readers/writers stay sync.
+
+import type { ConvertDocxOptions } from '../../word/docx-to-pdf';
+import type { DocumentReader, ReadResult } from '../ir/adapters';
+import type { FlowDoc } from '../ir/flow';
+import type { SheetDoc } from '../ir/sheet';
+import type { FontProvider } from '../fonts/provider';
+import type { Loss, LossReport } from '../ir';
+import type { FontBytesByVariant } from '../font';
+
+import type { ProjectSheetOptions } from '../../excel/sheet-to-flow';
+
+import { ConversionLossError, FEATURES } from '../ir';
+import { projectSheetDoc } from '../../excel/sheet-to-flow';
+import { FontRegistry } from '../font';
+import { chainProviders } from '../fonts/provider';
+import { fetchFontSet } from '../fonts';
+import { flowRenderOptions } from './project';
+import { layoutSheetImages } from './sheet-images';
+import { writeDocx } from '../../word/docx-writer';
+import { writeXlsx } from '../../excel/xlsx-writer';
+import { writeHtml } from '../../html/html-writer';
+import { writeMarkdown } from '../../markdown/markdown-writer';
+import { layoutStyledDocument } from '../../layout/styled-layout';
+import { renderStyledPdf } from '../../pdf';
+import { writeSvg } from '../../svg/svg-writer';
+import { convertDocxToPdf } from '../../word/docx-to-pdf';
+import { convertXlsxToPdf } from '../../excel/xlsx-to-pdf';
+import { docxReader } from '../../word/docx-reader';
+import { docReader } from '../../word/doc/doc-reader';
+import { xlsxReader } from '../../excel/xlsx-reader';
+import { xlsReader } from '../../excel/xls/xls-reader';
+import { pptxReader } from '../../pptx/pptx-reader';
+import { pptReader } from '../../pptx/ppt/ppt-reader';
+import { pdfReader } from '../../pdf-reader/reader';
+
+/** Options for a {@link Converter.convert} call (extends the docx PDF options). */
+export interface ConvertOptions extends ConvertDocxOptions {
+  /**
+   * Target: 'pdf' (default), 'svg' (page-stack preview), 'html'/'md'/'docx'
+   * (flowed), or 'xlsx' (the native grid writer — spreadsheet input only).
+   */
+  readonly to?: 'pdf' | 'svg' | 'html' | 'md' | 'docx' | 'xlsx';
+  /**
+   * Strict mode (handoff v1 §5): throw ConversionLossError on the first
+   * recorded loss instead of returning it in the report.
+   */
+  readonly strict?: boolean;
+  /**
+   * E-SHEET W9 — reference date for conditional-format `timePeriod` rules and
+   * TODAY()/NOW() in `expression` rules (spreadsheet input). An explicit input,
+   * never the wall clock; omitted ⇒ those clock-relative rules no-op.
+   */
+  readonly now?: Date;
+  /**
+   * §18.3.1.34 `&F` — the workbook's file name, for a spreadsheet whose header
+   * or footer prints it. Absent, the code is dropped.
+   */
+  readonly fileName?: string;
+  /**
+   * Font resolution chain (ir-design §8). When set (and no caller `fonts`),
+   * the facade resolves the default font set through these providers — e.g.
+   * [localFontProvider(), remoteFontProvider()] — and reports a 'substituted'
+   * loss when anything below a caller/embedded answer wins. Local Font Access
+   * stays strictly opt-in via this option (it can trigger a permission
+   * prompt), which is why nothing wires it in by default.
+   */
+  readonly fontProviders?: ReadonlyArray<FontProvider>;
+}
+
+/** The output of a conversion: the encoded bytes and the accumulated losses. */
+export interface ConvertResult {
+  /** The encoded output bytes (PDF / SVG / HTML / DOCX / XLSX). */
+  readonly bytes: Uint8Array;
+  /** Every {@link Loss} recorded while reading the source and writing the target. */
+  readonly losses: LossReport;
+}
+
+/**
+ * One of the source IR trees a reader yields. The render path is {@link FlowDoc},
+ * so a {@link SheetDoc} is projected to a FlowDoc at the boundary (E-SHEET SB1);
+ * the discriminant `kind` selects the projection and a FlowDoc passes through.
+ */
+export type SourceDoc = FlowDoc | SheetDoc;
+
+/**
+ * Normalize a {@link SourceDoc} to a {@link FlowDoc}: a {@link SheetDoc} is run
+ * through the print-model projection; a FlowDoc passes through unchanged.
+ *
+ * @param doc     The reader's native tree.
+ * @param options Projection options (e.g. the `now` reference date).
+ * @returns The flow tree the render path consumes.
+ */
+export function toFlowDoc(doc: SourceDoc, options: ProjectSheetOptions = {}): FlowDoc {
+  return doc.kind === 'sheet' ? projectSheetDoc(doc, options) : doc;
+}
+
+function readToFlow(
+  reader: DocumentReader<SourceDoc>,
+  bytes: Uint8Array,
+  options: ProjectSheetOptions = {},
+  placesNothing = false,
+): ReadResult<FlowDoc> {
+  const read = reader.read(bytes);
+  // A medium that places nothing reads a source kept as a page for marks it
+  // drops anyway as the document it is without them (see ReadResult.flowing).
+  const { doc, losses } = (placesNothing ? read.flowing?.() : undefined) ?? read;
+  return { doc: toFlowDoc(doc, options), losses };
+}
+
+/** A registry-driven converter: readers → layout → writers (ir-design §7). */
+export interface Converter {
+  /** The registered readers, in sniffing order. */
+  readonly readers: ReadonlyArray<DocumentReader<SourceDoc>>;
+  /** Detect the input format by reader sniffing; undefined when unknown. */
+  detect: (bytes: Uint8Array) => DocumentReader<SourceDoc> | undefined;
+  /** Read the bytes and convert them to the requested target (default `'pdf'`). */
+  convert: (bytes: Uint8Array, options?: ConvertOptions) => Promise<ConvertResult>;
+}
+
+/** Options for {@link createConverter}. */
+export interface CreateConverterOptions {
+  /** Override / extend the reader registry (defaults to {@link DEFAULT_READERS}). */
+  readonly readers?: ReadonlyArray<DocumentReader<SourceDoc>>;
+}
+
+/** The built-in readers, in sniffing order: docx, doc, xlsx, xls, pptx, ppt, pdf. */
+export const DEFAULT_READERS: ReadonlyArray<DocumentReader<SourceDoc>> = [
+  docxReader,
+  docReader,
+  xlsxReader,
+  xlsReader,
+  pptxReader,
+  pptReader,
+  pdfReader,
+];
+
+/**
+ * Build a {@link Converter} over a reader registry. The async boundary (font
+ * fetching) lives here; readers and writers stay synchronous.
+ *
+ * @param opts Optional reader-registry override.
+ * @returns A converter exposing `readers`, `detect` and `convert`.
+ */
+export function createConverter(opts: CreateConverterOptions = {}): Converter {
+  const readers = opts.readers ?? DEFAULT_READERS;
+
+  const detect = (bytes: Uint8Array): DocumentReader<SourceDoc> | undefined =>
+    readers.find((r) => r.sniff(bytes));
+
+  const convert = async (
+    bytes: Uint8Array,
+    options: ConvertOptions = {},
+  ): Promise<ConvertResult> => {
+    const { to = 'pdf', strict = false, fontProviders, ...rest } = options;
+    const reader = detect(bytes);
+    if (!reader) {
+      throw new Error('Unrecognized input format (no registered reader sniffs these bytes)');
+    }
+    const losses: Array<Loss> = [];
+    if (to === 'docx') {
+      // FlowDoc → docx writer directly: re-serialization, zero I/O.
+      const { doc: flow, losses: readLosses } = readToFlow(
+        reader,
+        bytes,
+        rest.now ? { now: rest.now } : undefined,
+      );
+      losses.push(...readLosses);
+      const out = writeDocx(flow);
+      losses.push(...out.losses);
+      if (strict && losses.length > 0) throw new ConversionLossError(losses[0]!);
+      return { bytes: out.bytes, losses };
+    }
+
+    if (to === 'html') {
+      // FlowDoc → html writer directly: no layout and no fonts — zero I/O. A
+      // workbook is projected for the screen, as Ream.convert does.
+      const { doc: flow, losses: readLosses } = readToFlow(reader, bytes, {
+        ...(rest.now ? { now: rest.now } : {}),
+        screen: true,
+      });
+      losses.push(...readLosses);
+      const html = writeHtml(flow);
+      losses.push(...html.losses);
+      if (strict && losses.length > 0) throw new ConversionLossError(losses[0]!);
+      return { bytes: html.bytes, losses };
+    }
+
+    if (to === 'md') {
+      // FlowDoc → markdown writer directly: the same flow medium as html,
+      // narrower — structure kept, geometry dropped and reported.
+      const { doc: flow, losses: readLosses } = readToFlow(
+        reader,
+        bytes,
+        // Each cell's text in its own column: markdown has no widths for it to
+        // run on over (ProjectSheetOptions.spill).
+        { ...(rest.now ? { now: rest.now } : {}), spill: false },
+        true,
+      );
+      losses.push(...readLosses);
+      const markdown = writeMarkdown(flow);
+      losses.push(...markdown.losses);
+      if (strict && losses.length > 0) throw new ConversionLossError(losses[0]!);
+      return { bytes: markdown.bytes, losses };
+    }
+
+    if (to === 'xlsx') {
+      // SheetDoc → xlsx writer directly (E-SHEET SD1): the writer needs the
+      // native grid, so a flow source (docx) cannot target xlsx. Zero I/O.
+      const { doc, losses: readLosses } = reader.read(bytes);
+      losses.push(...readLosses);
+      if (doc.kind !== 'sheet') {
+        throw new Error("to: 'xlsx' requires a spreadsheet input; a flow document has no grid");
+      }
+      const out = writeXlsx(doc);
+      losses.push(...out.losses);
+      if (strict && losses.length > 0) throw new ConversionLossError(losses[0]!);
+      return { bytes: out.bytes, losses };
+    }
+    let conv = rest;
+    // Resolve the default font set through the provider chain (unless the
+    // caller supplied bytes directly — those always win).
+    if (fontProviders && fontProviders.length > 0 && !rest.fonts && !rest.fontBytes) {
+      const { fonts, loss } = await resolveFontsViaChain(fontProviders);
+      if (fonts) conv = { ...rest, fonts };
+      if (loss) losses.push(loss);
+    }
+    if (to === 'svg') {
+      // FlowDoc → layout → svg writer: the stage-6 pipeline, no PDF involved.
+      const fonts = conv.fonts ?? (conv.fontBytes ? { regular: conv.fontBytes } : undefined);
+      if (!fonts) {
+        throw new Error("to: 'svg' requires options.fonts/fontBytes or fontProviders");
+      }
+      // A workbook is drawn as images of its sheets, as Ream.convert does.
+      const { doc } = reader.read(bytes);
+      const registry = FontRegistry.fromBytes(fonts);
+      const laid =
+        doc.kind === 'sheet'
+          ? layoutSheetImages(doc, { registry }, rest.now ? { now: rest.now } : {})
+          : layoutStyledDocument(doc.body, { registry, ...flowRenderOptions(doc) });
+      const svg = writeSvg(laid);
+      losses.push(...svg.losses);
+      if (strict && losses.length > 0) throw new ConversionLossError(losses[0]!);
+      return { bytes: svg.bytes, losses };
+    }
+    let pdf: Uint8Array;
+    if (reader.id === 'xlsx') {
+      pdf = await convertXlsxToPdf(bytes, conv);
+    } else if (reader.produces === 'sheet') {
+      // Other spreadsheet readers (.xls): project to flow and render through the
+      // shared styled-PDF path; fonts are auto-fetched when the caller gives none.
+      pdf = await renderSheetReaderToPdf(reader, bytes, conv, rest.now);
+    } else {
+      pdf = await convertDocxToPdf(bytes, conv);
+    }
+    if (strict && losses.length > 0) throw new ConversionLossError(losses[0]!);
+    return { bytes: pdf, losses };
+  };
+
+  return { readers, detect, convert };
+}
+
+// Render a sheet-producing reader's projected flow to PDF — the generic path for
+// spreadsheet inputs other than xlsx (i.e. legacy .xls). Fonts are auto-fetched
+// when the caller supplies none; the principal render knobs pass through, while
+// the full converter feature set (signing, encryption, source embedding) stays
+// on the Ream path.
+async function renderSheetReaderToPdf(
+  reader: DocumentReader<SourceDoc>,
+  bytes: Uint8Array,
+  conv: ConvertDocxOptions,
+  now: Date | undefined,
+): Promise<Uint8Array> {
+  const fonts =
+    conv.fonts ??
+    (conv.fontBytes
+      ? { regular: conv.fontBytes }
+      : await fetchFontSet({
+          ...(conv.fontFamily ? { family: conv.fontFamily } : {}),
+          ...(conv.fontFetch ? { fetch: conv.fontFetch } : {}),
+        }));
+  const { doc: flow } = readToFlow(reader, bytes, now ? { now } : undefined);
+  return renderStyledPdf(flow.body, {
+    registry: FontRegistry.fromBytes(fonts),
+    ...flowRenderOptions(flow),
+    ...(conv.pdfA ? { pdfA: conv.pdfA } : {}),
+    ...(conv.info ? { info: conv.info } : {}),
+    ...(conv.section ? { section: conv.section } : {}),
+  });
+}
+
+/**
+ * Resolve the regular/bold/italic/bold-italic variants of the document-default
+ * family through a {@link FontProvider} chain. A `remote` or `local` winner is
+ * reported as a substitution {@link Loss}.
+ *
+ * @param providers The provider chain, highest priority first.
+ * @returns The resolved font bytes (present when the regular variant resolves)
+ *          and an optional substitution loss.
+ */
+export async function resolveFontsViaChain(
+  providers: ReadonlyArray<FontProvider>,
+): Promise<{ fonts?: FontBytesByVariant; loss?: Loss }> {
+  const chain = chainProviders(providers);
+  const ask = (bold: boolean, italic: boolean) => chain.resolve({ bold, italic });
+  const [regular, bold, italic, boldItalic] = await Promise.all([
+    ask(false, false),
+    ask(true, false),
+    ask(false, true),
+    ask(true, true),
+  ]);
+  if (regular.kind !== 'bytes') return {};
+  const fonts: FontBytesByVariant = {
+    regular: regular.bytes,
+    ...(bold.kind === 'bytes' ? { bold: bold.bytes } : {}),
+    ...(italic.kind === 'bytes' ? { italic: italic.bytes } : {}),
+    ...(boldItalic.kind === 'bytes' ? { boldItalic: boldItalic.bytes } : {}),
+  };
+  const loss: Loss | undefined =
+    regular.providerId === 'remote' || regular.providerId === 'local'
+      ? {
+          severity: 'substituted',
+          feature: FEATURES.fontsSubstitution,
+          detail: `document fonts rendered with ${regular.faceName} (provider: ${regular.providerId})`,
+        }
+      : undefined;
+  return { fonts, ...(loss ? { loss } : {}) };
+}

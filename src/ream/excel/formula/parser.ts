@@ -1,0 +1,461 @@
+// Formula parser (E-SHEET W9) — a precedence-climbing (Pratt) parser turning the
+// token stream into an AST. Operator precedence follows ECMA-376 §18.17.2 /
+// Excel: range `:` > unary `-`/`+` > postfix `%` > `^` > `*` `/` > `+` `-` >
+// `&` > comparisons. A "word" token is classified here: a `(` after it makes it
+// a function call; otherwise an A1-shaped word is a cell reference (its `$`
+// anchors recorded per axis for the conditional-format relative shift), TRUE/
+// FALSE a logical literal, anything else a defined name (unsupported → #NAME?).
+
+import type { FErr } from './value';
+import type { Token } from './lexer';
+
+import { tokenize } from './lexer';
+
+/**
+ * One coordinate of a cell reference. `abs` records whether the axis was `$`
+ * anchored — an unanchored axis shifts by the cell's offset from the rule's
+ * origin when a conditional-format expression is evaluated per cell.
+ */
+export interface Axis {
+  /** 0-indexed row or column. */
+  readonly index: number;
+  /** Whether the axis carried a `$` anchor (stays put under the per-cell shift). */
+  readonly abs: boolean;
+}
+
+/** A single-cell reference: its column and row {@link Axis}es. */
+export interface CellRef {
+  readonly col: Axis;
+  readonly row: Axis;
+}
+
+/** A table's part a structured reference names (§18.17.6.4); none named ⇒ `#Data`. */
+export type TableArea = '#All' | '#Data' | '#Headers' | '#Totals' | '#This Row';
+
+/**
+ * §18.17.6.4 — a structured reference: the table (empty for the one the cell
+ * is in), the parts of it, and the columns, first to last (all of them when
+ * undefined). `tblIncome[Amount]` is `{ table: 'tblIncome', areas: [],
+ * columns: ['Amount', 'Amount'] }`.
+ */
+export interface StructuredRef {
+  readonly table: string;
+  readonly areas: ReadonlyArray<TableArea>;
+  readonly columns?: readonly [string, string];
+}
+
+/** The formula syntax tree — a discriminated union over the node kind `k`. */
+export type Ast =
+  | { readonly k: 'num'; readonly v: number }
+  | { readonly k: 'str'; readonly v: string }
+  | { readonly k: 'bool'; readonly v: boolean }
+  | { readonly k: 'err'; readonly v: FErr }
+  | { readonly k: 'cell'; readonly ref: CellRef; readonly sheet?: string }
+  | { readonly k: 'range'; readonly a: CellRef; readonly b: CellRef; readonly sheet?: string }
+  | { readonly k: 'name'; readonly name: string }
+  | { readonly k: 'sref'; readonly ref: StructuredRef }
+  | { readonly k: 'array'; readonly rows: ReadonlyArray<ReadonlyArray<Ast>> }
+  | { readonly k: 'unary'; readonly op: '-' | '+'; readonly x: Ast }
+  | { readonly k: 'pct'; readonly x: Ast }
+  | { readonly k: 'bin'; readonly op: BinOp; readonly a: Ast; readonly b: Ast }
+  | { readonly k: 'call'; readonly name: string; readonly args: ReadonlyArray<Ast> };
+
+/** The binary operators the parser recognises (see {@link Ast} `bin` nodes). */
+export type BinOp = '+' | '-' | '*' | '/' | '^' | '&' | '=' | '<>' | '<' | '>' | '<=' | '>=';
+
+/** Thrown when the token stream is not a well-formed formula. */
+export class ParseError extends Error {}
+
+// Precedence + associativity per binary operator. Higher binds tighter.
+const PREC: Readonly<Record<BinOp, number>> = {
+  '=': 1,
+  '<>': 1,
+  '<': 1,
+  '>': 1,
+  '<=': 1,
+  '>=': 1,
+  '&': 2,
+  '+': 3,
+  '-': 3,
+  '*': 4,
+  '/': 4,
+  '^': 5,
+};
+const RIGHT_ASSOC: ReadonlySet<BinOp> = new Set<BinOp>(['^']);
+
+const MAX_DEPTH = 64;
+const MAX_ARGS = 255;
+
+const CELL_RE = /^(\$?)([A-Za-z]{1,3})(\$?)([0-9]{1,7})$/;
+const MAX_COL = 16383; // XFD
+const MAX_ROW = 1048575;
+
+/**
+ * Parse a formula string into an {@link Ast}. Callers (the CF compiler) catch
+ * the throw and treat a parse failure as "rule does not apply" — a formula using
+ * a construct we do not model never misrenders, it just no-ops.
+ *
+ * @param src The formula source.
+ * @returns The parsed syntax tree.
+ * @throws ParseError on a malformed formula (or {@link LexError} from tokenizing).
+ */
+export function parse(src: string): Ast {
+  const parser = new Parser(tokenize(src));
+  const ast = parser.parseExpr(0);
+  parser.expectEof();
+  return ast;
+}
+
+/** A precedence-climbing (Pratt) parser over a {@link tokenize} token stream. */
+class Parser {
+  private pos = 0;
+  private depth = 0;
+  /** @param toks The token stream to parse (must end with an `eof` token). */
+  constructor(private readonly toks: ReadonlyArray<Token>) {}
+
+  /** The current token without consuming it. */
+  private peek(): Token {
+    return this.toks[this.pos]!;
+  }
+  /** Consume and return the current token. */
+  private next(): Token {
+    return this.toks[this.pos++]!;
+  }
+
+  /** Assert the stream is fully consumed; throws `ParseError` on trailing tokens. */
+  expectEof(): void {
+    if (this.peek().kind !== 'eof') throw new ParseError(`trailing tokens at ${this.pos}`);
+  }
+
+  /**
+   * Parse an expression whose operators bind at least as tightly as `minBp`
+   * (the precedence-climbing entry point).
+   *
+   * @param minBp The minimum binding power; operators below it stop the climb.
+   * @returns The parsed sub-tree.
+   * @throws ParseError when the expression nests past the depth cap or is malformed.
+   */
+  parseExpr(minBp: number): Ast {
+    if (++this.depth > MAX_DEPTH) throw new ParseError('expression too deep');
+    let left = this.parseUnary();
+    for (;;) {
+      const t = this.peek();
+      if (t.kind !== 'op' || !(t.text in PREC)) break;
+      const op = t.text as BinOp;
+      const p = PREC[op];
+      if (p < minBp) break;
+      this.next();
+      const right = this.parseExpr(RIGHT_ASSOC.has(op) ? p : p + 1);
+      left = { k: 'bin', op, a: left, b: right };
+    }
+    this.depth--;
+    return left;
+  }
+
+  /**
+   * Parse a (possibly signed) operand. Unary `+`/`-` bind tighter than `^`
+   * (Excel: `-2^2` = 4), so they live above the binary loop; postfix `%` binds
+   * tighter still.
+   */
+  private parseUnary(): Ast {
+    const t = this.peek();
+    if (t.kind === 'op' && (t.text === '-' || t.text === '+')) {
+      this.next();
+      return { k: 'unary', op: t.text, x: this.parseUnary() };
+    }
+    return this.parsePostfix();
+  }
+
+  /** Parse a primary then fold any trailing postfix `%` percent operators. */
+  private parsePostfix(): Ast {
+    let x = this.parsePrimary();
+    while (this.peek().kind === 'op' && this.peek().text === '%') {
+      this.next();
+      x = { k: 'pct', x };
+    }
+    return x;
+  }
+
+  /**
+   * Parse a primary expression: a literal, a parenthesised sub-expression, an
+   * inline array constant, or a word (classified by `parseWord` /
+   * sheet-qualifier handling).
+   */
+  private parsePrimary(): Ast {
+    const t = this.next();
+    switch (t.kind) {
+      case 'num': {
+        const v = Number(t.text);
+        if (!Number.isFinite(v)) throw new ParseError(`bad number ${t.text}`);
+        return { k: 'num', v };
+      }
+      case 'str':
+        return { k: 'str', v: t.text };
+      case 'err':
+        return { k: 'err', v: t.text as FErr };
+      case 'word':
+        // A word directly before `!` is a sheet qualifier (Sheet2!A1); otherwise
+        // it is classified by parseWord (function / cell / TRUE/FALSE / name).
+        if (this.peek().kind === 'op' && this.peek().text === '!') {
+          this.next();
+          return this.parseSheetCell(t.text);
+        }
+        return this.parseWord(t.text);
+      case 'sheetq':
+        // A 'quoted sheet name' is only valid immediately before `!` and a cell.
+        this.expect('!');
+        return this.parseSheetCell(t.text);
+      case 'sref':
+        return { k: 'sref', ref: parseStructuredRef(t.text) };
+      case 'op':
+        if (t.text === '(') {
+          const e = this.parseExpr(0);
+          this.expect(')');
+          return e;
+        }
+        if (t.text === '{') return this.parseArray();
+        throw new ParseError(`unexpected operator ${t.text}`);
+      case 'eof':
+        throw new ParseError('unexpected end of formula');
+    }
+  }
+
+  /**
+   * Classify a `word` token: a `(` directly after it makes it a function call,
+   * regardless of shape (so `LOG10( … )` is the function, bare `LOG10` is the
+   * cell reference); else an A1-shaped word is a cell ref (extended to a range on
+   * a trailing `:`), `TRUE`/`FALSE` a logical, anything else a defined name.
+   */
+  private parseWord(word: string): Ast {
+    // A `(` directly after the word makes it a function call, regardless of shape
+    // (so LOG10( … ) is the function, bare LOG10 is the cell reference).
+    if (this.peek().kind === 'op' && this.peek().text === '(') {
+      this.next();
+      const args = this.parseArgs();
+      this.expect(')');
+      return { k: 'call', name: word.toUpperCase(), args };
+    }
+    const upper = word.toUpperCase();
+    if (upper === 'TRUE') return { k: 'bool', v: true };
+    if (upper === 'FALSE') return { k: 'bool', v: false };
+    const ref = parseCellRef(word);
+    if (ref) {
+      // A `:` between two cell references forms a range (A1:B3).
+      if (this.peek().kind === 'op' && this.peek().text === ':') {
+        const save = this.pos;
+        this.next();
+        const rhs = this.peek();
+        if (rhs.kind === 'word') {
+          const b = parseCellRef(rhs.text);
+          if (b) {
+            this.next();
+            return { k: 'range', a: ref, b };
+          }
+        }
+        this.pos = save; // not a range after all
+      }
+      return { k: 'cell', ref };
+    }
+    return { k: 'name', name: upper };
+  }
+
+  /**
+   * Parse a sheet-qualified cell or range — the `!` is already consumed; `sheet`
+   * is the (unquoted) sheet name. `Sheet2!A1` or `Sheet2!A1:B3`. The evaluator
+   * resolves the name against the workbook; an unknown sheet becomes `#REF!`.
+   */
+  private parseSheetCell(sheet: string): Ast {
+    const t = this.next();
+    if (t.kind !== 'word') throw new ParseError('expected a cell after !');
+    const a = parseCellRef(t.text);
+    if (!a) throw new ParseError('expected a cell reference after !');
+    if (this.peek().kind === 'op' && this.peek().text === ':') {
+      this.next();
+      const rhs = this.next();
+      if (rhs.kind !== 'word') throw new ParseError('expected a cell after :');
+      const b = parseCellRef(rhs.text);
+      if (!b) throw new ParseError('bad range end after !');
+      return { k: 'range', a, b, sheet };
+    }
+    return { k: 'cell', ref: a, sheet };
+  }
+
+  /**
+   * Parse an inline array constant `{1,2,3}` / `{1,2;3,4}`: rows separated by
+   * `;`, elements by `,`. The opening `{` is already consumed. Elements are
+   * parsed as expressions (so a signed literal like `-1` works) and reduced to
+   * scalars at eval; the element count is capped against a crafted huge array.
+   */
+  private parseArray(): Ast {
+    const rows: Array<Array<Ast>> = [];
+    let row: Array<Ast> = [];
+    let count = 0;
+    for (;;) {
+      row.push(this.parseExpr(0));
+      if (++count > MAX_ARGS) throw new ParseError('array constant too large');
+      const t = this.peek();
+      if (t.kind === 'op' && t.text === ',') {
+        this.next();
+        continue;
+      }
+      if (t.kind === 'op' && t.text === ';') {
+        this.next();
+        rows.push(row);
+        row = [];
+        continue;
+      }
+      break;
+    }
+    rows.push(row);
+    this.expect('}');
+    return { k: 'array', rows };
+  }
+
+  /** Parse a comma-separated function argument list (the `(` already consumed). */
+  private parseArgs(): Array<Ast> {
+    const args: Array<Ast> = [];
+    if (this.peek().kind === 'op' && this.peek().text === ')') return args;
+    for (;;) {
+      args.push(this.parseExpr(0));
+      if (args.length > MAX_ARGS) throw new ParseError('too many arguments');
+      const t = this.peek();
+      if (t.kind === 'op' && t.text === ',') {
+        this.next();
+        continue;
+      }
+      break;
+    }
+    return args;
+  }
+
+  /** Consume the next token, asserting it is the operator `op`. */
+  private expect(op: string): void {
+    const t = this.next();
+    if (t.kind !== 'op' || t.text !== op) throw new ParseError(`expected ${op}`);
+  }
+}
+
+// Classify + decode an A1-shaped word into a CellRef, or undefined if it is not
+// a reference (then the caller treats it as a defined name). Out-of-range column
+// or row also returns undefined (Excel would surface #REF!; we no-op the rule).
+function parseCellRef(word: string): CellRef | undefined {
+  const m = CELL_RE.exec(word);
+  if (!m) return undefined;
+  const colAbs = m[1] === '$';
+  const col = columnToIndex(m[2]!);
+  const rowAbs = m[3] === '$';
+  const row = Number(m[4]) - 1;
+  if (col > MAX_COL || row < 0 || row > MAX_ROW) return undefined;
+  return { col: { index: col, abs: colAbs }, row: { index: row, abs: rowAbs } };
+}
+
+// Column letters → 0-indexed column (A→0, Z→25, AA→26, …).
+function columnToIndex(letters: string): number {
+  let idx = 0;
+  const up = letters.toUpperCase();
+  for (let i = 0; i < up.length; i++) {
+    idx = idx * 26 + (up.charCodeAt(i) - 64); // 'A' = 65
+  }
+  return idx - 1;
+}
+
+const AREAS: ReadonlyMap<string, TableArea> = new Map([
+  ['#all', '#All'],
+  ['#data', '#Data'],
+  ['#headers', '#Headers'],
+  ['#totals', '#Totals'],
+  ['#this row', '#This Row'],
+]);
+
+/**
+ * §18.17.6.4 — read a structured reference's text: `Table[Col]`, `Table[]`,
+ * `Table[#Totals]`, `Table[[#Headers],[A]:[C]]`, `[@Col]`, `[@[Col 2]]`.
+ *
+ * @param text The token: the table's name, if any, and its brackets.
+ * @returns The reference.
+ * @throws ParseError when the brackets name nothing a table has.
+ */
+export function parseStructuredRef(text: string): StructuredRef {
+  const open = text.indexOf('[');
+  const table = text.slice(0, open);
+  let inner = text.slice(open + 1, -1).trim();
+  const areas: Array<TableArea> = [];
+  let columns: [string, string] | undefined;
+  // `@` is `[#This Row],` in short: `[@Amount]`, `[@[Unit Price]]`, `[@]`.
+  if (inner.startsWith('@')) {
+    areas.push('#This Row');
+    inner = inner.slice(1).trim();
+    if (inner.length > 0 && !inner.startsWith('[')) inner = `[${inner}]`;
+  } else if (inner.length > 0 && !inner.startsWith('[')) {
+    // The short form: one part or one column, no brackets of its own.
+    inner = `[${inner}]`;
+  }
+  for (const item of splitTopLevel(inner)) {
+    const range = splitRange(item);
+    if (range) {
+      columns = [unescapeName(range[0]), unescapeName(range[1])];
+      continue;
+    }
+    const body = item.slice(1, -1);
+    const area = AREAS.get(body.trim().toLowerCase());
+    if (area) areas.push(area);
+    else {
+      const name = unescapeName(body);
+      columns = [name, name];
+    }
+  }
+  return { table, areas, ...(columns ? { columns } : {}) };
+}
+
+/** The bracket groups of a list `[a],[b]:[c]`, each with its `:` partner. */
+function splitTopLevel(inner: string): Array<string> {
+  const out: Array<string> = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < inner.length; i++) {
+    const c = inner[i];
+    if (c === "'") {
+      i++;
+      continue;
+    }
+    if (c === '[') depth++;
+    else if (c === ']') depth--;
+    else if (c === ',' && depth === 0) {
+      out.push(inner.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  const last = inner.slice(start).trim();
+  if (last.length > 0) out.push(last);
+  for (const item of out) {
+    if (!item.startsWith('[') || !item.endsWith(']')) {
+      throw new ParseError(`bad structured reference part ${item}`);
+    }
+  }
+  return out;
+}
+
+/** `[A]:[C]` → the two columns' bracketed bodies, or undefined for one group. */
+function splitRange(item: string): [string, string] | undefined {
+  let depth = 0;
+  for (let i = 0; i < item.length; i++) {
+    const c = item[i];
+    if (c === "'") {
+      i++;
+      continue;
+    }
+    if (c === '[') depth++;
+    else if (c === ']') depth--;
+    else if (c === ':' && depth === 0) {
+      const a = item.slice(0, i).trim();
+      const b = item.slice(i + 1).trim();
+      return [a.slice(1, -1), b.slice(1, -1)];
+    }
+  }
+  return undefined;
+}
+
+/** A column name as written in a reference, its `'` escapes undone. */
+function unescapeName(name: string): string {
+  return name.trim().replace(/'(.)/g, '$1');
+}
