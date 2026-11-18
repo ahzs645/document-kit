@@ -59,8 +59,62 @@ Each change is marked in the source with a `document-kit:` comment unless noted.
    them to substitute keys exactly as before (same keys, same order). `document-kit/layout` uses
    the names to report which named family went to which stand-in.
 
+6. **A section's vertical alignment** (`core/document-model/types.ts`
+   `SectionProperties.verticalAlign`; `word/document-parser.ts` `parseSectPrNode`;
+   `word/docx-writer.ts` `sectPrXml`; `layout/styled-layout.ts`
+   `PageAssembler.alignPageVertically`, `lowerItem`). Upstream read no `w:vAlign` (§17.6.23),
+   so a cover page centred in Word was set at the top of the sheet. `center` and `bottom` now
+   lower everything the flow placed on each of the section's pages by half, or all, of the room
+   left under it; bookmark destinations move with their text. The header, footer, notes band
+   and floating drawings stay where they are (a picture anchored to a paragraph does not move
+   with it). `both` (spread over the page) is read but laid out as `top`. A page shared by two
+   sections, a page of several columns and a section whose lines run down the sheet are left
+   as laid out. Pinned by `tests/layout/vertical-align.test.ts`.
+7. **Page-number fields in the body** (`layout/body-fields.ts`, new; `layout/styled-layout.ts`
+   `layoutStyledDocument`, now a loop over the upstream body renamed `layoutStyledOnce`, and
+   `MAX_FIELD_PASSES`; `word/document-parser.ts` `parseFieldInstr`, `synthesizeFieldRun`,
+   `applyFieldFsm`; `Run.field` gains `'PAGEREF'` and `Run.fieldTarget`;
+   `LaidOutPage.pageLabel`; `substitutePageFields` leaves PAGEREF alone). Upstream printed the
+   cached text of every field in the body, so a contents list the `docx` library wrote (whose
+   `PAGEREF _TocN \h` fields cache nothing) had no page numbers, and PAGE or NUMPAGES in body
+   text printed whatever Word last cached. Now PAGEREF (§17.16.5.45) is read with its
+   bookmark (a `\p` PAGEREF, "above/below", keeps its cached text), and a field opened inside
+   another's result keeps its own opening run's properties and link. A document with such a
+   field in its body is laid out with the cached text, the numbers read from the pages (each in
+   its page's numbering format, `pageLabel`), and laid out again with them until a layout prints
+   the numbers it finds, at most four times; if it does not settle, the last layout is kept and
+   a `degraded` `text` loss says the numbers may be a page out. A PAGE field is placed by a
+   bookmark the pass gives its paragraph (removed from the result's bookmarks); a PAGE field in
+   a table cell, and a PAGEREF to a bookmark the layout does not place (in a cell, a header,
+   a text box), keep their cached text. A PAGEREF in a header or footer is filled the same
+   way. A document with no such field is laid out once, exactly as before. Pinned by
+   `tests/layout/fields.test.ts`.
+8. **Table border conflicts** (`core/border-conflict.ts`, new; `layout/styled-layout.ts`
+   `resolveCellBorders`, `heavierBorder`; `layout/page-doc.ts` `paintPlan`;
+   `svg/svg-writer.ts`). Upstream weighed two facing cell borders by width alone, kept the
+   lower or right cell's border on a tie, and gave a neighbour that states no `w:tcBorders` no
+   claim at all. Now §17.4.66's rules decide: a cell's own border before the table's; a side
+   that is none gives way; then width in eighths times the style's number; then the style
+   earlier in the list; then the darker colour (R + B + 2G, then B + 2G, then G). A neighbour
+   with no borders of its own claims the table's inside rule. The paint plan now paints
+   borders lightest first (a stable sort by the same weight), so a heavy border is not cut at
+   its corners by the projecting ends of the thin rules that run into it; and the SVG writer
+   strokes a solid rule with a square cap as the PDF does (ISO 32000-1 §8.4.3.3), so a boxed
+   cell's corners close in the page pictures too. Output changes only where a page has rules of
+   different weights (the byte gate's fixtures are unchanged). Pinned by
+   `tests/layout/table-borders.test.ts`.
+9. **Rows kept with the next** (`layout/styled-layout.ts` `rowKeepsWithNext`,
+   `keptRowsHeight`, `RowLayout.keepNext`, the table pass in `paginateSections`,
+   `keptTogetherHeight`). Upstream ignored `w:keepNext` inside a table. A row now stays on the
+   page of the row after it when every paragraph of its first cell keeps with the next (style
+   included), which is how Word reads it: a run of kept rows that will not fit in the room left
+   but will fit a fresh page, under the repeated header rows, moves to the next page whole. A
+   run taller than a page breaks as before, and a table's last row keeps with nothing. A
+   paragraph kept with a table (a caption) now counts the rows kept with the first, when they
+   fit a page. Pinned by `tests/layout/keep-rows.test.ts`.
+
 Nothing else differs. `diff -r` against the upstream tree, after running the rewrite script
-over a fresh copy, shows only the five changes above.
+over a fresh copy, shows only the nine changes above.
 
 ## Bringing in a newer upstream
 
@@ -70,12 +124,15 @@ over a fresh copy, shows only the five changes above.
    included; skip `corpus/`, `stand/`, `docs/`, `scripts/`). Delete files upstream deleted.
 3. Run `node scripts/rewrite-ream-aliases.mjs`, then `node scripts/rewrite-ream-aliases.mjs
    --check` (exits 1 if an alias import or root-relative fixture path is left).
-4. Re-apply changes 1, 2, 4 and 5 above unless upstream has made them itself (check
+4. Re-apply changes 1, 2 and 4 to 9 above unless upstream has made them itself (check
    `FIXED_MTIME`, a `w:r` split for complex fields, every fallback to the global `fetch` in
-   `core/fonts`, `core/converter` and `excel`, and `familyNamesInFlow`). Search for new uses of
+   `core/fonts`, `core/converter` and `excel`, `familyNamesInFlow`, `w:vAlign`, PAGEREF and
+   body fields, §17.4.66 border conflicts and `w:keepNext` in table rows). Search for
+   `document-kit:` in the old tree to find each place. Search for new uses of
    `fetch`, `XMLHttpRequest` and `node:` in `src/ream` and treat any as change 4.
 5. Check `src/layout` still compiles against the internals it imports (`core/converter/project`,
-   `core/fonts/families`, `core/fonts/remote-fonts`, `core/fonts/scripts`,
+   `core/fonts/families`, `core/fonts/remote-fonts`, `core/fonts/scripts` (`scriptsInFlow`,
+   `companionsInFlow`, `forEachTextInFlow`, `scriptForCodepoint`), `core/font` (`ParsedTtf`),
    `layout/styled-layout`, `pdf/styled-page-emitter`, `pdf/writer`, `svg/svg-writer`,
    `html/html-writer`, `word/docx-reader`, `core/crypto/*`).
 6. `npx tsc -p tsconfig.json --noEmit`, then `npx vitest run tests/ream tests/layout` in the

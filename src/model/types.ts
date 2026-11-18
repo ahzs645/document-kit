@@ -3,7 +3,7 @@
  * (Word here, others later) reads it. Nothing in this file renders, measures or touches the DOM.
  *
  * Units: every length is in points (1/72 inch). Font sizes are points. Picture sizes given in pixels are pixels of
- * the picture itself, read at 96 to the inch. Colours are six hex digits, with or without a leading `#`.
+ * the picture itself, read at 96 to the inch. Colours are hex, `#rrggbb` or `#rgb` in any case, with or without the `#`.
  */
 
 /* ------------------------------------------------------------------ inline text */
@@ -225,7 +225,7 @@ export interface ParagraphBlock extends BlockBase {
   text?: TextStyle
   tabs?: readonly TabStop[]
   borders?: { top?: Border; bottom?: Border; left?: Border; right?: Border }
-  /** Fill behind the paragraph, six hex digits. */
+  /** Fill behind the paragraph, a hex colour. */
   shading?: string
 }
 
@@ -282,12 +282,18 @@ export interface TableCell {
   rowSpan?: number
   align?: Align
   verticalAlign?: VerticalAlign
-  /** Fill, six hex digits. */
+  /** Fill, a hex colour. */
   shading?: string
   text?: TextStyle
   borders?: { top?: Border; bottom?: Border; left?: Border; right?: Border }
   /** A rule corner to corner: `down` top-left to bottom-right, `up` bottom-left to top-right (a struck cell). */
   diagonal?: 'down' | 'up'
+  /**
+   * Turn the cell's text a quarter: `up` reads from the bottom of the cell to the top (Word's bottom-to-top, `btLr`),
+   * `down` from the top to the bottom (`tbRl`). The row grows to the length of the longest line; give the row a
+   * `height` to fix it.
+   */
+  textDirection?: 'up' | 'down'
   source?: string
   /** What the blank is for the to-complete list. */
   what?: string
@@ -313,6 +319,12 @@ export interface TableRow {
   repeat?: boolean
   /** Never break the row across a page. */
   cantSplit?: boolean
+  /**
+   * Keep the row on the same page as the row after it (Word's keep-with-next on the row's paragraphs). Defaults to true
+   * for a `header` row that has a row after it, so a heading row is never left alone at the foot of a page with its
+   * body on the next. False lets a header row part from the rows under it.
+   */
+  keepWithNext?: boolean
   /** Least height, points. */
   height?: number
 }
@@ -347,6 +359,11 @@ export interface TableBlock extends BlockBase {
   cellPadding?: { top?: number; bottom?: number; left?: number; right?: number }
   /** Keep every row whole (no row breaks across a page). */
   cantSplit?: boolean
+  /**
+   * Keep the whole table on one page: every row whole and kept with the next. A table taller than a page still breaks
+   * (Word's rule as well), between rows. A row's own `keepWithNext` or `cantSplit` overrides it for that row.
+   */
+  keepTogether?: boolean
   /** Turn off repeating header rows for this table. */
   repeatHeader?: boolean
   /** Alignment of body cells by column, when a cell does not say. */
@@ -378,6 +395,30 @@ export interface FigureBlock extends BlockBase {
   note?: RichText
   /** Caption above (default below) the picture. */
   captionPosition?: 'above' | 'below'
+  /**
+   * Show part of the picture (Word's crop, `a:srcRect`): the share, 0 to 1, of its width or height cut away at each
+   * edge. `{ top: 0.25, bottom: 0.5 }` shows the band from a quarter to half way down. The part shown is what is fitted
+   * into the box. What is cut away stays in the file, as Word keeps it.
+   */
+  crop?: PictureCrop
+  /** A solid line round the picture, drawn on its edge (Word's picture border). */
+  border?: PictureBorder
+}
+
+/** The share, 0 to 1, of a picture's width (left, right) or height (top, bottom) cut away at each edge. */
+export interface PictureCrop {
+  top?: number
+  right?: number
+  bottom?: number
+  left?: number
+}
+
+/** A solid frame round a picture. Word draws it centred on the picture's edge. */
+export interface PictureBorder {
+  /** Points; half a point when absent. */
+  width?: number
+  /** Hex colour; the body text's colour when absent. */
+  color?: string
 }
 
 export interface FigureGridItem {

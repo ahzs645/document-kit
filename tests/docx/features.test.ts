@@ -47,6 +47,7 @@ import {
 } from '../../src/index'
 import { writeDocx, type WriteDocxOptions } from '../../src/docx/index'
 import { all, makePng, paragraphTexts, readPackage } from './helpers'
+import { hex } from '../../src/docx/units'
 
 const write = async (body: readonly Block[], extra: Omit<Section, 'body'> = {}, options?: WriteDocxOptions) =>
   readPackage(await writeDocx(document([section(body, extra)]), options))
@@ -484,5 +485,28 @@ describe('determinism', () => {
     const a = readPackage(await writeDocx(doc())).document
     const b = readPackage(await writeDocx(doc())).document
     expect(b).toBe(a)
+  })
+})
+
+describe('colours', () => {
+  it('takes six or three hex digits, with or without #, in any case', () => {
+    expect(hex('#035642')).toBe('035642')
+    expect(hex('035642')).toBe('035642')
+    expect(hex('#aBcDeF')).toBe('ABCDEF')
+    expect(hex('#0a3')).toBe('00AA33')
+    expect(hex('fC0')).toBe('FFCC00')
+    expect(hex('  #abc ')).toBe('AABBCC')
+  })
+
+  it('throws on anything else, naming the value', () => {
+    for (const bad of ['red', '#12345', '#1234567', '#ggg', '', 'rgb(1,2,3)', '##abc']) {
+      expect(() => hex(bad)).toThrow(`document-kit: ${JSON.stringify(bad)} is not a hex colour`)
+    }
+  })
+
+  it('writes a short colour in a document as Word’s six digits', async () => {
+    const xml = body((await write([paragraph([{ type: 'text', text: 'x', color: '#c00' }], { shading: 'eee' })])).document)
+    expect(xml).toContain('<w:color w:val="CC0000"/>')
+    expect(xml).toContain('w:fill="EEEEEE"')
   })
 })

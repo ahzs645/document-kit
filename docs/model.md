@@ -8,7 +8,8 @@ tables, its laboratory rules) in its own code and reaches the kit through custom
 ## Units
 
 Every length is in **points** (1/72 inch): margins, indents, spacing, picture boxes, font sizes, border widths.
-A picture's own size is in **pixels**, read at 96 to the inch. Colours are six hex digits, with or without `#`.
+A picture's own size is in **pixels**, read at 96 to the inch. Colours are hex: `#rrggbb` or the short `#rgb`
+(each digit doubled, as in CSS), in any case, with or without the `#`. Anything else throws an error naming the value.
 Column widths in a table are **shares** (any numbers; `[3, 1, 1]` gives the first column three fifths).
 
 ## The document
@@ -32,7 +33,8 @@ A section is a run of pages with one page set-up:
   in points, given portrait.
 - `page.orientation`: `portrait` or `landscape`. The writer turns the paper; you never swap width and height.
 - `page.margins`: `top`, `right`, `bottom`, `left`, and `header` / `footer` (edge to header or footer).
-- `page.verticalAlign`: `center` for a cover page.
+- `page.verticalAlign`: `top` (default), `center` for a cover page, or `bottom`. Written as Word's `w:vAlign`; the
+  layout honours it on every page of the section.
 - `header`, `footer`: lists of blocks. **Left out, a section keeps the header of the section before it** (Word's
   own rule); an empty list means none.
 - `firstPage: { header?, footer? }`: a different first page. A part left out there is empty on that page.
@@ -49,12 +51,12 @@ A section is a run of pages with one page set-up:
 | `paragraph` | Rich text with a style (`normal`, `title`, `subtitle`, `caption`, `note`, `small`), alignment (including justify), spacing before/after/line, indent (left, right, first line, hanging), keep with next, keep lines together, page break before, tab stops (`at: 'end'` is the right edge), borders and shading. |
 | `list` | Bulleted or ordered, nested to any depth; an item may change kind for its children. Real Word numbering; each ordered list counts from its own `start`. |
 | `fields` | Label and value rows, as lines (`Label: value`, optional tab stop) or as a two-column table. A `null` value prints a blank rule. |
-| `table` | Rows with roles: `header` (theme header look, repeated at the top of each page while among the first rows), `group` (shaded band), `note` (one small cell across the table), `spacer` (a short empty row), `body`. Cells span columns and rows (`colSpan`, `rowSpan`, listed as in HTML: a covered cell is not written). Per-cell alignment, vertical alignment, shading, borders, text style, a corner-to-corner rule (`diagonal`, a struck cell), and blocks inside a cell (paragraphs, lists, pictures, nested tables). Column shares, width as a share of the text, table borders, cell padding, text size, a caption above or below, a note under it, rows kept whole. |
-| `figure` | A PNG or JPEG with its pixel size (read from its header when not given), fitted into a box (`fit: { width, height, upscale }`, or `'page'` to fill what the section's page leaves under the caption), a caption, a note, alignment. `image: null` prints a placeholder box with `placeholder` text. |
+| `table` | Rows with roles: `header` (theme header look, repeated at the top of each page while among the first rows), `group` (shaded band), `note` (one small cell across the table), `spacer` (a short empty row), `body`. Cells span columns and rows (`colSpan`, `rowSpan`, listed as in HTML: a covered cell is not written). Per-cell alignment, vertical alignment, shading, borders, text style, a corner-to-corner rule (`diagonal`, a struck cell), text turned a quarter (`textDirection: 'up'` or `'down'`), and blocks inside a cell (paragraphs, lists, pictures, nested tables). Column shares, width as a share of the text, table borders, cell padding, text size, a caption above or below, a note under it, rows kept whole (`cantSplit`), a row kept with the next (`keepWithNext`, on by default for a `header` row with a row after it), the whole table on one page (`keepTogether`). |
+| `figure` | A PNG or JPEG with its pixel size (read from its header when not given), fitted into a box (`fit: { width, height, upscale }`, or `'page'` to fill what the section's page leaves under the caption), a caption, a note, alignment. `crop: { top, right, bottom, left }` shows a band of it (the share, 0 to 1, cut away at each edge; the part shown is what is fitted), and `border: { width, color }` draws a solid frame round it. `image: null` prints a placeholder box with `placeholder` text. |
 | `figureGrid` | Pictures in `columns` columns (one column stacks them), each with a label above or below and a placeholder when missing, under one caption. |
 | `signature` | A label, the signature picture or room to sign by hand, the signing rule with the name under it, and lines under that (`Title`, `Date`), any of which can be blank. |
 | `pageBreak` | The next block starts a new page. Every block also takes `pageBreakBefore`. |
-| `toc` | A table of contents over heading levels 1 to `levels`, filled from the headings when written (page numbers are filled when Word updates the field). |
+| `toc` | A table of contents over heading levels 1 to `levels`, filled from the headings when written. Word fills the page numbers when it updates the field; `document-kit/layout` fills them itself, each in its page's numbering. |
 | `spacer` | Vertical space of an exact height. |
 | `custom` | A block the kit does not know, with a `kind` and the application's `data` (below). |
 
@@ -72,6 +74,19 @@ Every block may carry `id` (the application's own), `source`, and `pending` (see
 - `blank`: a rule to fill by hand, with `what` it is for.
 - `image`: a picture in the line (a logo in a header) at a stated size in points.
 - `sentence`: a template over named slots (below).
+
+## Keeping table rows together
+
+Word keeps a row on the page of the next row when the paragraphs of the row carry keep-with-next, and does not break a
+row that says `cantSplit`. The writer says both that way:
+
+- a row's `keepWithNext: true` puts `w:keepNext` on every paragraph of its cells. A `header` row that has a row after it
+  keeps with it unless it says `keepWithNext: false`, so a heading row is never left alone at the foot of a page.
+  Repeating header rows (`w:tblHeader`) work as before.
+- a table's `keepTogether: true` keeps every row but the last with the next and makes every row `cantSplit`. A table
+  taller than a page still breaks, between rows. A row's own `keepWithNext` or `cantSplit` wins over it.
+
+`document-kit/layout` honours both (see `docs/layout.md`).
 
 ## Theme
 
@@ -217,6 +232,10 @@ always, and the same bytes whenever `created` is given.
 
 - Shapes and vector drawing: a scale bar with an arrow, a mark between matrix cells, an X on a grid, a north arrow.
   The app draws them as a PNG or builds them from table cells. SVG pictures are not written.
+- Tick boxes ☐ ☑ ☒ in text print only where a face that has them is embedded: the bundled stand-ins have none. Draw
+  them as pictures.
+- A picture border other than a solid line (dashed, double): the layout draws a picture's frame solid only. Crop and
+  border are on `figure`; a `figureGrid` item and an inline picture take neither yet.
 - A frame pinned to the foot of the page (the laboratory contact block's `pinBottom`).
 - A label printed inside a picture's corner (the `inset` placement of a figure pair); labels go above or below.
 - A list of figures (the contents' Images list); only headings make a table of contents.

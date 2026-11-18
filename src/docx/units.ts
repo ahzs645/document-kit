@@ -13,11 +13,17 @@ export const pixels = (points: number): number => Math.max(1, Math.round((points
 /** Line height as a multiple, in Word's 240ths. */
 export const lineMultiple = (multiple: number): number => Math.round(multiple * 240)
 
-/** A colour as six upper-case hex digits; throws on anything else, naming it. */
+/**
+ * A colour as Word writes it: six upper-case hex digits. Takes `#rrggbb`, `rrggbb`, `#rgb` or `rgb` in any case (the
+ * short form doubles each digit, as CSS does: `#0a3` is `00AA33`); throws on anything else, naming the value.
+ */
 export function hex(color: string): string {
-  const cleaned = color.trim().replace(/^#/, '')
-  if (!/^[0-9a-fA-F]{6}$/.test(cleaned)) throw new Error(`document-kit: "${color}" is not a six-digit hex colour`)
-  return cleaned.toUpperCase()
+  const cleaned = typeof color === 'string' ? color.trim().replace(/^#/, '') : ''
+  if (/^[0-9a-fA-F]{6}$/.test(cleaned)) return cleaned.toUpperCase()
+  if (/^[0-9a-fA-F]{3}$/.test(cleaned)) return [...cleaned].map((digit) => digit + digit).join('').toUpperCase()
+  throw new Error(
+    `document-kit: ${JSON.stringify(color)} is not a hex colour; write it as #rrggbb or #rgb (the # is optional)`,
+  )
 }
 
 const STYLES = {

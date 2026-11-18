@@ -9,16 +9,20 @@
  * @packageDocumentation
  */
 
-export { docxToHtml, docxToPages, docxToPdf } from './convert';
+export { docxToHtml, docxToPages, docxToPdf, layoutDocx } from './convert';
 export type {
   HtmlResult,
+  LaidOutDocx,
+  LayoutDocxOptions,
   LayoutLoss,
   LayoutOptions,
   PagedOptions,
   PageSize,
   PagesResult,
+  PagesWriteOptions,
   PdfOptions,
   PdfResult,
+  PdfWriteOptions,
 } from './convert';
 export { STAND_IN_FILES, STAND_IN_NAMES, createFontProvider, standInFor } from './fonts';
 export type {

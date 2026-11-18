@@ -11,6 +11,7 @@
 // numbers — they are not page-frame coordinates.
 
 import type { BorderStyle, ImageCrop, PictureOutline, ShapeShadow } from '../core/document-model';
+import { borderPaintRank } from '../core/border-conflict';
 import type { Pt, ResourceId, ResourceStore } from '../core/ir';
 import type { FontMeasure, ParsedTtf } from '../core/font';
 import type { ResolvedParagraphProperties, ResolvedRunProperties } from '../core/style-cascade';
@@ -620,11 +621,17 @@ export function paintPlan(commands: ReadonlyArray<PageItem>): PagePaintPlan {
         assertNeverPageItem(c);
     }
   }
+  // document-kit: §17.4.66 — the rule a conflict shows is painted over the
+  // lighter ones that run into it, so their projecting ends do not cut it.
+  // A stable sort: rules of one rank keep the order they were laid out in.
+  const ranked = borders.some((b, i) => i > 0 && borderPaintRank(b) < borderPaintRank(borders[i - 1]!))
+    ? [...borders].sort((a, b) => borderPaintRank(a) - borderPaintRank(b))
+    : borders;
   return {
     behind,
     fills,
     images,
-    borders,
+    borders: ranked,
     shapes,
     lines,
     pictures: [...pictures.values()],
@@ -790,4 +797,10 @@ export interface LaidOutPage {
   readonly commands: Array<PageItem>;
   readonly width: Pt;
   readonly height: Pt;
+  /**
+   * document-kit: the number a PAGE field prints on this page, in its
+   * section's numbering format (§17.6.12): "iv" on front matter numbered in
+   * roman. Absent on pages the Word layout did not make.
+   */
+  readonly pageLabel?: string;
 }

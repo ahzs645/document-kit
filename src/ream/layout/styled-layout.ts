@@ -102,7 +102,7 @@ import type { StructNode, StructType } from '../pdf/struct-tree';
 import type { MetaPicture } from '../core/metafile/picture';
 import type { Sheet } from './turned-section';
 import { pageItemBounds } from './page-doc';
-import { ResourceStore, halfPtToPt, pt } from '../core/ir';
+import { FEATURES, ResourceStore, halfPtToPt, pt } from '../core/ir';
 import { headingLevelOf } from '../core/outline';
 import { hasCombiningMark, isCombiningMark } from '../core/font/mark-shaper';
 import {
@@ -151,6 +151,16 @@ import {
 import { StructTreeBuilder } from '../pdf/struct-tree';
 import { floatIntoFrame, turnOntoSheet } from './turned-section';
 import { undrawnLoss } from './undrawn';
+import { type EdgeClaim, edgeWinner } from '../core/border-conflict';
+import {
+  fillFields,
+  fillHeaderFooterRefs,
+  hasLayoutFields,
+  isPageFieldMark,
+  markPageFields,
+  printedKey,
+  readFieldValues,
+} from './body-fields';
 
 /**
  * PDF/A conformance string: part 1 (ISO 19005-1, PDF 1.4) / 2 (ISO 19005-2) / 3
@@ -880,6 +890,11 @@ interface RowLayout {
    */
   readonly cantSplit?: boolean;
   /**
+   * document-kit: §17.3.1.14 — the row stays on the page of the row after it
+   * (its first cell's paragraphs keep with the next; see rowKeepsWithNext).
+   */
+  readonly keepNext?: boolean;
+  /**
    * §17.4.38 — the room the row gives its top border, and (the table's last
    * row) its bottom one, where the document is set as Word sets it (see
    * {@link withBorderBands}). The borders are drawn down the middle of it.
@@ -1367,7 +1382,70 @@ interface NotePlan {
  * @param options The resolved fonts, styles, section model, and PDF-output toggles.
  * @returns The positioned pages plus the PDF-only {@link PdfLayoutAux} companion.
  */
+/**
+ * document-kit: how many times a document with page-number fields in its body
+ * is laid out at most. Each pass prints the numbers the one before found; the
+ * numbers can move a line (a "9" becoming "10" in a contents entry), and so
+ * a page break. Two passes settle an ordinary contents list.
+ */
+export const MAX_FIELD_PASSES = 4;
+
+/**
+ * Lay a document out and paginate it.
+ *
+ * document-kit: a PAGE, NUMPAGES or PAGEREF field in the BODY prints numbers
+ * only pagination knows (./body-fields). Such a document is laid out with the
+ * fields' cached text, the numbers read from the pages, and laid out again
+ * with them, until a layout prints the numbers it finds, at most
+ * {@link MAX_FIELD_PASSES} times. A document that does not settle by then
+ * keeps the last layout, whose numbers are the pass before's and may be a
+ * page out, and says so in `options.losses`. A document with no such field is
+ * laid out once, as before.
+ */
 export function layoutStyledDocument(
+  body: ReadonlyArray<BodyElement>,
+  options: StyledRenderOptions,
+): LaidOutPdfDocument {
+  if (!hasLayoutFields(body, options.headersFooters)) return layoutStyledOnce(body, options);
+  const marked = markPageFields(body).body;
+  let passBody: ReadonlyArray<BodyElement> = marked;
+  let passBands = options.headersFooters;
+  for (let pass = 1; ; pass++) {
+    const passLosses: Array<Loss> = [];
+    const laid = layoutStyledOnce(passBody, {
+      ...options,
+      ...(passBands ? { headersFooters: passBands } : {}),
+      ...(options.losses ? { losses: passLosses } : {}),
+    });
+    const values = readFieldValues(laid.pages, laid.pdf.bookmarks);
+    const nextBody = fillFields(marked, values);
+    const nextBands = options.headersFooters
+      ? fillHeaderFooterRefs(options.headersFooters, values)
+      : undefined;
+    const settled = printedKey(nextBody, nextBands) === printedKey(passBody, passBands);
+    if (settled || pass >= MAX_FIELD_PASSES) {
+      options.losses?.push(...passLosses);
+      if (!settled) {
+        options.losses?.push({
+          severity: 'degraded',
+          feature: FEATURES.text,
+          detail:
+            `page numbers in fields (a contents list, PAGEREF, PAGE or NUMPAGES) did not settle ` +
+            `after ${String(MAX_FIELD_PASSES)} layouts: filling them in kept moving the text, ` +
+            'so some may be a page out',
+        });
+      }
+      const bookmarks = new Map(
+        [...laid.pdf.bookmarks].filter(([name]) => !isPageFieldMark(name)),
+      );
+      return { ...laid, pdf: { ...laid.pdf, bookmarks } };
+    }
+    passBody = nextBody;
+    passBands = nextBands;
+  }
+}
+
+function layoutStyledOnce(
   body: ReadonlyArray<BodyElement>,
   options: StyledRenderOptions,
 ): LaidOutPdfDocument {
@@ -2235,7 +2313,7 @@ function substitutePageFields(
       paragraph: {
         ...el.paragraph,
         runs: el.paragraph.runs.map((r) =>
-          r.field === undefined
+          r.field === undefined || r.field === 'PAGEREF'
             ? r
             : { ...r, text: r.field === 'PAGE' ? pageText : String(totalPages) },
         ),
@@ -7978,6 +8056,40 @@ function withMergedShading(table: Table, roles: ReadonlyArray<ReadonlyArray<Merg
   return changed ? { ...table, rows } : table;
 }
 
+/**
+ * document-kit: §17.3.1.14 `w:keepNext` in a table — a row stays on the page of
+ * the row after it when the paragraphs of its first cell keep with the next,
+ * which is how Word reads it (and how Word writes "keep with next" for the
+ * rows a user selects). The table's last row is never kept with a row.
+ */
+function rowKeepsWithNext(row: Table['rows'][number], options: StyledRenderOptions): boolean {
+  const first = row.cells[0];
+  if (!first) return false;
+  const paragraphs = first.content.filter(
+    (el): el is Extract<BodyElement, { kind: 'paragraph' }> => el.kind === 'paragraph',
+  );
+  return (
+    paragraphs.length > 0 &&
+    paragraphs.every(
+      (el) => resolveParagraphProperties(el.paragraph.properties, options.styles).keepNext,
+    )
+  );
+}
+
+/**
+ * document-kit: the height a run of rows kept together needs, from `from`: the
+ * row itself and, while a row keeps with the next, the one after it — the last
+ * of the run whole, as far as one page holds it.
+ */
+function keptRowsHeight(rows: ReadonlyArray<RowLayout>, from: number, pagePt: number): number {
+  let height = 0;
+  for (let i = from; i < rows.length; i++) {
+    height += Math.min(rows[i]!.heightPt, pagePt);
+    if (!rows[i]!.keepNext) break;
+  }
+  return height;
+}
+
 function layoutTableBlock(
   table: Table,
   options: StyledRenderOptions,
@@ -8021,13 +8133,15 @@ function layoutTableBlock(
     }
     aboveBordersByCol = nextAbove;
     const rp = table.rows[r]!.properties;
+    const keepNext = r < table.rows.length - 1 && rowKeepsWithNext(table.rows[r]!, options);
     rows.push(
-      rp.isHeader || rp.pageBreakBefore || rp.sheetTopPt !== undefined
+      rp.isHeader || rp.pageBreakBefore || rp.sheetTopPt !== undefined || keepNext
         ? {
             ...rl,
             ...(rp.isHeader ? { isHeader: true } : {}),
             ...(rp.pageBreakBefore ? { breakBefore: true } : {}),
             ...(rp.sheetTopPt !== undefined ? { sheetTopPt: rp.sheetTopPt } : {}),
+            ...(keepNext ? { keepNext: true } : {}),
           }
         : rl,
     );
@@ -8930,36 +9044,18 @@ function layoutTableCell(
 // would split the merge group — middle/end cells lose their top, start/middle
 // cells lose their bottom. Span cells use colStart/colEnd to decide first/last
 // column status so a right border still snaps to the last spanned column.
-// Style precedence for breaking a same-width border conflict (CSS border-collapse
-// / §17.4 ordering): a heavier line style wins.
-const BORDER_STYLE_RANK: Readonly<Record<BorderStyle, number>> = {
-  double: 5,
-  thick: 4,
-  single: 3,
-  dashed: 2,
-  dashSmallGap: 2,
-  dashDot: 2,
-  dashDotDot: 2,
-  dotted: 1,
-  none: 0,
-};
-
-// Effective weight of a border for conflict resolution: its width in points
-// point (default 4 = ½pt), or 0 when absent / explicitly 'none'.
+// document-kit: ECMA-376 Part 1 §17.4.66 (`w:tcBorders`) — the conflict rules
+// for an edge two cells share, with no cell spacing. The rules are kept in
+// ./border-conflict; `heavierBorder` is the cell-against-cell case.
+// The room a border takes: its width in points (default ½pt), or 0 when
+// absent / explicitly 'none'.
 function borderWeight(b: Border | undefined): number {
   if (!b || b.style === 'none') return 0;
   return b.width ?? 0.5;
 }
 
-// §17.4 — the winner of a shared cell edge: the heavier border, ties broken by
-// style precedence. A side with weight 0 (absent or 'none') loses to any real
-// border; if both are empty the edge stays unbordered.
 function heavierBorder(a: Border | undefined, b: Border | undefined): Border | undefined {
-  const wa = borderWeight(a);
-  const wb = borderWeight(b);
-  if (wa !== wb) return wa > wb ? a : b;
-  if (wa === 0) return undefined;
-  return BORDER_STYLE_RANK[a!.style] >= BORDER_STYLE_RANK[b!.style] ? a : b;
+  return edgeWinner({ border: a, fromCell: true }, { border: b, fromCell: true });
 }
 
 function resolveCellBorders(
@@ -8987,14 +9083,29 @@ function resolveCellBorders(
     cellBorders?.bottom ?? (isLastRow ? tableBorders?.bottom : tableBorders?.insideH);
   const ownLeft = cellBorders?.left ?? (isFirstCol ? tableBorders?.left : tableBorders?.insideV);
   const ownRight = cellBorders?.right ?? (isLastCol ? tableBorders?.right : tableBorders?.insideV);
-  // §17.4 border-conflict resolution: an INTERNAL edge is shared by two cells and
-  // drawn once (we draw it on the lower/right cell's top/left side). The two
-  // facing borders compete — the heavier wins (§17.4.* table border conflict).
-  // The neighbour's facing border also inherits the table's insideH/insideV.
-  const aboveBottom = aboveNeighbor ? (aboveNeighbor.bottom ?? tableBorders?.insideH) : undefined;
-  const leftRight = leftNeighbor ? (leftNeighbor.right ?? tableBorders?.insideV) : undefined;
-  const top = isFirstRow ? ownTop : heavierBorder(ownTop, aboveBottom);
-  const left = isFirstCol ? ownLeft : heavierBorder(ownLeft, leftRight);
+  // §17.4.66 border-conflict resolution: an INTERNAL edge is shared by two cells
+  // and drawn once (we draw it on the lower/right cell's top/left side). The two
+  // facing borders compete by the standard's rules (./border-conflict): a
+  // cell's own border before the table's, then the heavier, then the style
+  // earlier in the list, then the darker. The neighbour's facing border also
+  // inherits the table's insideH/insideV.
+  // document-kit: weighed by width alone, a light border a cell states lost to
+  // a heavier table rule; and a neighbour that states no borders of its own
+  // claimed nothing, where it inherits the table's inside rule like any other.
+  const facing = (own: Border | undefined, inherited: Border | undefined): EdgeClaim =>
+    own !== undefined ? { border: own, fromCell: true } : { border: inherited, fromCell: false };
+  const top = isFirstRow
+    ? ownTop
+    : edgeWinner(
+        facing(cellBorders?.top, tableBorders?.insideH),
+        facing(aboveNeighbor?.bottom, tableBorders?.insideH),
+      );
+  const left = isFirstCol
+    ? ownLeft
+    : edgeWinner(
+        facing(cellBorders?.left, tableBorders?.insideV),
+        facing(leftNeighbor?.right, tableBorders?.insideV),
+      );
   const bottom = ownBottom;
   const right = ownRight;
   const suppressTop = mergeRole === 'middle' || mergeRole === 'end';
@@ -9789,6 +9900,7 @@ class PageAssembler {
     const sheet = this.ctx.sheet;
     const onSheet = (items: ReadonlyArray<PageItem>): ReadonlyArray<PageItem> =>
       sheet ? items.map((item) => turnOntoSheet(item, sheet.width)) : items;
+    this.alignPageVertically();
     this.pages.push({
       commands: [
         // §17.2.1 — the page background is under everything, paper and all.
@@ -9807,6 +9919,7 @@ class PageAssembler {
       ],
       width: pt(sheet?.width ?? this.ctx.pageWidth),
       height: pt(sheet?.height ?? this.ctx.pageHeight),
+      pageLabel: pageText,
     });
     this.current = [];
     this.floatsBehind = [];
@@ -9878,6 +9991,35 @@ class PageAssembler {
 
   /** The section context the CURRENT page began in (see {@link columnSeparatorItems}). */
   pageStartCtx: SectionRenderCtx;
+
+  /**
+   * document-kit: §17.6.23 `w:vAlign` — set the page's body text in the middle
+   * of the room between its margins (`center`) or at its foot (`bottom`), by
+   * lowering everything the flow placed on it, line numbers included, by the
+   * room left under it (half of it, centred). The header, the footer, the
+   * notes band and drawings anchored to the page stay where they are, and so
+   * do floats: a picture anchored to a paragraph does not move with it.
+   * Bookmark destinations on the page move with their text. `both` (spread
+   * over the page) is laid out as `top`. A page shared by two sections (a
+   * `continuous` break), a page of several columns and a section whose lines
+   * run down the sheet are left as laid out.
+   */
+  private alignPageVertically(): void {
+    const how = this.ctx.properties.verticalAlign;
+    if (how !== 'center' && how !== 'bottom') return;
+    if (this.pageStartCtx !== this.ctx || this.ctx.columns || this.ctx.sheet) return;
+    if (this.current.length === 0) return;
+    const room = this.cursorY - this.bottomLimit();
+    if (room <= 0) return;
+    const dy = how === 'center' ? room / 2 : room;
+    this.current = this.current.map((item) => lowerItem(item, dy));
+    if (this.bookmarkPositions) {
+      const pageIdx = this.pages.length;
+      for (const [name, at] of this.bookmarkPositions) {
+        if (at.pageIdx === pageIdx) this.bookmarkPositions.set(name, { ...at, yTopPt: at.yTopPt - dy });
+      }
+    }
+  }
 
   /**
    * §17.6.10 `w:pgBorders` — the rules around the page. `@w:offsetFrom` says
@@ -10201,6 +10343,9 @@ function keptTogetherHeight(
   end: number,
   // Whether paragraph spacing stacks as Word stacks it (see SpacingStack).
   collapse = false,
+  // document-kit: the height of the column's page, which rows kept together
+  // with a table's first must fit in to be counted.
+  pagePt = Number.POSITIVE_INFINITY,
 ): number | undefined {
   const first = blocks[from];
   if (first?.kind !== 'paragraph') return undefined;
@@ -10239,7 +10384,13 @@ function keptTogetherHeight(
         height += computeLineHeight(line, next.resolved);
       }
     } else if (next?.kind === 'table' && !next.float) {
-      height += current.spacingAfterPt + (next.rows[0]?.heightPt ?? 0);
+      // document-kit: the table's first row and the rows kept with it, when
+      // they fit a page with what comes before them; otherwise the first row.
+      const firstRow = next.rows[0]?.heightPt ?? 0;
+      const keptRows = next.rows.length > 0 ? keptRowsHeight(next.rows, 0, pagePt) : 0;
+      height +=
+        current.spacingAfterPt +
+        (height + current.spacingAfterPt + keptRows <= pagePt ? keptRows : firstRow);
     } else if (next?.kind === 'image' && !next.float) {
       height += current.spacingAfterPt + next.heightPt;
     }
@@ -10422,7 +10573,13 @@ function paginateSections(
       // page would hold it all, and break it there. It moves the way a first
       // line that runs past the foot does, its space before spent here. Not
       // beside a float, whose exclusions shape lines the count cannot foresee.
-      const kept = keptTogetherHeight(blocks, blockIdx, asm.ctx.endIndex, typesetByWord);
+      const kept = keptTogetherHeight(
+        blocks,
+        blockIdx,
+        asm.ctx.endIndex,
+        typesetByWord,
+        asm.ctx.pageContentHeight,
+      );
       if (
         kept !== undefined &&
         columnInUse &&
@@ -10917,7 +11074,21 @@ function paginateSections(
           const forcedBreak =
             ci === 0 && row.breakBefore && (ri === 0 || !isLeadingHeader) && asm.pageHasContent();
           const overflow = asm.cursorY - chunk.heightPt < asm.bottomLimit() && asm.colHasContent();
-          if (forcedBreak || overflow) {
+          // document-kit: §17.3.1.14 — a row kept with the next goes to the next
+          // page with it when the two (and the rows they keep with) will not
+          // fit here but will on a fresh page, under the repeated header rows:
+          // a header row is never left at the foot of a page with its body on
+          // the next, and a table kept together is not split.
+          const keptHeight =
+            ci === 0 && row.keepNext && chunks.length === 1
+              ? keptRowsHeight(block.rows, ri, asm.ctx.pageContentHeight)
+              : 0;
+          const keepBreak =
+            keptHeight > 0 &&
+            asm.cursorY - keptHeight < asm.bottomLimit() &&
+            asm.colHasContent() &&
+            keptHeight + (isLeadingHeader ? 0 : headerHeightPt) <= asm.ctx.pageContentHeight;
+          if (forcedBreak || overflow || keepBreak) {
             sheetView?.show(asm);
             if (forcedBreak) asm.flushPage();
             else asm.advanceColumn();
@@ -10988,7 +11159,17 @@ function paginateSections(
               next.breakBefore && ri + 1 >= headerRows.length && asm.current.length > 0;
             const nextOverflow =
               asm.cursorY - nextHeight < asm.bottomLimit() && asm.colHasContent();
-            if (nextForced || nextOverflow) {
+            // document-kit: …and where the next row moves to keep with its own next.
+            const nextKept = next.keepNext
+              ? keptRowsHeight(block.rows, ri + 1, asm.ctx.pageContentHeight)
+              : 0;
+            const nextKeepBreak =
+              nextKept > 0 &&
+              asm.cursorY - nextKept < asm.bottomLimit() &&
+              asm.colHasContent() &&
+              nextKept + (ri + 1 < headerRows.length ? 0 : headerHeightPt) <=
+                asm.ctx.pageContentHeight;
+            if (nextForced || nextOverflow || nextKeepBreak) {
               emitRowBottomEdge(asm.current, chunk, tableX, asm.cursorY, asm.ctx.pageHeight);
             }
           }
@@ -11016,6 +11197,67 @@ function paginateSections(
   }
   for (const page of asm.pages) coalesceVerticalFills(page.commands);
   return asm.pages;
+}
+
+/**
+ * document-kit: a page item moved `dy` points down the page (top-left frame),
+ * with everything that goes with it: its clip, its window, a warped line's
+ * boxes, a picture's clip path and a shape's matrix.
+ */
+function lowerItem(item: PageItem, dy: number): PageItem {
+  const window = item.window ? { window: { ...item.window, y: pt(item.window.y + dy) } } : {};
+  switch (item.type) {
+    case 'line':
+      return {
+        ...item,
+        ...window,
+        baselineY: pt(item.baselineY + dy),
+        ...(item.clip ? { clip: { ...item.clip, y: pt(item.clip.y + dy) } } : {}),
+        ...(item.warp
+          ? {
+              warp: {
+                ...item.warp,
+                boxY: pt(item.warp.boxY + dy),
+                srcTop: pt(item.warp.srcTop + dy),
+              },
+            }
+          : {}),
+      };
+    case 'image': {
+      const clip = item.clip;
+      return {
+        ...item,
+        ...window,
+        y: pt(item.y + dy),
+        ...(clip
+          ? {
+              clip: {
+                paths: clip.paths,
+                transform: [
+                  clip.transform[0],
+                  clip.transform[1],
+                  clip.transform[2],
+                  clip.transform[3],
+                  clip.transform[4],
+                  clip.transform[5] + dy,
+                ] as const,
+              },
+            }
+          : {}),
+      };
+    }
+    case 'shape': {
+      const m = item.shape.transform;
+      return {
+        ...item,
+        ...window,
+        shape: { ...item.shape, transform: [m[0], m[1], m[2], m[3], m[4], m[5] + dy] },
+      };
+    }
+    case 'border':
+    case 'fill':
+      return { ...item, ...window, y: pt(item.y + dy) };
+  }
 }
 
 // Join a column of same-coloured cell fills into one rectangle.

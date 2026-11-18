@@ -2429,6 +2429,11 @@ function sectPrXml(s: SectionProperties, hf: HeaderFooterRefs): string {
     parts.push(`<w:pgNumType${fmt}${start}/>`);
   }
   if (s.columns) parts.push(colsXml(s.columns));
+  // document-kit: §17.6.23 — the page's vertical alignment, between the
+  // columns and the title-page toggle as CT_SectPr orders them.
+  if (s.verticalAlign !== undefined && s.verticalAlign !== 'top') {
+    parts.push(`<w:vAlign w:val="${s.verticalAlign}"/>`);
+  }
   if (s.titlePg) parts.push('<w:titlePg/>');
   // §17.6.20 — which way the lines run, after the title-page toggle as
   // CT_SectPr orders them.

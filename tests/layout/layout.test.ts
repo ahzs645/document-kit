@@ -85,6 +85,22 @@ describe('docxToPdf', () => {
     expect(new Set(asked.map((f) => f.split('-')[0]))).toEqual(new Set(['Arimo', 'Tinos']));
   });
 
+  it('names no symbol loss for symbols the supplied faces draw', async () => {
+    const docx = await sampleDocx({ rows: 3, extra: [{ text: 'Trend ▼ ► ■ ↑ made up' }] });
+    const { losses } = await docxToPdf(docx, { fonts });
+    expect(losses.filter((l) => /symbol/i.test(l.detail))).toEqual([]);
+    expect(losses.filter((l) => l.severity === 'dropped')).toEqual([]);
+  });
+
+  it('still names symbols no supplied face has, by code point', async () => {
+    const docx = await sampleDocx({ rows: 3, extra: [{ text: 'Done ☐ ▼' }] });
+    const { losses } = await docxToPdf(docx, { fonts });
+    const loss = losses.find((l) => /symbol text/.test(l.detail));
+    expect(loss?.severity).toBe('degraded');
+    expect(loss?.detail).toContain('U+2610');
+    expect(loss?.detail).not.toContain('U+25BC');
+  });
+
   it('refuses a document it has no fonts for', async () => {
     await expect(docxToPdf(await sampleDocx({ rows: 3 }))).rejects.toThrow(/No fonts/);
   });

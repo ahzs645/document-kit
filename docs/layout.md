@@ -7,7 +7,7 @@ with fonts the caller hands in. It is a small front over the reamkit engine (`sr
 ## API
 
 ```ts
-import { createFontProvider, docxToPdf, docxToPages, docxToHtml } from 'document-kit/layout';
+import { createFontProvider, docxToPdf, docxToPages, docxToHtml, layoutDocx } from 'document-kit/layout';
 
 const fonts = createFontProvider(async ({ file }) =>
   new Uint8Array(await (await fetch(`${base}/fonts/${file}`)).arrayBuffer()),
@@ -16,13 +16,26 @@ const fonts = createFontProvider(async ({ file }) =>
 const { bytes, pageCount, losses } = await docxToPdf(docx, { fonts });
 const { pages, pageSizes, pageText } = await docxToPages(docx, { fonts });
 const { html } = await docxToHtml(docx);
+
+// Preview and export from one layout:
+const laid = await layoutDocx(docx, { fonts });
+const preview = laid.toPages();      // same as docxToPages
+const pdf = laid.toPdf({ info });    // same as docxToPdf, without laying out again
 ```
+
+- `layoutDocx(docx, { fonts?, password?, pdfA?, tagged? })` → `Promise<LaidOutDocx>`: the file
+  laid out once. `LaidOutDocx` has `pageCount`, `pageSizes`, `pageText`, `losses` (what reading
+  and laying out recorded), and two writers that reuse the layout, each callable any number of
+  times: `toPdf({ info? })` → `PdfResult` and `toPages({ sharedGlyphs? })` → `PagesResult`.
+  `pdfA` and `tagged` are layout options because the accessible PDF/A levels and a tagged PDF
+  need the structure tree the layout builds; they change nothing on the pages. `docxToPdf` and
+  `docxToPages` are `layoutDocx` followed by one writer, and write the same bytes as before.
 
 - `docxToPdf(docx, { fonts?, password?, info?, pdfA?, tagged? })` →
   `Promise<{ bytes, pageCount, losses }>`. `info` (title, author, …) is laid over the Word
   file's own properties; `pdfA` is a level such as `'PDF/A-2b'`; `tagged` writes a tagged PDF.
-- `docxToPages(docx, { fonts?, password? })` →
-  `Promise<{ pages, pageSizes, pageText, losses }>`. The same layout the PDF gets.
+- `docxToPages(docx, { fonts?, password?, sharedGlyphs? })` →
+  `Promise<{ pages, pageSizes, pageText, losses, glyphDefs? }>`. The same layout the PDF gets.
   - `pages[i]` is a standalone SVG document for page *i*, drawn by the engine's SVG writer one
     page at a time. Text is drawn from the faces' own glyph outlines (`<path>` definitions and
     `<use>`), so a page shows the same in any viewer with no fonts installed, and there is no
@@ -32,6 +45,15 @@ const { html } = await docxToHtml(docx);
     each other's glyphs (the engine numbers them from zero on every page). The page sits on a white
     rectangle with a light grey outline (the engine's preview style). Size is in points:
     `width`/`height`/`viewBox` are the page in pt.
+  - `sharedGlyphs: true` is for an application that puts every page inline in ONE HTML
+    document: the glyph outlines are taken out of the pages and put once in `glyphDefs`, a
+    hidden `<svg>` of `<defs>` (ids `dk-g1`, `dk-g2`, …) that the pages refer to. Place
+    `glyphDefs` anywhere in the same document (it takes no room); a page without it draws no
+    text. Each page keeps its own clips and pictures. An outline is known by its shape, so the
+    same glyph on two pages is defined once. The saving is the outlines only: each drawn glyph
+    is still one `<use>` on its page, which is most of a page's size. On the test sample it is
+    about a sixth at two pages and a quarter at twelve. Off by default: each page stays a
+    standalone picture.
   - `pageSizes[i]` is `{ widthPt, heightPt }`.
   - `pageText[i]` is the text of the page's laid-out lines, one per `\n`, in layout order (use it
     for search and checks). Text inside charts and drawn shapes is not included.
@@ -50,7 +72,8 @@ const { html } = await docxToHtml(docx);
 
 Types exported: `FontProvider`, `FontLoader`, `FontFileBytes`, `StandInFamily`, `StandInFile`,
 `FaceStyle`, `ProvidedFamily`, `LayoutOptions`, `PagedOptions`, `PdfOptions`, `PdfResult`,
-`PagesResult`, `PageSize`, `HtmlResult`, `LayoutLoss`, `DocumentInfo`, `PdfALevel`.
+`PagesResult`, `PagesWriteOptions`, `PageSize`, `HtmlResult`, `LayoutLoss`, `LayoutDocxOptions`,
+`LaidOutDocx`, `PdfWriteOptions`, `DocumentInfo`, `PdfALevel`.
 
 ## The font rule
 
@@ -99,8 +122,37 @@ losses of its own:
   another of the family's faces, thickened or slanted by the layout.
 - `degraded`: Greek or Cyrillic in Cambria text wants Noto Serif, which is not bundled.
 - `degraded`: the document has Japanese/Korean/Chinese/Arabic/Hebrew/Thai/Indic or symbol text
-  and no face for that script is bundled. Hebrew, Greek and Cyrillic letters the bundled faces
-  happen to carry are still drawn; others come out as empty boxes (and a `dropped` `text` loss).
+  that no supplied face draws, named by code point (`… symbol text that no supplied face draws
+  (U+2610) …`). Only characters missing from every face supplied (and every embedded face) are
+  named: Arimo draws ▼ ► ■ ↑, so a document with only those has no such loss. The missing ones
+  come out as empty boxes (and a `dropped` `text` loss names them per page).
+- `degraded` `text`: page numbers in body fields did not settle (see below).
+
+## What the layout does with a Word file's page set-up and fields
+
+- **Vertical alignment of a section** (`w:vAlign`, the model's `page.verticalAlign`): `center`
+  sets the text of each of the section's pages in the middle of the room between the margins,
+  `bottom` at its foot. The header, the footer and floating drawings stay where they are.
+  `both` (spread over the page) is laid out as `top`. A page shared by two sections, a page of
+  several columns and a section turned on its side are left at the top.
+- **Page numbers in the body.** A contents list's `PAGEREF` fields print the page their heading
+  lands on, in that page's numbering (`iv` on a page numbered in roman). `PAGE` in body text
+  prints the page its paragraph starts on, `NUMPAGES` the page count. These numbers only
+  pagination knows, so a document with such a field is laid out, the numbers read from the
+  pages, and laid out again with them, until a layout prints what it finds: two layouts for an
+  ordinary contents list (one if the file's cached numbers are already right), at most four.
+  If filling the numbers keeps moving the text (a "9" becoming "10" pushing a line over), the
+  fourth layout is kept, its numbers may be a page out, and a `degraded` loss says so. Not
+  filled: a `PAGE` field in a table cell, a `PAGEREF` to a bookmark in a table cell, a text box
+  or a header, and a `PAGEREF \p` ("above"/"below"); they print the file's cached text.
+- **Table borders.** Where two cells share an edge, the border shown follows ECMA-376
+  §17.4.66: a cell's own border before the table's, a side with none gives way, then the
+  heavier (width × the style's number), then the earlier style, then the darker colour. Heavier
+  rules are painted over lighter ones, so a thick border keeps its corners.
+- **Rows kept together.** A row whose first cell's paragraphs keep with the next stays on the
+  page of the next row (the model's `keepWithNext`, on by default for header rows, and
+  `keepTogether`); a run of such rows that fits a page moves to the next page whole rather than
+  leave a header row at the foot of a page. A run taller than a page still breaks.
 
 ## Known gaps
 
@@ -110,12 +162,16 @@ losses of its own:
   (say, a licensed Calibri); only the five stand-ins. The engine supports it (`embeddedFonts`);
   the API does not expose it yet.
 - **No scripts beyond Latin, Greek and Cyrillic** in the bundled set (see above).
-- **Two calls lay out twice.** `docxToPdf` and `docxToPages` each run the layout.
+- **Each call lays out.** `docxToPdf` and `docxToPages` each run the layout; use
+  `layoutDocx` to write both from one. A document with page-number fields in its body is laid
+  out two to four times inside that one call (see above).
 - **Bundle size.** The engine is large: `dist/layout.js` is small but imports a shared chunk of
   about 1.5 MB unminified (about 440 kB gzipped) that also holds readers this API does not use
   (the build cannot split them out because `document-kit/ream` shares it).
-- **SVG pages have no text layer** and repeat glyph outlines per page; `pageText` stands in for
-  search.
+- **SVG pages have no text layer**; `pageText` stands in for search. Pages repeat glyph
+  outlines unless `sharedGlyphs` is asked for.
+- **No vector tick boxes.** The bundled faces have no ☐ ☑ ☒; they print as empty boxes with a
+  loss. Draw them as pictures, or embed a face that has them.
 - **HTML has no headers, footers or page numbers.**
 - **Fidelity is the engine's.** Stand-ins match widths, not shapes. Layout differences from
   Word in particular documents are the engine's to fix (and record in `docs/ream-upstream.md`).

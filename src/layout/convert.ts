@@ -7,7 +7,7 @@
 // below are the engine's own pipeline (reader → layout → writer), driven
 // directly so the font set can be built from the caller's bytes.
 
-import type { FontRegistry as EngineFontRegistry } from '../ream/core/font';
+import type { FontRegistry as EngineFontRegistry, ParsedTtf } from '../ream/core/font';
 import type { DocumentInfo } from '../ream/core/document-model';
 import type { FamilyKey, SubstituteKey } from '../ream/core/fonts/remote-fonts';
 import type { Loss } from '../ream/core/ir';
@@ -22,7 +22,12 @@ import { WrongPasswordError } from '../ream/core/crypto/password-error';
 import { FontRegistry } from '../ream/core/font';
 import { familyNamesInFlow } from '../ream/core/fonts/families';
 import { resolveFamilyKey } from '../ream/core/fonts/remote-fonts';
-import { companionsInFlow, scriptsInFlow } from '../ream/core/fonts/scripts';
+import {
+  companionsInFlow,
+  forEachTextInFlow,
+  scriptForCodepoint,
+  scriptsInFlow,
+} from '../ream/core/fonts/scripts';
 import { FEATURES } from '../ream/core/ir';
 import { writeHtml } from '../ream/html/html-writer';
 import { layoutStyledDocument } from '../ream/layout/styled-layout';
@@ -71,6 +76,18 @@ export interface PageSize {
   readonly heightPt: number;
 }
 
+/** How {@link LaidOutDocx.toPages} and {@link docxToPages} write the page pictures. */
+export interface PagesWriteOptions {
+  /**
+   * Put the glyph outlines once, in {@link PagesResult.glyphDefs}, and have
+   * every page refer to them, instead of each page carrying its own copy. For
+   * an application that places every page inline in ONE HTML document: the
+   * pages then draw text only where `glyphDefs` is in the same document. Off
+   * by default, which keeps each page a standalone picture.
+   */
+  readonly sharedGlyphs?: boolean;
+}
+
 /** The result of {@link docxToPdf}. */
 export interface PdfResult {
   /** The PDF file. */
@@ -100,6 +117,12 @@ export interface PagesResult {
    * drawn shapes is not included.
    */
   readonly pageText: ReadonlyArray<string>;
+  /**
+   * With `sharedGlyphs`: one hidden `<svg>` holding every glyph outline the
+   * pages draw, each once, to be placed in the same HTML document as the pages
+   * (anywhere; it takes no room). Absent otherwise.
+   */
+  readonly glyphDefs?: string;
   /** What the conversion dropped, degraded or substituted. */
   readonly losses: ReadonlyArray<LayoutLoss>;
 }
@@ -112,6 +135,97 @@ export interface HtmlResult {
   readonly losses: ReadonlyArray<LayoutLoss>;
 }
 
+/** Options for {@link layoutDocx}. */
+export interface LayoutDocxOptions extends PagedOptions {
+  /**
+   * Write the PDF as PDF/A at this level. It is a layout option because the
+   * accessible levels (`…a`) need the structure tree the layout builds.
+   */
+  readonly pdfA?: PdfALevel;
+  /**
+   * Build the structure tree a tagged PDF needs while laying out. It changes
+   * nothing on the pages; only {@link LaidOutDocx.toPdf} uses it.
+   */
+  readonly tagged?: boolean;
+}
+
+/** Options for {@link LaidOutDocx.toPdf}. */
+export interface PdfWriteOptions {
+  /** Document properties for the PDF, laid over the Word file's own. */
+  readonly info?: DocumentInfo;
+}
+
+/**
+ * A Word file laid out once, ready to be written as a PDF, as page pictures or
+ * both, without laying it out again.
+ */
+export interface LaidOutDocx {
+  /** How many pages the layout made. */
+  readonly pageCount: number;
+  /** Each page's size. */
+  readonly pageSizes: ReadonlyArray<PageSize>;
+  /** The text of each page's lines, one per `\n` (see {@link PagesResult.pageText}). */
+  readonly pageText: ReadonlyArray<string>;
+  /** What reading and laying out the file dropped, degraded or substituted. */
+  readonly losses: ReadonlyArray<LayoutLoss>;
+  /**
+   * Write the layout as a PDF. Can be called more than once; each call writes
+   * the same pages.
+   */
+  toPdf(options?: PdfWriteOptions): PdfResult;
+  /** Draw each page of the layout as an SVG picture. Can be called more than once. */
+  toPages(options?: PagesWriteOptions): PagesResult;
+}
+
+/**
+ * Lay a Word file out once. The result writes the PDF and the page pictures
+ * from that one layout, so an application that previews and then exports pays
+ * for the layout once. {@link docxToPdf} and {@link docxToPages} are this
+ * followed by one writer.
+ *
+ * @param docx    The `.docx` bytes.
+ * @param options Fonts, password, and the PDF settings the layout depends on.
+ * @returns The laid-out document.
+ */
+export async function layoutDocx(
+  docx: Uint8Array,
+  options: LayoutDocxOptions = {},
+): Promise<LaidOutDocx> {
+  const { flow, losses } = readWord(docx, options.password);
+  const render = await renderOptions(flow, options.fonts, losses);
+  const styled: StyledRenderOptions = {
+    ...render,
+    ...(options.pdfA ? { pdfA: options.pdfA } : {}),
+    ...(options.tagged ? { tagged: true } : {}),
+  };
+  const laid = layoutStyledDocument(flow.body, styled);
+  const pageSizes = laid.pages.map((p) => ({ widthPt: p.width, heightPt: p.height }));
+  const pageTexts = laid.pages.map(pageText);
+  const layoutLosses: ReadonlyArray<LayoutLoss> = [...losses];
+  return {
+    pageCount: laid.pages.length,
+    pageSizes,
+    pageText: pageTexts,
+    losses: layoutLosses,
+    toPdf(write: PdfWriteOptions = {}): PdfResult {
+      const info = flow.info || write.info ? { ...flow.info, ...write.info } : undefined;
+      const bytes = emitStyledPdf(laid, { ...styled, ...(info ? { info } : {}) }, new PdfDocument());
+      return { bytes, pageCount: laid.pages.length, losses: [...layoutLosses] };
+    },
+    toPages(write: PagesWriteOptions = {}): PagesResult {
+      const out = [...layoutLosses];
+      const drawn = drawPages(laid, write.sharedGlyphs === true, out);
+      return {
+        pages: drawn.pages,
+        ...(drawn.glyphDefs !== undefined ? { glyphDefs: drawn.glyphDefs } : {}),
+        pageSizes,
+        pageText: pageTexts,
+        losses: out,
+      };
+    },
+  };
+}
+
 /**
  * Lay a Word file out and write it as a PDF.
  *
@@ -120,18 +234,8 @@ export interface HtmlResult {
  * @returns The PDF bytes, its page count and the losses.
  */
 export async function docxToPdf(docx: Uint8Array, options: PdfOptions = {}): Promise<PdfResult> {
-  const { flow, losses } = readWord(docx, options.password);
-  const render = await renderOptions(flow, options.fonts, losses);
-  const info = flow.info || options.info ? { ...flow.info, ...options.info } : undefined;
-  const styled: StyledRenderOptions = {
-    ...render,
-    ...(info ? { info } : {}),
-    ...(options.pdfA ? { pdfA: options.pdfA } : {}),
-    ...(options.tagged ? { tagged: true } : {}),
-  };
-  const laid = layoutStyledDocument(flow.body, styled);
-  const bytes = emitStyledPdf(laid, styled, new PdfDocument());
-  return { bytes, pageCount: laid.pages.length, losses };
+  const laid = await layoutDocx(docx, options);
+  return laid.toPdf(options.info ? { info: options.info } : {});
 }
 
 /**
@@ -139,16 +243,23 @@ export async function docxToPdf(docx: Uint8Array, options: PdfOptions = {}): Pro
  * the PDF gets, for a true-to-print preview.
  *
  * @param docx    The `.docx` bytes.
- * @param options Fonts and password.
+ * @param options Fonts, password, and how the pictures are written.
  * @returns One SVG per page, the page sizes, each page's text and the losses.
  */
 export async function docxToPages(
   docx: Uint8Array,
-  options: PagedOptions = {},
+  options: PagedOptions & PagesWriteOptions = {},
 ): Promise<PagesResult> {
-  const { flow, losses } = readWord(docx, options.password);
-  const render = await renderOptions(flow, options.fonts, losses);
-  const laid = layoutStyledDocument(flow.body, render);
+  const laid = await layoutDocx(docx, options);
+  return laid.toPages(options.sharedGlyphs ? { sharedGlyphs: true } : {});
+}
+
+/** Draw every page of a layout as its own SVG document, ids scoped per page. */
+function drawPages(
+  laid: LaidOutDocument,
+  shared: boolean,
+  losses: Array<LayoutLoss>,
+): { pages: Array<string>; glyphDefs?: string } {
   const decoder = new TextDecoder();
   const pages: Array<string> = [];
   for (const page of laid.pages) {
@@ -157,12 +268,8 @@ export async function docxToPages(
     losses.push(...svg.losses);
     pages.push(scopeIds(decoder.decode(svg.bytes), `dk-p${pages.length + 1}-`));
   }
-  return {
-    pages,
-    pageSizes: laid.pages.map((p) => ({ widthPt: p.width, heightPt: p.height })),
-    pageText: laid.pages.map(pageText),
-    losses,
-  };
+  if (!shared) return { pages };
+  return shareGlyphs(pages);
 }
 
 /**
@@ -314,14 +421,25 @@ async function renderOptions(
         'which document-kit does not bundle; they are drawn from another face on hand, at its own widths',
     });
   }
-  const scripts = new Set([...scriptsInFlow(flow).scripts].map((k) => SCRIPT_NAMES[k] ?? k));
-  for (const script of scripts) {
+  // A script is named only for the characters of it that no face on hand
+  // draws: the engine sends ▼ ■ ↑ to a symbol face it would download, but the
+  // stand-ins draw most of them themselves, and a loss for those misled.
+  const faces = [...registriesByFamily.values(), ...embedded.values()].flatMap(facesOf);
+  const drawn = (cp: number): boolean => faces.some((face) => face.glyphForCodepoint(cp) !== 0);
+  for (const [script, cps] of scriptCharacters(flow)) {
+    const missing = [...cps].filter((cp) => !drawn(cp));
+    if (missing.length === 0) continue;
+    const shown = missing
+      .slice(0, 8)
+      .map((cp) => `U+${cp.toString(16).toUpperCase().padStart(4, '0')}`)
+      .join(', ');
     losses.push({
       severity: 'degraded',
       feature: FEATURES.fontsSubstitution,
       detail:
-        `the document has ${script} text and document-kit bundles no face ` +
-        'for that script; letters no supplied face has are drawn as empty boxes',
+        `the document has ${script} text that no supplied face draws ` +
+        `(${shown}${missing.length > 8 ? ', …' : ''}); document-kit bundles no face for that ` +
+        'script, and those letters are drawn as empty boxes',
     });
   }
 
@@ -331,6 +449,43 @@ async function renderOptions(
     ...(registriesByFamily.size > 0 ? { registriesByFamily } : {}),
     losses,
   };
+}
+
+/** Every face of a registry (the regular one and those of the styles it has). */
+function facesOf(registry: EngineFontRegistry): Array<ParsedTtf> {
+  const out = new Set<ParsedTtf>();
+  for (const [bold, italic] of [
+    [false, false],
+    [true, false],
+    [false, true],
+    [true, true],
+  ] as const) {
+    out.add(registry.resolveByStyle(bold, italic).parsed);
+  }
+  return [...out];
+}
+
+/**
+ * The characters of each script the engine has no bundled face for, by the
+ * script's name in loss messages. Han is named for the face the engine would
+ * draw it with (Japanese, Korean or Chinese, by what else the document holds).
+ */
+function scriptCharacters(flow: FlowDoc): Map<string, Set<number>> {
+  const { hanFace } = scriptsInFlow(flow);
+  const out = new Map<string, Set<number>>();
+  forEachTextInFlow(flow, (text) => {
+    for (const ch of text) {
+      const cp = ch.codePointAt(0) ?? 0;
+      if (cp < 0x0590) continue;
+      const key = scriptForCodepoint(cp, hanFace);
+      if (key === undefined) continue;
+      const name = SCRIPT_NAMES[key] ?? key;
+      let set = out.get(name);
+      if (!set) out.set(name, (set = new Set()));
+      set.add(cp);
+    }
+  });
+  return out;
 }
 
 /** Names for the engine's companion keys, for loss messages. */
@@ -376,6 +531,46 @@ function scopeIds(svg: string, prefix: string): string {
     .replace(/(href="#|url\(#)([^")]+)/g, (m, pre: string, id: string) =>
       ids.has(id) ? `${pre}${prefix}${id}` : m,
     );
+}
+
+/** The id prefix of a glyph outline the shared definitions hold. */
+const SHARED_GLYPH_PREFIX = 'dk-g';
+
+/**
+ * Move the glyph outlines out of every page into one set of definitions. Each
+ * page numbers its glyphs on its own (`dk-p3-g0-36`), so an outline is known
+ * by its path data, which is the glyph's shape in em units whatever the size
+ * it is drawn at: the same shape on two pages becomes one `dk-gN`. A page's
+ * other definitions (clips, gradients, pictures) stay on the page.
+ */
+function shareGlyphs(pages: ReadonlyArray<string>): { pages: Array<string>; glyphDefs: string } {
+  const byPath = new Map<string, string>();
+  const defs: Array<string> = [];
+  const glyphPath = /<path id="(dk-p\d+-g\d+-\d+)" d="([^"]*)"\/>/g;
+  const out = pages.map((page) => {
+    const renamed = new Map<string, string>();
+    const stripped = page.replace(glyphPath, (_whole, id: string, d: string) => {
+      let shared = byPath.get(d);
+      if (shared === undefined) {
+        shared = `${SHARED_GLYPH_PREFIX}${byPath.size + 1}`;
+        byPath.set(d, shared);
+        defs.push(`<path id="${shared}" d="${d}"/>`);
+      }
+      renamed.set(id, shared);
+      return '';
+    });
+    if (renamed.size === 0) return page;
+    return stripped
+      .replace(/<defs><\/defs>/g, '')
+      .replace(/href="#(dk-p\d+-g\d+-\d+)"/g, (whole, id: string) => {
+        const shared = renamed.get(id);
+        return shared === undefined ? whole : `href="#${shared}"`;
+      });
+  });
+  const glyphDefs =
+    '<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" aria-hidden="true" ' +
+    `style="position:absolute;width:0;height:0;overflow:hidden"><defs>${defs.join('')}</defs></svg>`;
+  return { pages: out, glyphDefs };
 }
 
 /** The text of a laid-out page's lines, one per line. */

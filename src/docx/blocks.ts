@@ -22,7 +22,7 @@ import type {
   TocBlock,
 } from '../model/types'
 import type { WriterContext } from './context'
-import { blankChildren, imageRun, inlineChildren } from './inline'
+import { blankChildren, croppedPixels, imageRun, inlineChildren } from './inline'
 import {
   alignment,
   captionParagraph,
@@ -286,9 +286,15 @@ function writeFigure(block: FigureBlock, context: WriterContext, breakBefore: bo
   }
   const breakHere = breakBefore && !captionAbove
   if (block.image) {
-    const info = resolveImage(block.image)
-    const size = fitImage(info, box, box.upscale)
+    const shown = croppedPixels(resolveImage(block.image), block.crop)
+    const size = fitImage(shown, box, box.upscale)
     const alt = block.alt ?? (block.caption ? plainText(block.caption.text) : undefined)
+    const look = compact({
+      crop: block.crop,
+      border: block.border
+        ? { width: block.border.width ?? 0.5, color: block.border.color ?? context.theme.body.color }
+        : undefined,
+    })
     out.push(
       new Paragraph(
         compact({
@@ -296,7 +302,7 @@ function writeFigure(block: FigureBlock, context: WriterContext, breakBefore: bo
           keepNext: (block.caption !== undefined && !captionAbove) || undefined,
           pageBreakBefore: breakHere || undefined,
           spacing: { before: 0, after: 0, line: 240, lineRule: LineRuleType.AUTO },
-          children: [imageRun(block.image, size.width, size.height, alt)],
+          children: [imageRun(block.image, size.width, size.height, alt, look)],
         }),
       ),
     )

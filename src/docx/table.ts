@@ -6,6 +6,7 @@ import {
   TableCell as DocxCell,
   TableLayoutType,
   TableRow as DocxRow,
+  TextDirection,
   VerticalAlignTable,
   VerticalMergeType,
   WidthType,
@@ -155,11 +156,16 @@ export function writeTable(
         : row.height !== undefined
           ? { value: twips(row.height), rule: HeightRule.ATLEAST }
           : undefined
+    // Keep with next is Word's: `w:keepNext` on the paragraphs of the row's cells (the docx library puts it on every
+    // one, the rows it adds under a merged cell too). The last row has no row to keep with.
+    const last = r === table.rows.length - 1
+    const keepNext = row.keepWithNext ?? (!last && (table.keepTogether === true || role === 'header'))
     return new DocxRow(
       compact({
         children: cells,
         tableHeader: r < repeat || undefined,
-        cantSplit: row.cantSplit ?? table.cantSplit ?? undefined,
+        cantSplit: row.cantSplit ?? (table.keepTogether || table.cantSplit) ?? undefined,
+        keepNext: keepNext || undefined,
         height,
       }),
     )
@@ -196,6 +202,12 @@ export function writeTable(
           width: { size: width, type: WidthType.DXA },
           shading: shadingOf(cell),
           verticalAlign: verticalAlign(cell.verticalAlign),
+          textDirection:
+            cell.textDirection === 'up'
+              ? TextDirection.BOTTOM_TO_TOP_LEFT_TO_RIGHT
+              : cell.textDirection === 'down'
+                ? TextDirection.TOP_TO_BOTTOM_RIGHT_TO_LEFT
+                : undefined,
           borders: cellBorders(cell),
         }) as ITableCellOptions,
       )

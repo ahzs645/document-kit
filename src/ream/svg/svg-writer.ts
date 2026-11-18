@@ -143,9 +143,13 @@ function emitLayer(out: Array<string>, commands: ReadonlyArray<PageItem>, ctx: S
             : [x2, yTop, x2, yBottom];
     // §18.18.3's dashed/dotted are line patterns, not weights — the PDF's own.
     const dash = b.borderStyle !== undefined ? BORDER_DASHES.get(b.borderStyle) : undefined;
+    // document-kit: a solid rule ends in a projecting square cap, as the PDF
+    // strokes it (ISO 32000-1 §8.4.3.3 cap style 2), so two rules meeting at a
+    // corner close it; with SVG's default butt cap every boxed cell showed a
+    // notch at each corner the PDF fills.
     out.push(
       `<line x1="${fmt(ax)}" y1="${fmt(ay)}" x2="${fmt(bx)}" y2="${fmt(by)}" stroke="#${b.borderColorHex}" stroke-width="${fmt(b.borderSizePt)}"${
-        dash ? ` stroke-dasharray="${dash.map(fmt).join(' ')}"` : ''
+        dash ? ` stroke-dasharray="${dash.map(fmt).join(' ')}"` : ' stroke-linecap="square"'
       }/>`,
     );
   }

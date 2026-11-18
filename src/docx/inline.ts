@@ -9,7 +9,7 @@ import {
   type ParagraphChild,
 } from 'docx'
 import { resolveImage, resolveSentences } from '../model/index'
-import type { InlineImage, RichText, TextStyle } from '../model/types'
+import type { InlineImage, PictureCrop, RichText, TextStyle } from '../model/types'
 import type { WriterContext } from './context'
 import { halfPoints, hex, pixels } from './units'
 
@@ -80,14 +80,65 @@ function textRuns(text: string, options: IRunOptions): TextRun[] {
   return out
 }
 
-export function imageRun(image: InlineImage['image'], width: number, height: number, alt?: string): ImageRun {
+/** What a picture run may carry beyond its size: a crop (shares cut away at each edge) and a solid frame. */
+export interface PictureLook {
+  crop?: PictureCrop
+  /** A frame of this width (points) and colour (hex). */
+  border?: { width: number; color: string }
+}
+
+export function imageRun(
+  image: InlineImage['image'],
+  width: number,
+  height: number,
+  alt?: string,
+  look: PictureLook = {},
+): ImageRun {
   const info = resolveImage(image)
+  const crop = look.crop
   return new ImageRun({
     type: info.format === 'jpeg' ? 'jpg' : 'png',
     data: image.bytes,
     transformation: { width: pixels(width), height: pixels(height) },
     ...(alt ? { altText: { name: alt, description: alt, title: alt } } : {}),
+    // The docx library takes the crop in percent of each side and writes `a:srcRect` in thousandths of one.
+    ...(crop && Object.values(crop).some((share) => (share ?? 0) > 0)
+      ? {
+          crop: {
+            top: (crop.top ?? 0) * 100,
+            right: (crop.right ?? 0) * 100,
+            bottom: (crop.bottom ?? 0) * 100,
+            left: (crop.left ?? 0) * 100,
+          },
+        }
+      : {}),
+    ...(look.border
+      ? {
+          outline: {
+            type: 'solidFill' as const,
+            solidFillType: 'rgb' as const,
+            value: hex(look.border.color),
+            width: Math.round(look.border.width * EMU_PER_POINT),
+          },
+        }
+      : {}),
   })
+}
+
+const EMU_PER_POINT = 12700
+
+/**
+ * A crop checked and the pixels it leaves: each share in [0, 1), and less than the whole picture cut away across and
+ * down. Throws, naming the crop, on anything else.
+ */
+export function croppedPixels(info: { width: number; height: number }, crop: PictureCrop | undefined) {
+  if (!crop) return { width: info.width, height: info.height }
+  const { top = 0, right = 0, bottom = 0, left = 0 } = crop
+  const ok = [top, right, bottom, left].every((share) => Number.isFinite(share) && share >= 0 && share < 1)
+  if (!ok || left + right >= 1 || top + bottom >= 1) {
+    throw new Error(`document-kit: crop ${JSON.stringify(crop)} must cut away shares from 0 to 1 that leave part of the picture`)
+  }
+  return { width: info.width * (1 - left - right), height: info.height * (1 - top - bottom) }
 }
 
 /**

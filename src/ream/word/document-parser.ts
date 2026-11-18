@@ -436,6 +436,7 @@ function parseSectPrNode(sectPr: PoNode): SectionProperties {
   let pageBorders: SectionProperties['pageBorders'];
   let gridLinePitchPt: Pt | undefined;
   let textDirection: SectionProperties['textDirection'];
+  let verticalAlign: SectionProperties['verticalAlign'];
   const headers: Array<HeaderFooterReference> = [];
   const footers: Array<HeaderFooterReference> = [];
 
@@ -538,6 +539,11 @@ function parseSectPrNode(sectPr: PoNode): SectionProperties {
       // of the one before. `lrTb`, the default, says nothing.
       const val = poAttr(child, 'val');
       if (val === 'tbRl' || val === 'btLr') textDirection = val;
+    } else if (poIs(child, 'w:vAlign')) {
+      // document-kit: §17.6.23 — where the text stands on the section's pages.
+      // A cover page centred in Word came out at the top of the sheet.
+      const val = poAttr(child, 'val');
+      if (val === 'center' || val === 'bottom' || val === 'both') verticalAlign = val;
     }
   }
 
@@ -555,6 +561,7 @@ function parseSectPrNode(sectPr: PoNode): SectionProperties {
     ...(pageBorders ? { pageBorders } : {}),
     ...(gridLinePitchPt !== undefined ? { gridLinePitchPt } : {}),
     ...(textDirection ? { textDirection } : {}),
+    ...(verticalAlign ? { verticalAlign } : {}),
   };
 }
 
@@ -1082,9 +1089,23 @@ function macroButtonText(instr: string): string | undefined {
 // §17.16.5.35 PAGE / §17.16.5.33 NUMPAGES: the instruction's first keyword;
 // switches (\* MERGEFORMAT …) are ignored. Anything else stays a cached
 // result (REF, TOC, DATE, … render their stored text exactly as before).
-function parseFieldInstr(instr: string | undefined): 'PAGE' | 'NUMPAGES' | undefined {
+// document-kit: §17.16.5.45 PAGEREF too, with the bookmark it names. A
+// PAGEREF with `\p` prints "above"/"below"/"on page N" relative to where it
+// stands, which the layout does not work out: it keeps its cached result.
+type PageFieldInstr =
+  | { readonly field: 'PAGE' | 'NUMPAGES' }
+  | { readonly field: 'PAGEREF'; readonly target: string };
+
+function parseFieldInstr(instr: string | undefined): PageFieldInstr | undefined {
   const kw = fieldKeyword(instr);
-  return kw === 'PAGE' ? 'PAGE' : kw === 'NUMPAGES' ? 'NUMPAGES' : undefined;
+  if (kw === 'PAGE' || kw === 'NUMPAGES') return { field: kw };
+  if (kw === 'PAGEREF' && instr !== undefined) {
+    const m = /^\s*PAGEREF\s+(?:"([^"]+)"|([^\s\\]+))(.*)$/isu.exec(instr);
+    const target = m?.[1] ?? m?.[2];
+    if (target === undefined || /\\p\b/iu.test(m?.[3] ?? '')) return undefined;
+    return { field: 'PAGEREF', target };
+  }
+  return undefined;
 }
 
 function fieldKeyword(instr: string | undefined): string | undefined {
@@ -1116,16 +1137,23 @@ const SILENT_FIELDS = new Set([
 // first result run's formatting, any hyperlink carried along.
 function synthesizeFieldRun(
   result: ReadonlyArray<Run>,
-  field: 'PAGE' | 'NUMPAGES',
+  instr: PageFieldInstr,
   href?: string,
+  // document-kit: the properties of the field's opening run, for a field that
+  // caches no result (the `docx` library's contents entries) and so has no
+  // result run to take them from.
+  fieldProperties?: Run['properties'],
 ): Run {
   const first = result[0];
   const linked = href ?? result.find((r) => r.href !== undefined)?.href;
+  const anchor = result.find((r) => r.anchor !== undefined)?.anchor;
   return {
     text: result.map((r) => r.text).join(''),
-    properties: first?.properties ?? {},
-    field,
+    properties: first?.properties ?? fieldProperties ?? {},
+    field: instr.field,
+    ...(instr.field === 'PAGEREF' ? { fieldTarget: instr.target } : {}),
     ...(linked !== undefined ? { href: linked } : {}),
+    ...(anchor !== undefined ? { anchor } : {}),
   };
 }
 
@@ -1174,6 +1202,8 @@ function applyFieldFsm(collected: ReadonlyArray<CollectedRun>): Array<Run> {
     depth: number;
     checkBox?: boolean;
     properties?: Run['properties'];
+    // document-kit: the run that opened the field, for the link it sits in.
+    begin?: Run;
   } | null = null;
   for (const c of collected) {
     if (c.fldChar === 'begin') {
@@ -1183,7 +1213,17 @@ function applyFieldFsm(collected: ReadonlyArray<CollectedRun>): Array<Run> {
           // A new field opening inside a result: flush what we have and track
           // the new one (nested result fields are rare; keep it simple).
           out.push(...st.result);
-          st = { phase: 'instr', instr: '', result: [], depth: 0 };
+          // document-kit: the new field keeps its own opening run, as a field
+          // opened outside a result does (a contents entry's PAGEREF opens
+          // inside the TOC field's result).
+          st = {
+            phase: 'instr',
+            instr: '',
+            result: [],
+            depth: 0,
+            properties: c.run.properties,
+            begin: c.run,
+          };
         }
       } else {
         st = {
@@ -1193,6 +1233,7 @@ function applyFieldFsm(collected: ReadonlyArray<CollectedRun>): Array<Run> {
           depth: 0,
           ...(c.checkBox !== undefined ? { checkBox: c.checkBox } : {}),
           properties: c.run.properties,
+          begin: c.run,
         };
       }
       continue;
@@ -1214,7 +1255,11 @@ function applyFieldFsm(collected: ReadonlyArray<CollectedRun>): Array<Run> {
       const silent = SILENT_FIELDS.has(fieldKeyword(st.instr) ?? '');
       if (silent) {
         // The field shows nothing; its cached result is bookkeeping.
-      } else if (field) out.push(synthesizeFieldRun(st.result, field));
+      } else if (field) {
+        const run = synthesizeFieldRun(st.result, field, st.begin?.href, st.properties);
+        const anchor = run.anchor ?? st.begin?.anchor;
+        out.push(anchor !== undefined ? { ...run, anchor } : run);
+      }
       else if (st.result.length > 0) out.push(...st.result);
       else {
         // §17.16.5.44 MACROBUTTON — the words a reader SEES are in the

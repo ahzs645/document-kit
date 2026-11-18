@@ -536,11 +536,16 @@ export interface Run {
    */
   readonly href?: string;
   /**
-   * §17.16.5.35 PAGE / §17.16.5.33 NUMPAGES — the run is a page-number field;
-   * `text` holds the source's cached result. Header/footer rendering
-   * substitutes the real number per page; body rendering keeps the cache.
+   * §17.16.5.35 PAGE / §17.16.5.33 NUMPAGES / §17.16.5.45 PAGEREF — the run
+   * is a page-number field; `text` holds the source's cached result. The
+   * layout prints the real number: per page in a header or footer, and in the
+   * body (document-kit) the page the field's own paragraph lands on (PAGE),
+   * the page count (NUMPAGES) or the page of the bookmark `fieldTarget` names
+   * (PAGEREF), each in that page's numbering format.
    */
-  readonly field?: 'PAGE' | 'NUMPAGES';
+  readonly field?: 'PAGE' | 'NUMPAGES' | 'PAGEREF';
+  /** §17.16.5.45 — the bookmark a PAGEREF field points at (document-kit). */
+  readonly fieldTarget?: string;
   /**
    * §17.16.22 `w:hyperlink @w:anchor` — internal link target: a bookmark name
    * in this document (never a URL — bypasses the scheme allowlist).
@@ -2127,6 +2132,13 @@ export interface SectionProperties {
    * Absent ⇒ no grid (`w:type="default"`, or none stated).
    */
   readonly gridLinePitchPt?: Pt;
+  /**
+   * §17.6.23 `w:vAlign` — where the text of each of the section's pages
+   * stands between the top and bottom margins: `center` sets a cover page in
+   * the middle of the sheet, `bottom` at its foot, `both` spreads it over the
+   * page (laid out as `top` here). Absent ⇒ top. (document-kit)
+   */
+  readonly verticalAlign?: 'top' | 'center' | 'bottom' | 'both';
 }
 
 /**
