@@ -205,6 +205,7 @@ export const CELL_KEYS: Record<string, Pos> = {
   text: 'any',
   borders: 'any',
   diagonal: 'scalar',
+  padding: 'any',
   textDirection: 'scalar',
   source: 'text',
   what: 'text',

@@ -91,3 +91,35 @@ describe('a table width written as a percentage with its sign', () => {
     expect(signed[0]!.line.availableWidthPt).toBeGreaterThan(0.8 * 468);
   });
 });
+
+describe('a table whose grid is a stand-in', () => {
+  // The `docx` library, given no column widths, writes 100-twip grid columns beside the table's width and the cells'
+  // own widths: here a 6.5-inch table of three columns asking for a half and two quarters.
+  const table = (grid: string) =>
+    buildDocxFromBody(
+      '<w:tbl><w:tblPr><w:tblW w:type="dxa" w:w="9360"/></w:tblPr>' +
+        `<w:tblGrid>${grid}</w:tblGrid><w:tr>` +
+        ['4680', '2340', '2340']
+          .map((w, i) => `<w:tc><w:tcPr><w:tcW w:type="dxa" w:w="${w}"/></w:tcPr><w:p><w:r><w:t>Cell ${i + 1}</w:t></w:r></w:p></w:tc>`)
+          .join('') +
+        '</w:tr></w:tbl><w:sectPr><w:pgSz w:w="12240" w:h="15840"/>' +
+        '<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720"/></w:sectPr>',
+    );
+  const starts = (docx: Uint8Array) =>
+    layOut(docx)
+      .pages[0]!.commands.filter((c): c is TextLineItem => c.type === 'line')
+      .map((line) => Math.round(line.originX));
+
+  it('takes the cells’ widths, as Word does, not equal columns from the grid', () => {
+    const [first, second, third] = starts(table('<w:gridCol w:w="100"/>'.repeat(3)))
+    // A half and two quarters of 468pt: the columns start 234pt and 117pt apart.
+    expect(second! - first!).toBe(234);
+    expect(third! - second!).toBe(117);
+  });
+
+  it('keeps a grid that is the table’s own', () => {
+    const [first, second, third] = starts(table('<w:gridCol w:w="3120"/>'.repeat(3)))
+    expect(second! - first!).toBe(156);
+    expect(third! - second!).toBe(156);
+  });
+});

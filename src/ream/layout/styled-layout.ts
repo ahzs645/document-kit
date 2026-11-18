@@ -8317,7 +8317,12 @@ function computeColumnWidths(
   // layout mode says: fdo59273.docx grids four columns and then spans its four
   // cells across eleven, and the two on the right fell off the table.
   const gridShort = gridColTwips(table).length < colCount;
-  const declared = declaredColumnWidths(table, colCount, contentWidth, gridShort);
+  const declared = declaredColumnWidths(
+    table,
+    colCount,
+    contentWidth,
+    gridShort || gridIsStandIn(table, contentWidth),
+  );
   if (declared) return declared;
 
   if (gridColTwips(table).some((w) => w > 0)) {
@@ -8369,6 +8374,24 @@ function computeColumnWidths(
   }
 
   return colNaturalWidths;
+}
+
+/**
+ * document-kit: a grid that cannot be the one the table was laid out at. The
+ * `docx` library, given no column widths, writes a 100-twip `w:gridCol` for
+ * every column beside a table width (`w:tblW`) and the cells' own widths
+ * (`w:tcW`): a 9360-twip table over a six-column grid of 600. Word sizes such a
+ * table from the cells' widths; scaled up, the grid drew every column the same
+ * width, a narrow label column wrapping each parameter name. A grid less than
+ * half the width the table states is taken as that stand-in, and the cells'
+ * declared widths decide (as for a `fixed` table); with no cell declaring one
+ * the grid still does.
+ */
+function gridIsStandIn(table: Table, contentWidth: number): boolean {
+  const explicit = explicitTableTargetWidth(table, contentWidth);
+  if (explicit === undefined || explicit <= 0) return false;
+  const gridPt = gridColTwips(table).reduce((s, w) => s + w, 0) * TWIP_TO_PT;
+  return gridPt > 0 && gridPt < explicit / 2;
 }
 
 // Recover the integer twips behind a Pt grid column. Grid ratios and sums were

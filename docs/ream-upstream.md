@@ -148,8 +148,18 @@ Each change is marked in the source with a `document-kit:` comment unless noted.
     one word a line. `w:tblW` and `w:tcW` now read both forms. Pinned by
     `tests/layout/pictures-and-cells.test.ts` ("reads \"86%\" as 86 per cent …").
 
+14. **A stand-in grid gives way to the cells' widths** (`layout/styled-layout.ts`, `gridIsStandIn`,
+    marked `document-kit:`). The `docx` library, given no column widths, writes a 100-twip
+    `w:gridCol` per column beside the table's width (`w:tblW`) and each cell's own (`w:tcW`); Word
+    sizes such a table from the cells. Upstream trusts the grid of a table not laid out `fixed`,
+    so the grid, scaled to the table's width, drew every column the same: a results table's
+    parameter column a quarter of its width, every name wrapping. A grid less than half the width
+    the table states is now taken as that stand-in and the cells' declared widths decide, as for a
+    `fixed` table; a table whose cells declare none keeps the grid. Pinned by
+    `tests/layout/pictures-and-cells.test.ts` ("a table whose grid is a stand-in").
+
 Nothing else differs. `diff -r` against the upstream tree, after running the rewrite script
-over a fresh copy, shows only the thirteen changes above.
+over a fresh copy, shows only the fourteen changes above.
 
 ## Bringing in a newer upstream
 
@@ -159,11 +169,11 @@ over a fresh copy, shows only the thirteen changes above.
    included; skip `corpus/`, `stand/`, `docs/`, `scripts/`). Delete files upstream deleted.
 3. Run `node scripts/rewrite-ream-aliases.mjs`, then `node scripts/rewrite-ream-aliases.mjs
    --check` (exits 1 if an alias import or root-relative fixture path is left).
-4. Re-apply changes 1, 2 and 4 to 13 above unless upstream has made them itself (check
+4. Re-apply changes 1, 2 and 4 to 14 above unless upstream has made them itself (check
    `FIXED_MTIME`, a `w:r` split for complex fields, every fallback to the global `fetch` in
    `core/fonts`, `core/converter` and `excel`, `familyNamesInFlow`, `w:vAlign`, PAGEREF and
    body fields, §17.4.66 border conflicts, `w:keepNext` in table rows, and the two foot-frame
-   checks of changes 10 and 11, the no-break hyphen of change 12, percentage widths with their sign of change 13). Search for
+   checks of changes 10 and 11, the no-break hyphen of change 12, percentage widths with their sign of change 13, the stand-in grid of change 14). Search for
    `document-kit:` in the old tree to find each place. Search for new uses of
    `fetch`, `XMLHttpRequest` and `node:` in `src/ream` and treat any as change 4.
 5. Check `src/layout` still compiles against the internals it imports (`core/converter/project`,

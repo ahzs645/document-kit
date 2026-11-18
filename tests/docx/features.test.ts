@@ -510,3 +510,21 @@ describe('colours', () => {
     expect(xml).toContain('w:fill="EEEEEE"')
   })
 })
+
+describe('a rule set off from its text, and a cell with its own padding', () => {
+  it('writes a paragraph border’s distance from the text', async () => {
+    const pkg = await write([
+      paragraph('Made-up letterhead line', { borders: { bottom: { style: 'single', width: 0.75, color: '#0c5a36', space: 6 } } }),
+    ])
+    expect(body(pkg.document)).toMatch(/<w:bottom w:val="single" w:color="0C5A36" w:sz="6" w:space="6"\/>/)
+  })
+
+  it('writes a cell’s own padding over the table’s, and only for that cell', async () => {
+    const pkg = await write([
+      table([row(['Plain', { content: 'Padded note', padding: { top: 3.5, bottom: 3.5 } }])], { cellPadding: { top: 5, bottom: 5, left: 5.5, right: 5.5 } }),
+    ])
+    const cells = body(pkg.document).match(/<w:tc>[\s\S]*?<\/w:tc>/g)!
+    expect(cells[0]).not.toContain('<w:tcMar>')
+    expect(cells[1]).toContain('<w:tcMar><w:top w:type="dxa" w:w="70"/><w:left w:type="dxa" w:w="110"/><w:bottom w:type="dxa" w:w="70"/><w:right w:type="dxa" w:w="110"/></w:tcMar>')
+  })
+})

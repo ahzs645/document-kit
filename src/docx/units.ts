@@ -42,6 +42,6 @@ export function border(value: Border | undefined): IBorderOptions | undefined {
     style,
     size: eighths(value.width ?? 0.5),
     color: value.color ? hex(value.color) : 'auto',
-    space: 0,
+    space: Math.max(0, Math.round(value.space ?? 0)),
   }
 }

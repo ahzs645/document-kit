@@ -172,6 +172,11 @@ export interface Border {
   /** Points. */
   width?: number
   color?: string
+  /**
+   * A paragraph's border: points between the text and the line (Word's `w:space`), a rule set a little under a
+   * letterhead. 0 by default. Table and cell borders take none.
+   */
+  space?: number
 }
 
 /** Something the application knows is still to complete but the kit cannot see (a sentence it left out). */
@@ -334,6 +339,8 @@ export interface TableCell {
   borders?: { top?: Border; bottom?: Border; left?: Border; right?: Border }
   /** A rule corner to corner: `down` top-left to bottom-right, `up` bottom-left to top-right (a struck cell). */
   diagonal?: 'down' | 'up'
+  /** This cell's inner padding, points, over the table's `cellPadding` side by side. */
+  padding?: { top?: number; bottom?: number; left?: number; right?: number }
   /**
    * Turn the cell's text a quarter: `up` reads from the bottom of the cell to the top (Word's bottom-to-top, `btLr`),
    * `down` from the top to the bottom (`tbRl`). The row grows to the length of the longest line; give the row a

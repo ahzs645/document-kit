@@ -163,6 +163,12 @@ supplied or embedded face draws, so they are no longer named as missing symbols;
   would push below the text area starts the next page, and a frame that would cover text already set on its page
   (the page is too full for it under its text) stands at the foot of the next page instead
   (`docs/ream-upstream.md`, changes 10 and 11).
+- **Column widths.** A table's grid (`w:tblGrid`) decides its columns, as Word keeps it, unless the
+  table is laid out `fixed` (the cells' widths decide) or the grid is far narrower than the width
+  the table states: the `docx` library, given no column widths, writes 100-twip stand-ins beside
+  the cells' real widths, and those cells' widths then decide, as Word draws them
+  (`docs/ream-upstream.md`, change 14). A percentage width may be written `4300` or `86%`
+  (change 13).
 - **Rows kept together.** A row whose first cell's paragraphs keep with the next stays on the
   page of the next row (the model's `keepWithNext`, on by default for header rows, and
   `keepTogether`); a run of such rows that fits a page moves to the next page whole rather than

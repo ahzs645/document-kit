@@ -108,6 +108,13 @@ export function writeTable(
     return Object.keys(borders).length ? borders : undefined
   }
 
+  // A cell's own padding, side by side over the table's; written only for a cell that gives one.
+  const cellMargins = (cell: TableCell) => {
+    if (!cell.padding) return undefined
+    const own = { ...padding, ...compact(cell.padding) }
+    return { top: twips(own.top), bottom: twips(own.bottom), left: twips(own.left), right: twips(own.right) }
+  }
+
   const rows = grid.rows.map((line, r) => {
     const row = table.rows[r]!
     const role = row.role ?? 'body'
@@ -175,7 +182,8 @@ export function writeTable(
     function writeCell(placed: PlacedCell, rowRole: RowRole, style: ReturnType<typeof roleLook>, at: number) {
       const cell = placed.cell
       const width = spanTwips(placed.column, placed.colSpan)
-      const inner = Math.max(12, width / 20 - padding.left - padding.right)
+      const own = { ...padding, ...compact(cell.padding ?? {}) }
+      const inner = Math.max(12, width / 20 - own.left - own.right)
       const cellAlign = cell.align ?? style.align ?? (rowRole === 'body' ? table.columnAlign?.[at] : undefined)
       const base: TextStyle = { ...(size === undefined ? {} : { size }), ...style.text, ...(cell.text ?? {}) }
       let children: Array<Paragraph | Table>
@@ -218,6 +226,7 @@ export function writeTable(
                 ? TextDirection.TOP_TO_BOTTOM_RIGHT_TO_LEFT
                 : undefined,
           borders: cellBorders(cell),
+          margins: cellMargins(cell),
         }) as ITableCellOptions,
       )
     }
