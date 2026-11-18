@@ -8,7 +8,8 @@ import type { BorderItem, ImageItem, TextLineItem } from '../../src/ream/layout/
 import { document, figure, image, row, section, table } from '../../src/model';
 import { writeDocx } from '../../src/docx';
 import { makePng } from '../docx/helpers';
-import { layOut } from './engine';
+import { layOut } from './engine'
+import { buildDocxFromBody } from '../ream/fixtures/build-docx';
 
 const band = () =>
   writeDocx(
@@ -64,5 +65,29 @@ describe('turned text in a table cell', () => {
     expect(lines.find((l) => text(l) === 'Upward')?.rotationDeg).toBe(90);
     expect(lines.find((l) => text(l) === 'Down')?.rotationDeg).toBe(-90);
     expect(lines.find((l) => text(l) === 'flat')?.rotationDeg).toBeUndefined();
+  });
+});
+
+describe('a table width written as a percentage with its sign', () => {
+  // As the `docx` library wrote a placeholder box up to its 9.7 releases: the width as "86%" and a
+  // one-column grid of 100 twips that only the percentage overrides.
+  const box = (width: string) =>
+    buildDocxFromBody(
+      `<w:tbl><w:tblPr><w:tblW w:type="pct" w:w="${width}"/><w:jc w:val="center"/></w:tblPr>` +
+        '<w:tblGrid><w:gridCol w:w="100"/></w:tblGrid><w:tr><w:tc><w:tcPr><w:tcW w:type="pct" w:w="100%"/></w:tcPr>' +
+        '<w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>Picture to come: a made-up placeholder caption</w:t></w:r></w:p>' +
+        '</w:tc></w:tr></w:tbl><w:sectPr><w:pgSz w:w="12240" w:h="15840"/>' +
+        '<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720"/></w:sectPr>',
+    );
+  const linesIn = (docx: Uint8Array) =>
+    layOut(docx).pages[0]!.commands.filter((c): c is TextLineItem => c.type === 'line');
+
+  it('reads "86%" as 86 per cent of the text width, as it reads 4300 fiftieths', () => {
+    const signed = linesIn(box('86%'));
+    const fiftieths = linesIn(box('4300'));
+    // One line, not a word a line in a box five points wide.
+    expect(signed).toHaveLength(1);
+    expect(signed[0]!.line.availableWidthPt).toBeCloseTo(fiftieths[0]!.line.availableWidthPt, 1);
+    expect(signed[0]!.line.availableWidthPt).toBeGreaterThan(0.8 * 468);
   });
 });

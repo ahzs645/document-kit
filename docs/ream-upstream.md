@@ -140,8 +140,16 @@ Each change is marked in the source with a `document-kit:` comment unless noted.
     `pageLines` read the character as `-` too.) Pinned by `tests/layout/report-features.test.ts`
     ("reads and prints the unbreakable hyphens as the hyphen a person types").
 
+13. **A percentage width written with its sign** (`word/table-parser.ts`, `pctFraction`, marked
+    `document-kit:`). §17.18.107 lets a `w:type="pct"` width be fiftieths of a percent (`4300`) or
+    a percentage with its sign (`86%`); the `docx` library up to 9.7 writes the second. Read as a
+    number, `86%` was nothing, so the table fell back to its grid, which that library writes as a
+    100-twip stand-in: a placeholder box meant to fill most of the line was drawn five points wide,
+    one word a line. `w:tblW` and `w:tcW` now read both forms. Pinned by
+    `tests/layout/pictures-and-cells.test.ts` ("reads \"86%\" as 86 per cent …").
+
 Nothing else differs. `diff -r` against the upstream tree, after running the rewrite script
-over a fresh copy, shows only the twelve changes above.
+over a fresh copy, shows only the thirteen changes above.
 
 ## Bringing in a newer upstream
 
@@ -151,11 +159,11 @@ over a fresh copy, shows only the twelve changes above.
    included; skip `corpus/`, `stand/`, `docs/`, `scripts/`). Delete files upstream deleted.
 3. Run `node scripts/rewrite-ream-aliases.mjs`, then `node scripts/rewrite-ream-aliases.mjs
    --check` (exits 1 if an alias import or root-relative fixture path is left).
-4. Re-apply changes 1, 2 and 4 to 12 above unless upstream has made them itself (check
+4. Re-apply changes 1, 2 and 4 to 13 above unless upstream has made them itself (check
    `FIXED_MTIME`, a `w:r` split for complex fields, every fallback to the global `fetch` in
    `core/fonts`, `core/converter` and `excel`, `familyNamesInFlow`, `w:vAlign`, PAGEREF and
    body fields, §17.4.66 border conflicts, `w:keepNext` in table rows, and the two foot-frame
-   checks of changes 10 and 11, the no-break hyphen of change 12). Search for
+   checks of changes 10 and 11, the no-break hyphen of change 12, percentage widths with their sign of change 13). Search for
    `document-kit:` in the old tree to find each place. Search for new uses of
    `fetch`, `XMLHttpRequest` and `node:` in `src/ream` and treat any as change 4.
 5. Check `src/layout` still compiles against the internals it imports (`core/converter/project`,

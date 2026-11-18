@@ -66,6 +66,22 @@ const MULTI_LINE_BORDERS = new Set([
   'inset',
 ]);
 
+/**
+ * document-kit: a `w:type="pct"` width as a share of what it is measured against. §17.18.107
+ * ST_MeasurementOrPercent lets the value be fiftieths of a percent ("4300") or a percentage written
+ * with its sign ("86%"), which the `docx` library writes up to 9.7. Read as a number, "86%" was no
+ * number at all, the table fell back to its grid, and that grid was the library's 100-twip stand-in:
+ * a placeholder box meant to fill most of the line was drawn five points wide, a word a line.
+ */
+function pctFraction(node: PoNode, fiftieths: number | undefined): number | undefined {
+  const raw = poAttr(node, 'w')?.trim();
+  if (raw !== undefined && raw.endsWith('%')) {
+    const percent = Number(raw.slice(0, -1));
+    return Number.isFinite(percent) ? percent / 100 : undefined;
+  }
+  return fiftieths === undefined ? undefined : fiftieths / 5000;
+}
+
 const WIDTH_TYPES = new Set<'auto' | 'dxa' | 'pct' | 'nil'>(['auto', 'dxa', 'pct', 'nil']);
 const HEIGHT_RULES = new Set<'auto' | 'atLeast' | 'exact'>(['auto', 'atLeast', 'exact']);
 
@@ -251,8 +267,9 @@ function parseTableProperties(tblPr: PoNode | undefined): TableProperties {
     const type = poAttr(tblW, 'type');
     // tblW @w is twips for type=dxa but fiftieths of a percent for type=pct
     // (5000 = 100% of the content width) — store each in its own field.
-    if (w !== undefined && type === 'pct') out.widthFraction = w / 5000;
-    else if (w !== undefined) out.widthPt = twipsToPt(w);
+    const fraction = type === 'pct' ? pctFraction(tblW, w) : undefined;
+    if (fraction !== undefined) out.widthFraction = fraction;
+    else if (w !== undefined && type !== 'pct') out.widthPt = twipsToPt(w);
     if (type && WIDTH_TYPES.has(type as 'auto' | 'dxa' | 'pct' | 'nil')) {
       out.widthType = type as 'auto' | 'dxa' | 'pct' | 'nil';
     }
@@ -461,10 +478,10 @@ function parseCellProperties(tcPr: PoNode | undefined): {
     if (type === 'pct' || type === 'dxa' || type === 'auto' || type === 'nil') {
       out.widthType = type;
     }
-    if (w !== undefined) {
-      if (type === 'pct') out.widthFraction = w / 5000;
-      else if (type !== 'auto' && type !== 'nil') out.width = twipsToPt(w);
-    }
+    if (type === 'pct') {
+      const fraction = pctFraction(tcW, w);
+      if (fraction !== undefined) out.widthFraction = fraction;
+    } else if (w !== undefined && type !== 'auto' && type !== 'nil') out.width = twipsToPt(w);
   }
   const gridSpan = poFirstChild(tcPr, 'w:gridSpan');
   if (gridSpan) {
