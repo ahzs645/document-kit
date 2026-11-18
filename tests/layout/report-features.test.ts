@@ -19,6 +19,9 @@ import { writeDocx } from '../../src/docx';
 import { createFontProvider, docxToPages, layoutDocx } from '../../src/layout';
 import { layOut, linesOf } from './engine';
 import { diskLoader } from './sample';
+import { unzipSync } from 'fflate';
+import { PdfFile } from '../../src/ream/pdf-reader/document';
+import { extractPageText } from '../../src/ream/pdf-reader/text';
 
 const fonts = createFontProvider(diskLoader);
 // Letter, one-inch margins: the text area ends 720pt down the page.
@@ -147,8 +150,33 @@ describe('two fields on one line', () => {
   it('shares a line when both fit', async () => {
     const pages = await docxToPages(await writeDocx(contact('someone@example.org')), { fonts });
     const lines = pages.pageText[0]!.split('\n');
-    expect(lines[0]).toMatch(/^E-mail: someone@example\.org\s+Phone:\s555‑010‑0199$/);
+    expect(lines[0]).toMatch(/^E-mail: someone@example\.org\s+Phone:\s555-010-0199$/);
     expect(lines[1]).toBe('Date: 12 March');
+  });
+
+  it('reads and prints the unbreakable hyphens as the hyphen a person types', async () => {
+    const docx = await writeDocx(contact('someone@example.org'))
+    // Word gets its own no-break hyphen, so the number moves whole there too.
+    expect(new TextDecoder().decode(unzipSync(docx)['word/document.xml']!)).toContain('<w:noBreakHyphen/>');
+    const laid = await layoutDocx(docx, { fonts });
+    expect(laid.pageText[0]).not.toContain('\u2011');
+    expect(laid.pageLines[0]![0]!.text).toMatch(/555-010-0199$/);
+    // The PDF's text layer gives U+002D back, not U+2011, and the hyphen is Tinos's own (one face draws the line).
+    const file = PdfFile.parse(laid.toPdf().bytes);
+    const text = extractPageText(file, file.pages()[0]!).map((run) => run.text).join('');
+    expect(text).toContain('555-010-0199');
+    expect(text).not.toContain('\u2011');
+    const pages = laid.toPages();
+    expect(pages.losses.filter((loss) => /U\+2011/.test(loss.detail))).toEqual([]);
+  });
+
+  it('gives each line its place on the page', async () => {
+    const laid = await layoutDocx(await writeDocx(contact('someone@example.org')), { fonts });
+    const [first, second] = laid.pageLines[0]!;
+    expect(first!.x).toBeCloseTo(72, 0);
+    expect(second!.text).toBe('Date: 12 March');
+    expect(second!.y).toBeGreaterThan(first!.y);
+    expect(laid.toPages().pageLines).toEqual(laid.pageLines);
   });
 
   it('moves the second field whole to a line of its own when it does not fit', async () => {
@@ -158,7 +186,7 @@ describe('two fields on one line', () => {
     // The addresses wrap at their own spaces; the phone is never split inside the number or from its label.
     expect(lines.length).toBeGreaterThan(2);
     const phone = lines.find((l) => l.includes('Phone'))!;
-    expect(phone).toMatch(/Phone:\s555‑010‑0199$/);
-    expect(lines.some((l) => /Phone:$|555‑$|^010/.test(l.trim()))).toBe(false);
+    expect(phone).toMatch(/Phone:\s555-010-0199$/);
+    expect(lines.some((l) => /Phone:$|555-$|^010/.test(l.trim()))).toBe(false);
   });
 });

@@ -178,7 +178,14 @@ export function parseTtf(raw: Uint8Array): ParsedTtf {
   }
 
   const cmap = require('cmap');
-  const glyphForCodepoint = buildCmap(raw, cmap.offset);
+  // document-kit: a no-break hyphen (U+2011, Word's `w:noBreakHyphen`) is drawn
+  // with the face's own hyphen, as Word draws it. Tinos has no U+2011 at all, so
+  // the character fell to another family and printed in Arimo's shape inside a
+  // Times line; and a face that has one gave it a glyph of its own, which the
+  // PDF's text then read back as U+2011, not the hyphen a reader copies.
+  const cmapGlyph = buildCmap(raw, cmap.offset);
+  const glyphForCodepoint = (cp: number): number =>
+    cp === NO_BREAK_HYPHEN ? cmapGlyph(HYPHEN_MINUS) || cmapGlyph(cp) : cmapGlyph(cp);
 
   const name = require('name');
   const postScriptName = readPostScriptName(raw, name.offset);
@@ -295,6 +302,10 @@ function readGlyphOffsets(
   }
   return out;
 }
+
+/** document-kit: Word's no-break hyphen, drawn with the face's hyphen-minus (see `parseTtf`). */
+const NO_BREAK_HYPHEN = 0x2011;
+const HYPHEN_MINUS = 0x2d;
 
 function buildCmap(raw: Uint8Array, cmapOffset: number): (cp: number) => number {
   const r = new BigEndianReader(raw, cmapOffset);

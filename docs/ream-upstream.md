@@ -128,8 +128,20 @@ Each change is marked in the source with a `document-kit:` comment unless noted.
     paragraph, aligned to the top or centre, or not wrapping are placed as before. Pinned by
     `tests/layout/report-features.test.ts` ("goes to the foot of the next page …").
 
+12. **A no-break hyphen drawn and read as a hyphen** (`core/font/ttf-parser.ts`, `parseTtf`'s
+    `glyphForCodepoint`; `layout/styled-layout.ts`, `countSharedGlyphs`; both marked
+    `document-kit:`). Word's `w:noBreakHyphen` is read as U+2011, which keeps a word from breaking
+    there. A face is now asked for U+2011 as its hyphen-minus (U+002D) glyph, falling back to its
+    own U+2011 only when it has no hyphen, as Word draws it. Tinos has no U+2011, so a phone number
+    kept on one line ("Phone: 250-555-0100") printed its hyphens in Arimo's shape inside a Times
+    line; a face with a U+2011 glyph of its own wrote the PDF's text back as U+2011, so a number
+    copied out of the PDF did not dial. The shared-glyph count that names a glyph in `/ToUnicode`
+    skips U+2011, so the hyphen glyph is always named U+002D. (`src/layout`'s `pageText` and
+    `pageLines` read the character as `-` too.) Pinned by `tests/layout/report-features.test.ts`
+    ("reads and prints the unbreakable hyphens as the hyphen a person types").
+
 Nothing else differs. `diff -r` against the upstream tree, after running the rewrite script
-over a fresh copy, shows only the eleven changes above.
+over a fresh copy, shows only the twelve changes above.
 
 ## Bringing in a newer upstream
 
@@ -139,11 +151,11 @@ over a fresh copy, shows only the eleven changes above.
    included; skip `corpus/`, `stand/`, `docs/`, `scripts/`). Delete files upstream deleted.
 3. Run `node scripts/rewrite-ream-aliases.mjs`, then `node scripts/rewrite-ream-aliases.mjs
    --check` (exits 1 if an alias import or root-relative fixture path is left).
-4. Re-apply changes 1, 2 and 4 to 11 above unless upstream has made them itself (check
+4. Re-apply changes 1, 2 and 4 to 12 above unless upstream has made them itself (check
    `FIXED_MTIME`, a `w:r` split for complex fields, every fallback to the global `fetch` in
    `core/fonts`, `core/converter` and `excel`, `familyNamesInFlow`, `w:vAlign`, PAGEREF and
    body fields, §17.4.66 border conflicts, `w:keepNext` in table rows, and the two foot-frame
-   checks of changes 10 and 11). Search for
+   checks of changes 10 and 11, the no-break hyphen of change 12). Search for
    `document-kit:` in the old tree to find each place. Search for new uses of
    `fetch`, `XMLHttpRequest` and `node:` in `src/ream` and treat any as change 4.
 5. Check `src/layout` still compiles against the internals it imports (`core/converter/project`,

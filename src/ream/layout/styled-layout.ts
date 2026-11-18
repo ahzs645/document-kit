@@ -5995,7 +5995,10 @@ function countSharedGlyphs(
 ): void {
   for (const ch of text) {
     const cp = ch.codePointAt(0)!;
-    if (cp < 0x80) continue;
+    // document-kit: a no-break hyphen is drawn with the hyphen-minus glyph (see
+    // `parseTtf`) and is a hyphen to whoever reads the text back, so it never
+    // names that glyph in /ToUnicode.
+    if (cp < 0x80 || cp === 0x2011) continue;
     const gid = parsed.glyphForCodepoint(cp);
     if (gid === 0 || sharedGlyphCodes(parsed, gid) === undefined) continue;
     sink.drawnAs ??= new Map();

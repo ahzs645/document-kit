@@ -77,6 +77,17 @@ export interface PageSize {
   readonly heightPt: number;
 }
 
+/**
+ * One laid-out line of a page: its text, where its first character starts (`x`) and its baseline (`y`), in points
+ * from the page's top-left corner, rounded to a hundredth. Lines are in layout order: the body, then frames, headers
+ * and footers as the engine sets them.
+ */
+export interface PageLine {
+  readonly text: string;
+  readonly x: number;
+  readonly y: number;
+}
+
 /** How {@link LaidOutDocx.toPages} and {@link docxToPages} write the page pictures. */
 export interface PagesWriteOptions {
   /**
@@ -118,6 +129,8 @@ export interface PagesResult {
    * drawn shapes is not included.
    */
   readonly pageText: ReadonlyArray<string>;
+  /** Each page's lines with their positions, the same lines as `pageText` (see {@link PageLine}). */
+  readonly pageLines: ReadonlyArray<ReadonlyArray<PageLine>>;
   /**
    * With `sharedGlyphs`: one hidden `<svg>` holding every glyph outline the
    * pages draw, each once, to be placed in the same HTML document as the pages
@@ -167,6 +180,8 @@ export interface LaidOutDocx {
   readonly pageSizes: ReadonlyArray<PageSize>;
   /** The text of each page's lines, one per `\n` (see {@link PagesResult.pageText}). */
   readonly pageText: ReadonlyArray<string>;
+  /** Each page's lines with their positions (see {@link PageLine}). */
+  readonly pageLines: ReadonlyArray<ReadonlyArray<PageLine>>;
   /** What reading and laying out the file dropped, degraded or substituted. */
   readonly losses: ReadonlyArray<LayoutLoss>;
   /**
@@ -201,12 +216,14 @@ export async function layoutDocx(
   };
   const laid = layoutStyledDocument(flow.body, styled);
   const pageSizes = laid.pages.map((p) => ({ widthPt: p.width, heightPt: p.height }));
-  const pageTexts = laid.pages.map(pageText);
+  const pageLines = laid.pages.map(linesOfPage);
+  const pageTexts = pageLines.map(pageText);
   const layoutLosses: ReadonlyArray<LayoutLoss> = [...losses];
   return {
     pageCount: laid.pages.length,
     pageSizes,
     pageText: pageTexts,
+    pageLines,
     losses: layoutLosses,
     toPdf(write: PdfWriteOptions = {}): PdfResult {
       const info = flow.info || write.info ? { ...flow.info, ...write.info } : undefined;
@@ -221,6 +238,7 @@ export async function layoutDocx(
         ...(drawn.glyphDefs !== undefined ? { glyphDefs: drawn.glyphDefs } : {}),
         pageSizes,
         pageText: pageTexts,
+        pageLines,
         losses: out,
       };
     },
@@ -587,14 +605,25 @@ function shareGlyphs(pages: ReadonlyArray<string>): { pages: Array<string>; glyp
   return { pages: out, glyphDefs };
 }
 
-/** The text of a laid-out page's lines, one per line. */
-function pageText(page: LaidOutPage): string {
-  const lines: Array<string> = [];
+/**
+ * A page's laid-out lines: each line's text, where it starts and its baseline. A no-break hyphen (Word's
+ * `w:noBreakHyphen`, which keeps "Phone: 250-555-0100" from breaking) is read as the hyphen it prints: a person
+ * copying a phone number out of the page gets the hyphen they would type.
+ */
+function linesOfPage(page: LaidOutPage): Array<PageLine> {
+  const lines: Array<PageLine> = [];
   for (const item of page.commands) {
     if (item.type !== 'line') continue;
     let text = '';
     for (const token of item.line.tokens) if (token.kind === 'text') text += token.text;
-    lines.push(text);
+    lines.push({ text: text.replace(/\u2011/g, '-'), x: round2(item.originX), y: round2(item.baselineY) });
   }
-  return lines.join('\n');
+  return lines;
+}
+
+const round2 = (value: number): number => Math.round(value * 100) / 100;
+
+/** The text of a laid-out page's lines, one per line. */
+function pageText(lines: ReadonlyArray<PageLine>): string {
+  return lines.map((line) => line.text).join('\n');
 }

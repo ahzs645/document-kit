@@ -24,7 +24,7 @@ const pdf = laid.toPdf({ info });    // same as docxToPdf, without laying out ag
 ```
 
 - `layoutDocx(docx, { fonts?, password?, pdfA?, tagged? })` → `Promise<LaidOutDocx>`: the file
-  laid out once. `LaidOutDocx` has `pageCount`, `pageSizes`, `pageText`, `losses` (what reading
+  laid out once. `LaidOutDocx` has `pageCount`, `pageSizes`, `pageText`, `pageLines`, `losses` (what reading
   and laying out recorded), and two writers that reuse the layout, each callable any number of
   times: `toPdf({ info? })` → `PdfResult` and `toPages({ sharedGlyphs? })` → `PagesResult`.
   `pdfA` and `tagged` are layout options because the accessible PDF/A levels and a tagged PDF
@@ -35,7 +35,7 @@ const pdf = laid.toPdf({ info });    // same as docxToPdf, without laying out ag
   `Promise<{ bytes, pageCount, losses }>`. `info` (title, author, …) is laid over the Word
   file's own properties; `pdfA` is a level such as `'PDF/A-2b'`; `tagged` writes a tagged PDF.
 - `docxToPages(docx, { fonts?, password?, sharedGlyphs? })` →
-  `Promise<{ pages, pageSizes, pageText, losses, glyphDefs? }>`. The same layout the PDF gets.
+  `Promise<{ pages, pageSizes, pageText, pageLines, losses, glyphDefs? }>`. The same layout the PDF gets.
   - `pages[i]` is a standalone SVG document for page *i*, drawn by the engine's SVG writer one
     page at a time. Text is drawn from the faces' own glyph outlines (`<path>` definitions and
     `<use>`), so a page shows the same in any viewer with no fonts installed, and there is no
@@ -56,7 +56,11 @@ const pdf = laid.toPdf({ info });    // same as docxToPdf, without laying out ag
     standalone picture.
   - `pageSizes[i]` is `{ widthPt, heightPt }`.
   - `pageText[i]` is the text of the page's laid-out lines, one per `\n`, in layout order (use it
-    for search and checks). Text inside charts and drawn shapes is not included.
+    for search and checks). Text inside charts and drawn shapes is not included. A no-break hyphen
+    (Word's `w:noBreakHyphen`) reads as `-`, as it does in the PDF's text.
+  - `pageLines[i]` is the same lines with their places: `{ text, x, y }`, `x` where the line's
+    first character starts and `y` its baseline, in points from the page's top-left corner,
+    rounded to a hundredth. For checks that compare two layouts line by line.
 - `docxToHtml(docx, { password? })` → `Promise<{ html, losses }>`. Flowed, self-contained HTML
   (pictures inlined). No layout and no fonts. Headers and footers have no fixed page in a flowed
   document and are reported as a loss, so page numbers do not appear.
@@ -72,7 +76,7 @@ const pdf = laid.toPdf({ info });    // same as docxToPdf, without laying out ag
 
 Types exported: `FontProvider`, `FontLoader`, `FontFileBytes`, `StandInFamily`, `StandInFile`,
 `FaceStyle`, `ProvidedFamily`, `LayoutOptions`, `PagedOptions`, `PdfOptions`, `PdfResult`,
-`PagesResult`, `PagesWriteOptions`, `PageSize`, `HtmlResult`, `LayoutLoss`, `LayoutDocxOptions`,
+`PageLine`, `PagesResult`, `PagesWriteOptions`, `PageSize`, `HtmlResult`, `LayoutLoss`, `LayoutDocxOptions`,
 `LaidOutDocx`, `PdfWriteOptions`, `DocumentInfo`, `PdfALevel`.
 
 ## The font rule

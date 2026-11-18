@@ -17,6 +17,7 @@ export type {
   LayoutLoss,
   LayoutOptions,
   PagedOptions,
+  PageLine,
   PageSize,
   PagesResult,
   PagesWriteOptions,

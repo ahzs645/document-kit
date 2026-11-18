@@ -52,7 +52,7 @@ describe('a laboratory-style report', () => {
     expect(flat).toContain('Results are reported on [basis].')
     expect(text).toContain('E-mail: office@example.org')
     // The phone shares the e-mail's line; its spaces and hyphen do not break.
-    expect(text).toMatch(/E-mail: office@example\.org\s+Phone:\s555‑0100/)
+    expect(text).toMatch(/E-mail: office@example\.org\s+Phone:\s555-0100/)
     // The contact block is pinned to the foot of the last page, under everything else on it.
     const last = laid.pageText[laid.pageText.length - 1]!.split('\n')
     expect(last.slice(-4, -1).join(' ')).toContain('Phone 555-0199 | lab@example.org | www.example.org/lab')
