@@ -22,6 +22,10 @@
       "types": "./dist/types/layout/index.d.ts",
       "import": "./dist/layout.js"
     },
+    "./pdf-preview": {
+      "types": "./dist/types/layout/pdfSource.d.ts",
+      "import": "./dist/pdf-preview.js"
+    },
     "./template": {
       "types": "./dist/types/template/index.d.ts",
       "import": "./dist/template.js"

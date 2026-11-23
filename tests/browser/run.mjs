@@ -90,7 +90,7 @@ function findChromium() {
 
 // --- Bundling ----------------------------------------------------------------
 
-const ENTRIES = { '': 'index', '/docx': 'docx', '/layout': 'layout', '/template': 'template', '/recipe': 'recipe', '/ream': 'ream' };
+const ENTRIES = { '': 'index', '/docx': 'docx', '/layout': 'layout', '/pdf-preview': 'pdf-preview', '/template': 'template', '/recipe': 'recipe', '/ream': 'ream' };
 
 async function bundleCase(build, file) {
   const name = basename(file, '.mjs');

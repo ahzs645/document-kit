@@ -14,6 +14,7 @@ import {
   TextRun,
 } from 'docx';
 import { createFontProvider, docxToHtml, docxToPages, docxToPdf } from 'document-kit/layout';
+import { createPdfSource, openPdfPreview } from 'document-kit/pdf-preview';
 
 function check(condition, message) {
   if (!condition) throw new Error(message);
@@ -24,7 +25,7 @@ function report() {
     new TableCell({ children: [new Paragraph({ children: [new TextRun({ text, bold })] })] });
   const header = new TableRow({
     tableHeader: true,
-    children: [cell('Sample', true), cell('Measured value', true), cell('Note', true)],
+    children: [cell('Sample ①', true), cell('Measured value', true), cell('Note', true)],
   });
   const rows = Array.from(
     { length: 70 },
@@ -75,7 +76,11 @@ export default async function layoutCase(ctx) {
   });
 
   const started = performance.now();
-  const pdf = await docxToPdf(docx, { fonts });
+  const forSnapshot = createPdfSource((snapshot) => docxToPdf(snapshot, { fonts }));
+  const [pdf, exported] = await Promise.all([forSnapshot(docx, undefined), forSnapshot(docx, undefined)]);
+  check(pdf === exported, 'preview and export use the same generated file');
+  const previewBytes = openPdfPreview(pdf, (data) => structuredClone(data, { transfer: [data.buffer] }));
+  check(previewBytes.length === exported.bytes.length, 'transferring preview bytes leaves the export intact');
   const pdfMs = Math.round(performance.now() - started);
   const head = new TextDecoder('latin1').decode(pdf.bytes.subarray(0, 5));
   check(head === '%PDF-', `the PDF starts with ${JSON.stringify(head)}`);
@@ -84,6 +89,8 @@ export default async function layoutCase(ctx) {
   const { pages, pageSizes, pageText, losses } = await docxToPages(docx, { fonts });
   check(pages.length === pdf.pageCount, `${pages.length} SVG pages for a ${pdf.pageCount}-page PDF`);
   check(pageSizes.length === pages.length, 'one size per page');
+  check(JSON.stringify(pageSizes) === JSON.stringify(pdf.pageSizes), 'PDF page sizes match the layout');
+  check(pageText[0].includes('①') && !losses.some((loss) => loss.detail.includes('U+2460')), 'circled number draws offline');
   pages.forEach((svg, i) => check(svg.startsWith('<svg'), `page ${i + 1} is not an SVG`));
   pageText.forEach((text, i) =>
     check(

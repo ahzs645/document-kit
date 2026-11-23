@@ -13,6 +13,7 @@ export default defineConfig({
         index: 'src/index.ts',
         docx: 'src/docx/index.ts',
         layout: 'src/layout/index.ts',
+        'pdf-preview': 'src/layout/pdfSource.ts',
         template: 'src/template/index.ts',
         recipe: 'src/recipe/index.ts',
         diagrams: 'src/diagrams/index.ts',

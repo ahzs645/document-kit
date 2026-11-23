@@ -13,6 +13,9 @@ import {
   paragraph,
   pinned,
   section,
+  table,
+  row,
+  cell,
   type Block,
 } from '../../src/model';
 import { writeDocx } from '../../src/docx';
@@ -129,6 +132,30 @@ describe('tick boxes', () => {
     expect(new TextDecoder('latin1').decode(pdf.bytes)).toContain('Tick');
     // The picture draws a glyph for every box: three more glyph uses than letters alone would make.
     expect((pages.pages[0]!.match(/<use /g) ?? []).length).toBeGreaterThan(40);
+  });
+});
+
+describe('circled numbers', () => {
+  it('prints and embeds the original characters in a bold table header and plain text', async () => {
+    const docx = await writeDocx(document([
+      section([
+        table([row([
+          cell({ type: 'text', text: 'Run ①', bold: true }),
+          cell({ type: 'text', text: 'Run ②', bold: true }),
+        ], { role: 'header' })]),
+        paragraph('⓪ through ⑳'),
+      ], { page }),
+    ]));
+    const laid = await layoutDocx(docx, { fonts });
+    const pdf = laid.toPdf();
+    const file = PdfFile.parse(pdf.bytes);
+    const text = extractPageText(file, file.pages()[0]!).map((run) => run.text).join(' ');
+    for (const marker of ['⓪', '①', '②', '⑳']) {
+      expect(text).toContain(marker);
+      expect(laid.toPages().pageText[0]).toContain(marker);
+    }
+    expect(pdf.losses.filter((loss) => loss.severity === 'dropped' || loss.severity === 'degraded')).toEqual([]);
+    expect(laid.toPages().losses.filter((loss) => loss.severity === 'dropped' || loss.severity === 'degraded')).toEqual([]);
   });
 });
 

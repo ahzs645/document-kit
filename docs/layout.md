@@ -32,7 +32,7 @@ const pdf = laid.toPdf({ info });    // same as docxToPdf, without laying out ag
   `docxToPages` are `layoutDocx` followed by one writer, and write the same bytes as before.
 
 - `docxToPdf(docx, { fonts?, password?, info?, pdfA?, tagged? })` →
-  `Promise<{ bytes, pageCount, losses }>`. `info` (title, author, …) is laid over the Word
+  `Promise<{ bytes, pageCount, pageSizes, losses }>`. `info` (title, author, …) is laid over the Word
   file's own properties; `pdfA` is a level such as `'PDF/A-2b'`; `tagged` writes a tagged PDF.
 - `docxToPages(docx, { fonts?, password?, sharedGlyphs? })` →
   `Promise<{ pages, pageSizes, pageText, pageLines, losses, glyphDefs? }>`. The same layout the PDF gets.
@@ -79,6 +79,30 @@ Types exported: `FontProvider`, `FontLoader`, `FontFileBytes`, `StandInFamily`, 
 `PageLine`, `PagesResult`, `PagesWriteOptions`, `PageSize`, `HtmlResult`, `LayoutLoss`, `LayoutDocxOptions`,
 `LaidOutDocx`, `PdfWriteOptions`, `DocumentInfo`, `PdfALevel`.
 
+## Previewing the generated PDF
+
+Use `createPdfSource` when preview and download should use the same generated file. The generator
+can run in a worker. Requests for the same immutable snapshot and variant share a pending or
+completed result. Failed builds can be retried. Pass a new snapshot when the input document changes.
+
+```ts
+import { docxToPdf } from 'document-kit/layout';
+import { createPdfSource, openPdfPreview } from 'document-kit/pdf-preview';
+
+const pdfFor = createPdfSource((snapshot: Uint8Array) => docxToPdf(snapshot, { fonts }));
+const pdf = await pdfFor(docx, undefined);
+const task = openPdfPreview(pdf, (data) => pdfjs.getDocument({ data }));
+const preview = await task.promise;
+
+// Reuse the original generated file on download.
+const download = await pdfFor(docx, undefined);
+```
+
+The lightweight preview entry can be used on the main thread while the layout engine runs in a worker.
+The application supplies its viewer and worker configuration. `openPdfPreview` gives the viewer
+a copy that can be transferred to its worker. The PDF's `pageSizes` can reserve space for pages
+before the viewer renders them. SVG previews are also available through `toPages`.
+
 ## The font rule
 
 The kit never reaches the network. For each family the document draws text in:
@@ -94,6 +118,10 @@ The kit never reaches the network. For each family the document draws text in:
 
 Without a provider, only embedded fonts are used; a document that embeds none cannot be laid
 out and `docxToPdf`/`docxToPages` reject with "No fonts…". `docxToHtml` needs no fonts.
+
+Built-in glyphs cover ballot boxes ☐, ☑ and ☒ and circled numbers ⓪ and ①–⑳. The engine uses
+these glyphs when the requested character is missing from the supplied fonts. The original Unicode
+characters are preserved in the PDF text layer.
 
 The open files are in `fonts/` (`fonts/README.md` lists each family's licence and source) and
 are exported as `document-kit/fonts/<file>`, for an application to serve with its own assets.

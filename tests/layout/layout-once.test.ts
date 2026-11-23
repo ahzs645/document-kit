@@ -25,6 +25,7 @@ describe('layoutDocx', () => {
     laid.toPdf();
     expect(layoutCalls() - before).toBe(1);
     expect(pdf.pageCount).toBe(laid.pageCount);
+    expect(pdf.pageSizes).toEqual(pages.pageSizes);
     expect(pages.pages.length).toBe(laid.pageCount);
     expect(laid.pageSizes.length).toBe(laid.pageCount);
     expect(laid.pageText.length).toBe(laid.pageCount);

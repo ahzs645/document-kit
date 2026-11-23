@@ -70,3 +70,17 @@ bc3f577ce4f0036c9f8045bfcb2f36ce8795de91915ccf127371d9e722d5e518  Cousine-BoldIt
 Not bundled: Noto Serif (the engine's source for Greek and Cyrillic in Cambria text) and the
 Noto faces for non-Latin scripts. A document that needs them is laid out without them and the
 gap is reported in `losses`.
+
+
+## Circled-number fallback
+
+`DocumentKitCircledNumbers-Regular.ttf` and `DocumentKitCircledNumbers-Bold.ttf` contain ⓪ and ①–⑳.
+The layout module inlines these small subsets. The font loader's twenty Office substitute files
+keep their original names and bytes.
+
+The outlines come from [Noto Sans Symbols at Google Fonts](https://github.com/google/fonts/blob/8b0a1d0f5983c89bc2b93f1b5fb55f9e252744b5/ofl/notosanssymbols/NotoSansSymbols%5Bwght%5D.ttf).
+Copyright 2022 The Noto Project Authors. The original and the subsets use the
+[SIL Open Font License 1.1](LICENSE-OFL-Noto-Sans-Symbols.txt).
+
+Download the pinned TTF above and run `python3 scripts/build-circled-numbers-font.py /path/to/NotoSansSymbols.ttf`
+with FontTools installed to regenerate the two faces.

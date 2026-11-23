@@ -10,6 +10,7 @@
  */
 
 export { docxToHtml, docxToPages, docxToPdf, layoutDocx } from './convert';
+export { createPdfSource, openPdfPreview } from './pdfSource';
 export type {
   HtmlResult,
   LaidOutDocx,

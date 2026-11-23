@@ -36,6 +36,7 @@ import { PdfDocument } from '../ream/pdf/writer';
 import { writeSvg } from '../ream/svg/svg-writer';
 import { docxReader } from '../ream/word/docx-reader';
 import { STAND_IN_NAMES } from './fonts';
+import { circledNumberRegistry, isCircledNumber } from './circledNumbers';
 import { TICK_BOX_CHARACTERS, tickBoxRegistry } from './tickBoxes';
 
 /** Something the conversion dropped, degraded or substituted (the engine's `Loss`). */
@@ -106,6 +107,8 @@ export interface PdfResult {
   readonly bytes: Uint8Array;
   /** How many pages it has. */
   readonly pageCount: number;
+  /** The physical page dimensions in points, in PDF page order. */
+  readonly pageSizes: ReadonlyArray<PageSize>;
   /** What the conversion dropped, degraded or substituted. */
   readonly losses: ReadonlyArray<LayoutLoss>;
 }
@@ -228,7 +231,7 @@ export async function layoutDocx(
     toPdf(write: PdfWriteOptions = {}): PdfResult {
       const info = flow.info || write.info ? { ...flow.info, ...write.info } : undefined;
       const bytes = emitStyledPdf(laid, { ...styled, ...(info ? { info } : {}) }, new PdfDocument());
-      return { bytes, pageCount: laid.pages.length, losses: [...layoutLosses] };
+      return { bytes, pageCount: laid.pages.length, pageSizes, losses: [...layoutLosses] };
     },
     toPages(write: PagesWriteOptions = {}): PagesResult {
       const out = [...layoutLosses];
@@ -440,18 +443,21 @@ async function renderOptions(
         'which document-kit does not bundle; they are drawn from another face on hand, at its own widths',
     });
   }
-  // Tick boxes (☐ ☑ ☒) no face on hand draws are drawn from a face of boxes
-  // built for them (./tickBoxes), which the engine falls back to per character.
+  // Install the built-in symbol faces only when a document needs their glyphs.
   const before = [...registriesByFamily.values(), ...embedded.values()].flatMap(facesOf);
   const boxes = new Set<number>();
+  let hasCircledNumbers = false;
   forEachTextInFlow(flow, (text) => {
     for (const ch of text) {
       const cp = ch.codePointAt(0) ?? 0;
       if (TICK_BOX_CHARACTERS.includes(cp)) boxes.add(cp);
+      if (isCircledNumber(cp)) hasCircledNumbers = true;
     }
   });
-  const undrawnBox = [...boxes].some((cp) => !before.some((face) => face.glyphForCodepoint(cp) !== 0));
-  if (undrawnBox && !registriesByFamily.has('symbols2')) registriesByFamily.set('symbols2', tickBoxRegistry());
+  const undrawn = (cp: number) => !before.some((face) => face.glyphForCodepoint(cp) !== 0);
+  if ([...boxes].some(undrawn)) registriesByFamily.set('symbols2', tickBoxRegistry());
+  if (hasCircledNumbers) registriesByFamily.set('symbols1', circledNumberRegistry());
+
 
   // A script is named only for the characters of it that no face on hand
   // draws: the engine sends ▼ ■ ↑ to a symbol face it would download, but the
