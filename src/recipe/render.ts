@@ -139,6 +139,7 @@ interface Bound {
 }
 
 interface LoopDetails {
+  odd: boolean
   index: number
   number: number
   first: boolean
@@ -380,7 +381,7 @@ function passes(state: State, loop: Loop, scope: Scope, out: Out): Scope[] {
       depth = (found.path?.length ?? 0) + 1
     }
     vars.set(loop.name, { value, path: found.path ? [...found.path, String(index)] : null, ...(source !== undefined ? { source } : {}), depth })
-    return { ...scope, vars, loop: { index, number: index + 1, first: index === 0, last: index === list.length - 1, length: list.length } }
+    return { ...scope, vars, loop: { index, odd: index % 2 === 0, number: index + 1, first: index === 0, last: index === list.length - 1, length: list.length } }
   })
 }
 
@@ -524,7 +525,7 @@ function missingRun(state: State, style: Style, tag: string, source: string | un
   return run
 }
 
-const INLINE_TYPES = new Set(['text', 'field', 'break', 'tab', 'blank', 'image', 'sentence', 'checkbox'])
+const INLINE_TYPES = new Set(['text', 'field', 'break', 'tab', 'blank', 'image', 'sentence', 'checkbox', 'footnote'])
 const isInlineObject = (value: unknown) => isRecord(value) && typeof value.type === 'string' && INLINE_TYPES.has(value.type)
 
 /** A data value that is already rich text (a run, or runs), or null. */
@@ -1109,7 +1110,7 @@ export function renderRecipe(compiledIn: CompiledRecipe, data: unknown, options:
   for (const section of sections)
     (section as { body: Block[] }).body = section.body.map((block) => (isToCompletePlaceholder(block) ? toCompleteBlock(block, items) : block))
 
-  const document: Document = { sections }
+  const document: Document = { sections, ...(compiled.document.footnotes && { footnotes: compiled.document.footnotes }) }
   if (metadata && Object.keys(metadata).length) (document as { metadata?: unknown }).metadata = metadata
   if (theme && Object.keys(theme).length) (document as { theme?: unknown }).theme = theme
   if (compiled.document.textRules?.length) (document as { textRules?: unknown }).textRules = compiled.document.textRules

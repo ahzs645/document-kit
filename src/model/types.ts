@@ -137,6 +137,7 @@ export type Inline =
   | string
   | TextRun
   | FieldRun
+  | { type: 'footnote'; id: string }
   | LineBreak
   | TabRun
   | BlankRun
@@ -243,6 +244,8 @@ export interface Caption {
 /* ------------------------------------------------------------------ blocks */
 
 export interface HeadingBlock extends BlockBase {
+  /** Named destination for an internal link written as #name. */
+  bookmark?: string
   type: 'heading'
   /** 1 to 6. Written as Word's own Heading styles, so a table of contents and the navigation pane read them. */
   level: 1 | 2 | 3 | 4 | 5 | 6
@@ -254,6 +257,8 @@ export interface HeadingBlock extends BlockBase {
 export type ParagraphStyleName = 'normal' | 'title' | 'subtitle' | 'caption' | 'note' | 'small'
 
 export interface ParagraphBlock extends BlockBase {
+  /** Named destination for an internal link written as #name. */
+  bookmark?: string
   type: 'paragraph'
   content: RichText
   style?: ParagraphStyleName
@@ -782,6 +787,8 @@ export type ThemeInput = {
 }
 
 export interface Document {
+  /** Paragraphs of each note, keyed by a permanent ID. Numbers follow first use in the body. */
+  footnotes?: Readonly<Record<string, readonly string[]>>
   metadata?: Metadata
   theme?: ThemeInput
   /**

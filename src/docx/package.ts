@@ -37,9 +37,9 @@ export function normalizePackage(bytes: Uint8Array, options: NormalizeOptions = 
     const random = [...rels.matchAll(/\bId="([^"]+)"/g)].map((m) => m[1]!).filter((id) => !/^rId\d+$/.test(id))
     if (!random.length) continue
     const renamed = new Map(random.map((id, index) => [id, `rIdL${index + 1}`]))
-    const swap = (source: string) => source.replace(/"([^"]+)"/g, (whole, id: string) => {
+    const swap = (source: string) => source.replace(/="([^"]*)"/g, (whole, id: string) => {
       const next = renamed.get(id)
-      return next ? `"${next}"` : whole
+      return next ? `="${next}"` : whole
     })
     text.set(relsName, swap(rels))
     const part = text.get(owner)

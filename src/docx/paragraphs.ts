@@ -12,6 +12,7 @@ import {
 } from 'docx'
 import { captionKind, captionPrefix, inlines, resolveSentences, type CaptionedBlock } from '../model/index'
 import type { Align, Caption, ParagraphBlock, TabStop, TextStyle } from '../model/types'
+import { bookmarked } from './bookmarks'
 import type { WriterContext } from './context'
 import { inlineChildren } from './inline'
 import { border, hex, lineMultiple, twips } from './units'
@@ -107,7 +108,7 @@ export function writeParagraph(block: ParagraphBlock, context: WriterContext, br
     shading: block.shading ? { fill: hex(block.shading), color: 'auto', type: 'clear' as const } : undefined,
     tabStops: block.tabs?.map((stop) => tabStop(stop, context)),
     frame: context.frame,
-    children,
+    children: bookmarked(block.bookmark, children, context),
   })
   return new Paragraph(options)
 }

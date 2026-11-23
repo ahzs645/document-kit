@@ -76,8 +76,9 @@ const STYLE: Record<string, Pos> = {
 
 /** Each block type's keys (besides `type`). */
 export const BLOCK_KEYS: Record<string, Record<string, Pos>> = {
-  heading: { ...BASE, level: 'scalar', content: 'rich', align: 'scalar' },
+  heading: { ...BASE, level: 'scalar', content: 'rich', align: 'scalar', bookmark: 'text' },
   paragraph: {
+    bookmark: 'text',
     ...BASE,
     content: 'rich',
     style: 'scalar',
@@ -221,6 +222,7 @@ export const CAPTION_KEYS: Record<string, Pos> = { text: 'richOpt', numbered: 's
 export const INLINE_KEYS: Record<string, Record<string, Pos>> = {
   text: { ...STYLE, text: 'rich', link: 'text', source: 'text' },
   field: { ...STYLE, field: 'scalar' },
+  footnote: { id: 'text' },
   break: {},
   tab: {},
   blank: { ...STYLE, what: 'text', width: 'scalar', source: 'text', show: 'scalar' },

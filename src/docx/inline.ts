@@ -2,6 +2,7 @@
 import {
   CheckBox,
   ExternalHyperlink,
+  InternalHyperlink,
   ImageRun,
   NoBreakHyphen,
   PageNumber,
@@ -180,12 +181,19 @@ export function inlineChildren(text: RichText, context: WriterContext, base: Inl
             ...(context.theme.link.underline ? { underline: true } : {}),
             ...style,
           }
-          children.push(new ExternalHyperlink({ link: inline.link, children: textRuns(inline.text, runOptions(linkStyle)) }))
+          const runs = textRuns(inline.text, runOptions(linkStyle))
+          children.push(inline.link.startsWith('#')
+            ? new InternalHyperlink({ anchor: inline.link.slice(1), children: runs })
+            : new ExternalHyperlink({ link: inline.link, children: runs }))
         } else {
           children.push(...textRuns(inline.text, runOptions(style)))
         }
         break
       }
+      case 'footnote':
+        if (context.part !== 'body') throw new Error('document-kit: footnote citations belong in the document body')
+        children.push(context.footnotes.reference(inline.id))
+        break
       case 'field': {
         const style = sourced({ ...baseStyle, ...styleOf(inline as unknown as TextStyle & Record<string, unknown>) }, undefined)
         const field =

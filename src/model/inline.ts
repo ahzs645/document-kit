@@ -136,6 +136,7 @@ export function plainText(text: RichText | null | undefined): string {
       switch (inline.type) {
         case 'text':
           return inline.text
+        case 'footnote':
         case 'field':
           return '#'
         case 'break':

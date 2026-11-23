@@ -64,6 +64,7 @@ export function stylesFor(theme: Theme): IStylesOptions {
         paragraph: paragraphOf({ after: theme.body.after ?? 6, line: theme.body.line ?? 1.15, ...compact({ before: theme.body.before }) }),
       },
       title: { run: runOf({ ...theme.title, color: theme.title.color ?? theme.body.color }), paragraph: paragraphOf(theme.title) },
+      footnoteText: { run: runOf({ ...theme.note, font: theme.note.font ?? theme.body.font, color: theme.note.color ?? theme.body.color }) },
       heading1: heading(1),
       heading2: heading(2),
       heading3: heading(3),

@@ -112,7 +112,7 @@ Names a tag reads:
 |---|---|
 | `params.*` | The component's parameters |
 | `options.*` | The recipe's options (constants; the render may lay others over them) |
-| a loop's item, `loop.*` | Inside a `for`: `loop.index` (from 0), `loop.number` (from 1), `loop.first`, `loop.last`, `loop.length` |
+| a loop's item, `loop.*` | Inside a `for`: `loop.index` (from 0), `loop.number` (from 1), `loop.first`, `loop.last`, `loop.length`, `loop.odd` (true for the first, third, and subsequent odd-numbered items) |
 | anything else | The data |
 
 So `params`, `options` and `loop` are not data names. A component does not see its caller's loop items: what it needs
@@ -539,3 +539,21 @@ as they leave out `src/template`. `tests/recipe` is checked with `tsconfig.integ
   control node): give such values through the data.
 - Section-level changes from a component (a component cannot open a section or set its page; the recipe does).
 - Everything in `docs/model.md`'s list of what the model cannot say yet.
+
+### Linked footnotes
+
+Define each note once in `document.footnotes`. Its key is a permanent ID of 1–33 lowercase letters, digits or hyphens, starting with a letter. Its value is an array of paragraphs in reading order. Use the ID wherever the note is cited, including table cells and list items.
+
+```json
+{
+  "document": { "footnotes": { "capacity": ["Minimum capacity per server."] } }
+}
+```
+
+For example, two cells can use `{"content":["4 cores",{"type":"footnote","id":"capacity"}]}` and `{"content":["16 GB",{"type":"footnote","id":"capacity"}]}`. Each export assigns numbers in first-use order and includes only cited notes. The first occurrence becomes a native Word footnote. Subsequent occurrences are Word NOTEREF fields linked to its bookmark.
+
+In Word, insert a new note with **References → Insert Footnote** and reuse it through **Cross-reference → Footnote**. After moving rows, update cross-reference fields. When changing which occurrence comes first, regenerating from the recipe places the native footnote at its new first use.
+
+### Internal navigation
+
+A heading or paragraph may declare a Word destination, for example `"bookmark": "{{ area.id }}"`. Refer to that destination with a text run such as `{"type":"text","text":"{{ area.title }}","link":"#{{ area.id }}"}`. Use a stable bookmark name of up to 40 ASCII letters, digits and underscores, starting with a letter. Names must be unique ignoring case. The prefix `dkNote_` is reserved for native footnotes.

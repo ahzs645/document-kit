@@ -22,6 +22,7 @@ import {
 import type { Block, Document, Section, TextStyle } from '../model/types'
 import { writeBlocks } from './blocks'
 import type { WriterContext } from './context'
+import { Footnotes } from './footnotes'
 import { normalizePackage } from './package'
 import { createListRegistry, stylesFor } from './styles'
 import { twips } from './units'
@@ -69,6 +70,8 @@ function buildDocx(source: Document, options: WriteDocxOptions): DocxDocument {
   const theme = resolveTheme(document.theme)
   const captions = numberCaptions(document)
   const lists = createListRegistry()
+  const bookmarks = new Set<string>()
+  const footnotes = new Footnotes(document.footnotes)
   const sections = document.sections.map((section) => {
     const page = pageBox(section.page, theme)
     const context: WriterContext = {
@@ -77,6 +80,8 @@ function buildDocx(source: Document, options: WriteDocxOptions): DocxDocument {
       width: page.contentWidth,
       part: 'body',
       captions,
+      footnotes,
+      bookmarks,
       sourceStyles: options.sourceStyles ?? {},
       nullCells: options.nullCells ?? 'empty',
       lists,
@@ -88,6 +93,7 @@ function buildDocx(source: Document, options: WriteDocxOptions): DocxDocument {
     sections,
     styles: stylesFor(theme),
     numbering: lists.numbering(),
+    ...(footnotes.size && { footnotes: footnotes.definitions, features: { updateFields: true } }),
     ...(metadata.title ? { title: metadata.title } : {}),
     ...(metadata.subject ? { subject: metadata.subject } : {}),
     ...(metadata.description ? { description: metadata.description } : {}),

@@ -254,7 +254,13 @@ function checkRecipe(c: Checker, value: unknown, path: Path) {
     c.problem([...path, 'description'], 'The description is not a string')
   c.id(value.extends, [...path, 'extends'], 'The recipe it extends', true)
   if (c.object(value.document, [...path, 'document'], 'The document', true)) {
-    c.keys(value.document, ['metadata', 'theme', 'textRules'], [...path, 'document'], 'The document')
+    c.keys(value.document, ['metadata', 'theme', 'textRules', 'footnotes'], [...path, 'document'], 'The document')
+    if (c.object(value.document.footnotes, [...path, 'document', 'footnotes'], 'The footnotes', true)) {
+      for (const [id, paragraphs] of Object.entries(value.document.footnotes)) {
+        if (!Array.isArray(paragraphs) || !paragraphs.length || !paragraphs.every(p => typeof p === 'string' && p.trim()))
+          c.problem([...path, 'document', 'footnotes', id], 'A footnote needs one or more nonempty paragraphs')
+      }
+    }
     if (value.document.textRules !== undefined) {
       if (!Array.isArray(value.document.textRules)) c.problem([...path, 'document', 'textRules'], 'The text rules are not a list')
       else c.json(value.document.textRules, [...path, 'document', 'textRules'], 'The text rules')

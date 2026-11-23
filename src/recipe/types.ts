@@ -126,6 +126,7 @@ export type RecipeChange =
   | { addSection: RecipeSection; after?: string | number }
 
 export interface RecipeDocument {
+  footnotes?: Record<string, string[]>
   metadata?: JsonObject
   theme?: JsonObject
   /** The document's text rules (the model's `TextRule`s), carried as written: no tags are read in them. */

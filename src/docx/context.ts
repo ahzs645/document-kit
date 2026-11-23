@@ -3,7 +3,11 @@ import type { IFrameOptions } from 'docx'
 import type { CaptionedBlock, PageBox } from '../model/index'
 import type { TextStyle, Theme } from '../model/types'
 
+import type { Footnotes } from './footnotes'
+
 export interface WriterContext {
+  bookmarks: Set<string>
+  footnotes: Footnotes
   theme: Theme
   page: PageBox
   /** Width the current container gives its content, points: the text width, or a table cell's inside. */

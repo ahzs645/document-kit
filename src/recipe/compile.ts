@@ -467,7 +467,7 @@ function walkValue(value: unknown, pos: Pos, ctx: Ctx, sym: Sym, loc: Loc, out: 
     case 'cell':
     case 'listItem': {
       if (typeof value.type === 'string') {
-        const keys = keysOf('inline', value) ?? fail('bad-node', `an inline run's type is one of text, field, break, tab, blank, image, sentence, checkbox`, at(loc, 'type'))
+        const keys = keysOf('inline', value) ?? fail('bad-node', `an inline run's type is one of text, field, break, tab, blank, image, sentence, checkbox, footnote`, at(loc, 'type'))
         return { type: value.type, ...walkKeys(value, keys, `a ${value.type} run`, ctx, sym, loc, out, ['type']) } as JsonObject
       }
       if (pos === 'cell') return walkKeys(value, keysOf('cell', value) ?? {}, 'a table cell', ctx, sym, loc, out)
@@ -720,6 +720,7 @@ export function compileRecipe(recipe: string | Recipe, libraryIn: Library, optio
   const top: Sym = { params: new Map(), vars: new Map(), inLoop: false, part: null, stack: [] }
   if (resolved.document.metadata) document.metadata = walkValue(resolved.document.metadata, 'any', ctx, top, at(root, 'document', 'metadata'), ['document', 'metadata']) as JsonObject
   if (resolved.document.theme) document.theme = walkValue(resolved.document.theme, 'any', ctx, top, at(root, 'document', 'theme'), ['document', 'theme']) as JsonObject
+  if (resolved.document.footnotes) document.footnotes = cloneJson(resolved.document.footnotes) as Record<string, string[]>
   if (textRules !== undefined) document.textRules = cloneJson(textRules as Json) as Json[]
 
   const recipesFrom = resolved.chain.map((r) => ({ id: r.id, hash: contentHash(r) }))

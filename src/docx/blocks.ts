@@ -45,6 +45,7 @@ import {
   TOC_TITLE_STYLE_ID,
   writeParagraph,
 } from './paragraphs'
+import { bookmarked } from './bookmarks'
 import { writeTable } from './table'
 import { border, twips } from './units'
 
@@ -124,13 +125,14 @@ function writeBlock(block: Block, context: WriterContext, breakBefore: boolean):
 
 function writeHeading(block: HeadingBlock, context: WriterContext, breakBefore: boolean): Paragraph {
   const level = Math.min(6, Math.max(1, Math.round(block.level))) as HeadingBlock['level']
+  const children = inlineChildren(block.content, context, compact({ source: block.source }))
   return new Paragraph(
     compact({
       heading: HEADINGS[level - 1],
       alignment: alignment(block.align),
       pageBreakBefore: breakBefore || undefined,
       frame: context.frame,
-      children: inlineChildren(block.content, context, compact({ source: block.source })),
+      children: bookmarked(block.bookmark, children, context),
     }),
   )
 }
