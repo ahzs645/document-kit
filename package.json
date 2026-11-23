@@ -35,7 +35,15 @@
       "import": "./dist/ream.js"
     },
     "./fonts/*": "./fonts/*",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./diagrams": {
+      "types": "./dist/types/diagrams/index.d.ts",
+      "import": "./dist/diagrams.js"
+    },
+    "./diagrams/d3": {
+      "types": "./dist/types/diagrams/d3.d.ts",
+      "import": "./dist/diagrams-d3.js"
+    }
   },
   "files": [
     "dist",
@@ -52,11 +60,17 @@
     "check": "npm run typecheck && npm run test && npm run build && npm run test:browser"
   },
   "dependencies": {
+    "d3-hierarchy": "2.0.0",
+    "d3-scale": "3.3.0",
+    "d3-shape": "2.1.0",
     "docx": "^9.15.4",
     "fast-xml-parser": "5.7.3",
     "fflate": "^0.8.2"
   },
   "devDependencies": {
+    "@types/d3-hierarchy": "^3.1.7",
+    "@types/d3-scale": "^4.0.9",
+    "@types/d3-shape": "^3.2.0",
     "@types/node": ">=20.11.0",
     "playwright-core": ">=1.56.0",
     "typescript": ">=5.4.0",

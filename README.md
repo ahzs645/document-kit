@@ -53,3 +53,7 @@ Set `DOCUMENT_KIT_CHROMIUM` to a Chromium or Chrome executable when none is foun
 they can be changed here. See `NOTICE-REAMKIT.md`, `NOTICE-OFFICEPARSER.md` and the two `docs/*-upstream.md`
 files, which list every change from upstream. The fonts' licences are in `fonts/`. Public test documents from
 other projects under `tests/ream/fixtures/real` keep their own licences, listed in its `NOTICE.md`.
+
+## Diagram renderers
+
+Use the [diagram registry and template gallery](docs/diagrams.md) to render D3, Mermaid or application-supplied diagrams as document figures.

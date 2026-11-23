@@ -15,9 +15,11 @@ export default defineConfig({
         layout: 'src/layout/index.ts',
         template: 'src/template/index.ts',
         recipe: 'src/recipe/index.ts',
+        diagrams: 'src/diagrams/index.ts',
+        'diagrams-d3': 'src/diagrams/d3.ts',
         ream: 'src/ream/index.ts',
       },
     },
-    rollupOptions: { external: ['docx', 'fflate', 'fast-xml-parser'] },
+    rollupOptions: { external: ['docx', 'fflate', 'fast-xml-parser', 'd3-scale', 'd3-hierarchy', 'd3-shape'] },
   },
 });
