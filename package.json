@@ -50,7 +50,9 @@
     "fonts",
     "LICENSE",
     "NOTICE-*.md",
-    "README.md"
+    "README.md",
+    "examples/diagrams",
+    "docs/diagrams.md"
   ],
   "scripts": {
     "build": "vite build && tsc -p tsconfig.build.json && tsc -p src/template/tsconfig.build.json && tsc -p src/recipe/tsconfig.build.json",

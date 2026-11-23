@@ -16,6 +16,18 @@ describe('diagram adapters', () => {
       }
     }
   })
+  it('uses the same explicit viewport for SVG, browser canvas and native rasterizers', () => {
+    const svg = renderD3({
+      type: 'bars',
+      title: 'Hours',
+      width: 600,
+      height: 120,
+      data: { values: [{ label: 'Review', value: 0 }] },
+    })
+    expect(svg).toContain('width="600" height="120" viewBox="0 0 600 120"')
+    expect(svg).not.toMatch(/NaN|Infinity/)
+  })
+
   it('selects Mermaid and independent renderers and rejects duplicate or unknown names', async () => {
     const external = { id: 'external', render: () => ({ svg: '<svg/>' }) }
     const registry = createDiagramRegistry([
