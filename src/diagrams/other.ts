@@ -40,21 +40,19 @@ export function metrics(c: Canvas, d: DiagramData['metrics']) {
   const cols = number(d.columns ?? 3, 1, d.values.length)
   check(Number.isInteger(cols), 'columns must be an integer')
   const w = (c.w - 12) / cols
-  let top = 6
-  for (let r = 0; r < d.values.length; r += cols) {
-    const row = d.values
-      .slice(r, r + cols)
-      .map((v) => ({ value: c.wrap(v.value, w - 26, c.s * 1.8, true), name: c.wrap(v.label, w - 26, c.s) }))
-    const h = Math.max(...row.map((v) => v.value.length * c.s * 2.27 + v.name.length * c.s * 1.26)) + 25
-    row.forEach((v, i) => {
-      const left = 6 + i * w
-      c.rect(left, top, w - 6, h, c.t.panel)
-      const end = c.lines(v.value, left + 12, top + c.s * 2, c.s * 1.8, true, c.t.accent)
-      c.lines(v.name, left + 12, end, c.s)
-    })
-    top += h + 6
-  }
-  return top
+  const cards = d.values.map((v) => ({
+    value: c.wrap(v.value, w - 26, c.s * 1.8, true),
+    name: c.wrap(v.label, w - 26, c.s),
+  }))
+  const height = Math.max(...cards.map((v) => v.value.length * c.s * 2.27 + v.name.length * c.s * 1.26)) + 25
+  cards.forEach((v, index) => {
+    const left = 6 + (index % cols) * w
+    const top = 6 + Math.floor(index / cols) * (height + 6)
+    c.rect(left, top, w - 6, height, c.t.panel)
+    const end = c.lines(v.value, left + 12, top + c.s * 2, c.s * 1.8, true, c.t.accent)
+    c.lines(v.name, left + 12, end, c.s)
+  })
+  return 6 + Math.ceil(cards.length / cols) * (height + 6)
 }
 export function overlap(c: Canvas, d: DiagramData['overlap']) {
   check(d.sets.length === 2, 'expected two sets')

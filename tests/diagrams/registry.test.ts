@@ -16,6 +16,21 @@ describe('diagram adapters', () => {
       }
     }
   })
+  it('sizes every metric card for the longest wrapped content across rows', () => {
+    const svg = renderD3({
+      type: 'metrics',
+      title: 'Review',
+      width: 400,
+      data: { columns: 2, values: [
+        { label: 'Items', value: '8' }, { label: 'Drafts', value: '5' },
+        { label: 'Items ready for review by the whole team', value: '3' },
+      ] },
+    })
+    const cards = [...svg.matchAll(/<rect x="[^"]+" y="[^"]+" width="([^"]+)" height="([^"]+)"/g)]
+    expect(cards).toHaveLength(3)
+    expect(new Set(cards.map((card) => card.slice(1).join('x'))).size).toBe(1)
+  })
+
   it('uses the same explicit viewport for SVG, browser canvas and native rasterizers', () => {
     const svg = renderD3({
       type: 'bars',

@@ -39,7 +39,7 @@ export function renderD3(spec: DiagramSpec, theme: Partial<DiagramTheme> = {}, f
   return [
     `<svg xmlns="http://www.w3.org/2000/svg" role="img" width="${w}" height="${height}" viewBox="0 0 ${w} ${height}">`,
     `<title>${escape(title)}</title>`,
-    '<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">',
+    '<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">',
     `<path d="M0 0L10 5L0 10z" fill="${t.ink}"/></marker></defs>`,
     `<rect width="${w}" height="${height}" fill="${t.paper}"/>`,
     `<g transform="${placement}">${c.parts.join('')}</g></svg>`,
