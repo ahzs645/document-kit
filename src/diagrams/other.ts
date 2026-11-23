@@ -58,22 +58,28 @@ export function metrics(c: Canvas, d: DiagramData['metrics']) {
 }
 export function overlap(c: Canvas, d: DiagramData['overlap']) {
   check(d.sets.length === 2, 'expected two sets')
-  const r = c.w * 0.235,
-    cy = r + 8
-  for (const x of [c.w * 0.33, c.w * 0.67]) c.circle(x, cy, r, 'none', c.t.muted)
-  d.sets.forEach((s, i) => {
-    const lines = c.wrap(s, r * 1.1, c.s * 1.2, true)
-    c.lines(
-      lines,
-      c.w * (i ? 0.72 : 0.28),
-      cy - (lines.length - 1) * c.s * 0.76 + c.s * 0.4,
-      c.s * 1.2,
-      true,
-      c.t.ink,
-      'middle',
-    )
+  const mid = c.w / 2
+  const offset = c.w * 0.18
+  const rx = c.w * 0.29
+  const size = Math.max(c.s, c.w * 0.031)
+  const lines = d.sets.map((set) => c.wrap(set, c.w * 0.29, size, true))
+  // Grow the ellipses vertically for multiline labels, preserving the exclusive label areas.
+  const ry = Math.max(c.w * 0.19, Math.max(...lines.map((label) => label.length)) * size * 1.26)
+  const cy = ry + 6
+  const chord = ry * Math.sqrt(1 - (offset / rx) ** 2)
+  const ellipse = (x: number, fill: string, stroke: string) =>
+    `<ellipse cx="${x}" cy="${cy}" rx="${rx}" ry="${ry}" fill="${fill}" stroke="${stroke}" stroke-width="2"/>`
+  c.parts.push(ellipse(mid - offset, c.t.paper, 'none'), ellipse(mid + offset, c.t.panel, 'none'))
+  c.parts.push(
+    `<path d="M ${mid} ${cy - chord} A ${rx} ${ry} 0 0 1 ${mid} ${cy + chord} A ${rx} ${ry} 0 0 1 ${mid} ${cy - chord} Z" fill="${c.t.accent}"/>`,
+    ellipse(mid - offset, 'none', c.t.muted),
+    ellipse(mid + offset, 'none', c.t.muted),
+  )
+  lines.forEach((label, i) => {
+    const y = cy + size * 0.34 - ((label.length - 1) * size * 1.26) / 2
+    c.lines(label, c.w * (i === 0 ? 0.22 : 0.78), y, size, true, c.t.ink, 'middle')
   })
-  return cy * 2
+  return 2 * cy
 }
 export function footprint(c: Canvas, d: DiagramData['footprint']) {
   check(d.points.length, 'empty scatter plot')
