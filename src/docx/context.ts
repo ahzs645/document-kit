@@ -19,6 +19,8 @@ export interface WriterContext {
   lists: ListRegistry
   /** Inside a pinned block: the text frame every paragraph written there carries (one frame together). */
   frame?: IFrameOptions
+  /** Writing the blocks of a table cell. */
+  inCell?: boolean
 }
 
 /** The numbering definitions the lists of a document need, gathered while the body is written. */

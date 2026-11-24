@@ -120,6 +120,7 @@ export const BLOCK_KEYS: Record<string, Record<string, Pos>> = {
     cantSplit: 'scalar',
     keepTogether: 'scalar',
     repeatHeader: 'scalar',
+    spaceAfter: 'scalar',
     columnAlign: 'any',
     autoFit: 'scalar',
   },

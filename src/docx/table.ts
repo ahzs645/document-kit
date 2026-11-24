@@ -190,7 +190,7 @@ export function writeTable(
       if (rowRole === 'spacer') {
         children = [gapParagraph(1)]
       } else if (cell.blocks?.length) {
-        children = writeBlocks(cell.blocks, { ...context, width: inner })
+        children = writeBlocks(cell.blocks, { ...context, width: inner, inCell: true })
         if (!(children[children.length - 1] instanceof Paragraph)) children.push(new Paragraph({ children: [] }))
       } else {
         const content = cell.content
@@ -267,6 +267,9 @@ export function writeTable(
   out.push(docxTable)
   if (table.caption && !above) out.push(captionParagraph(table, table.caption, context))
   if (table.note !== undefined) out.push(styledParagraph('note', table.note, context, compact({ source: table.source })))
+  // Space before the next block, so text does not sit on the table's last rule.
+  const after = table.spaceAfter ?? context.theme.table.spaceAfter ?? 0
+  if (after > 0 && context.part === 'body' && !context.inCell && !context.frame) out.push(gapParagraph(after))
   return out
 }
 

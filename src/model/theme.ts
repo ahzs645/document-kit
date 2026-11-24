@@ -54,6 +54,7 @@ export const DEFAULT_THEME: Theme = {
     innerBorder: { style: 'single', width: 0.25, color: 'cbd2d9' },
     cellPadding: { top: 3, bottom: 3, left: 5, right: 5 },
     spacerHeight: 6,
+    spaceAfter: 9,
     placeholderFill: 'f5f7fa',
     placeholderBorder: { style: 'dashed', width: 0.75, color: '9aa5b1' },
     placeholderText: { size: 10, color: '7b8794' },

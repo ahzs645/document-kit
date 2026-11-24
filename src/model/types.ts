@@ -419,6 +419,8 @@ export interface TableBlock extends BlockBase {
   line?: number
   /** Keep every row whole (no row breaks across a page). */
   cantSplit?: boolean
+  /** Space after this table, points, over the theme's `table.spaceAfter`; 0 for none. */
+  spaceAfter?: number
   /**
    * Keep the whole table on one page: every row whole and kept with the next. A table taller than a page still breaks
    * (Word's rule as well), between rows. A row's own `keepWithNext` or `cantSplit` overrides it for that row.
@@ -746,6 +748,11 @@ export interface TableLook {
   line?: number
   /** Spacer row height, points. */
   spacerHeight: number
+  /**
+   * Space between a table (with its caption or note) and the block after it, points. Applies in the body, not
+   * inside a table cell, pinned frame, header or footer. A table's own `spaceAfter` wins.
+   */
+  spaceAfter?: number
   /** Fill of a missing figure's placeholder box. */
   placeholderFill: string
   placeholderBorder: Border
