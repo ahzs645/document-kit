@@ -214,6 +214,8 @@ export async function layoutDocx(
   const render = await renderOptions(flow, options.fonts, losses);
   const styled: StyledRenderOptions = {
     ...render,
+    // Compressed page drawing and palette pictures: the same pages, a fraction of the bytes.
+    compact: true,
     ...(options.pdfA ? { pdfA: options.pdfA } : {}),
     ...(options.tagged ? { tagged: true } : {}),
   };

@@ -529,6 +529,39 @@ describe('PNG colour types beyond 8-bit RGB', () => {
     const woven = decode(buildIndexedPng(2, 2, 8, [BLACK, YELLOW], indices, { interlaced: true }));
     expect(woven.rgb).toEqual(plain.rgb);
   });
+
+  describe('kept as a palette (keepPalette)', () => {
+    it('gives one index a pixel and the palette, at every bit depth', () => {
+      for (const depth of [1, 2, 4, 8] as const) {
+        const prepared = prepareImage(buildIndexedPng(3, 1, depth, [BLACK, YELLOW], [1, 0, 1]), { keepPalette: true });
+        expect([...unzlibSync(prepared.data)]).toEqual([1, 0, 1]);
+        expect([...prepared.palette!]).toEqual([0, 0, 0, 255, 255, 0]);
+        expect(prepared.colorSpace).toBe('DeviceRGB');
+      }
+    });
+
+    it('reads an index past the palette as entry 0, as the expansion does', () => {
+      const prepared = prepareImage(buildIndexedPng(2, 1, 8, [BLACK, YELLOW], [1, 7]), { keepPalette: true });
+      expect([...unzlibSync(prepared.data)]).toEqual([1, 0]);
+    });
+
+    it('keeps tRNS as the soft mask', () => {
+      const prepared = prepareImage(buildIndexedPng(2, 1, 8, [BLACK, YELLOW], [0, 1], { alpha: [0, 255] }), { keepPalette: true });
+      expect(prepared.palette).toBeDefined();
+      expect([...unzlibSync(prepared.smaskData!)]).toEqual([0, 255]);
+    });
+
+    it('goes as RGB when PDF/A-1 flattens its alpha onto white', () => {
+      const prepared = prepareImage(buildIndexedPng(2, 1, 8, [BLACK, YELLOW], [0, 1], { alpha: [0, 255] }), { keepPalette: true, flattenAlpha: true });
+      expect(prepared.palette).toBeUndefined();
+      expect([...unzlibSync(prepared.data)]).toEqual([255, 255, 255, 255, 255, 0]);
+    });
+
+    it('leaves non-palette pictures as they were', () => {
+      const png = buildTinyPng(2, 2, [255, 0, 0, 255]);
+      expect(prepareImage(png, { keepPalette: true })).toEqual(prepareImage(png));
+    });
+  });
 });
 
 describe('a rotated picture (§20.1.7.6 a:xfrm @rot)', () => {
