@@ -586,7 +586,7 @@ function rawFromString(state: State, text: string, scope: Scope, out: Out, keepW
 }
 
 /** Places where null stays null (the model prints it blank, or a picture's placeholder); elsewhere a key with none is left out. */
-const KEEPS_NULL: ReadonlySet<Pos> = new Set(['richNull', 'cell', 'image', 'slots'])
+const KEEPS_NULL: ReadonlySet<Pos> = new Set(['richNull', 'cell', 'image', 'file', 'slots'])
 
 function evalValue(state: State, value: unknown, pos: Pos, scope: Scope, out: Out): unknown {
   if (isListPos(pos) && Array.isArray(value)) {
@@ -653,6 +653,10 @@ function evalValue(state: State, value: unknown, pos: Pos, scope: Scope, out: Ou
         const raw = rawFromString(state, value, scope, out)
         return picture(raw === OMIT ? null : raw, value, out)
       }
+      case 'file': {
+        const raw = rawFromString(state, value, scope, out)
+        return fileBytes(raw === OMIT ? null : raw, value, out)
+      }
       case 'slots': {
         const raw = rawFromString(state, value, scope, out)
         return raw === OMIT ? null : raw
@@ -685,6 +689,7 @@ function evalValue(state: State, value: unknown, pos: Pos, scope: Scope, out: Ou
       return result
     }
     case 'image':
+    case 'file':
       return record
     case 'block':
       return evalBlock(state, record, scope, out)
@@ -725,6 +730,13 @@ function picture(value: unknown, text: string, out: Out): unknown {
   if (value instanceof Uint8Array) return { bytes: value }
   if (isRecord(value) && value.bytes instanceof Uint8Array) return value
   throw new RecipeError('bad-value', `${text} is not a picture (bytes, or { bytes })`, where(out))
+}
+
+function fileBytes(value: unknown, text: string, out: Out): unknown {
+  if (value === null || value === undefined) return null
+  if (value instanceof Uint8Array) return { bytes: value }
+  if (isRecord(value) && value.bytes instanceof Uint8Array) return value
+  throw new RecipeError('bad-value', `${text} is not a file (bytes, or { bytes })`, where(out))
 }
 
 function evalObject(state: State, record: Record<string, unknown>, keys: Record<string, Pos>, scope: Scope, out: Out): Record<string, unknown> {

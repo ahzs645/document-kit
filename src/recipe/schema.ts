@@ -13,7 +13,8 @@
  *   (a field's value, a cell, a signature's name), which the model prints blank and lists; `richOpt`: optional rich
  *   text (a table's note, a fields block's title), left out when a lone tag has no value;
  * - `text`: a plain string (`alt`, `link`, `what`); `scalar`: a number, a flag or a word (`level`, `align`);
- * - `image`: a picture from the data (null when missing); `slots`: a sentence's values (null when missing);
+ * - `image`: a picture from the data (null when missing); `file`: a file's bytes from the data, a workbook (null when
+ *   missing); `slots`: a sentence's values (null when missing);
  * - `any`: free JSON (`data` of a custom block, `page`, `theme`), raw values kept;
  * - `literal`: a string taken as written, with no tags (a sentence's template).
  */
@@ -39,6 +40,7 @@ export type Pos =
   | 'text'
   | 'scalar'
   | 'image'
+  | 'file'
   | 'slots'
   | 'any'
   | 'literal'
@@ -123,6 +125,22 @@ export const BLOCK_KEYS: Record<string, Record<string, Pos>> = {
     spaceAfter: 'scalar',
     columnAlign: 'any',
     autoFit: 'scalar',
+  },
+  spreadsheet: {
+    ...BASE,
+    workbook: 'file',
+    sheet: 'scalar',
+    range: 'text',
+    headerRows: 'scalar',
+    formulas: 'scalar',
+    scale: 'scalar',
+    gridLines: 'scalar',
+    align: 'scalar',
+    caption: 'caption',
+    captionPosition: 'scalar',
+    note: 'richOpt',
+    placeholder: 'richOpt',
+    spaceAfter: 'scalar',
   },
   figure: {
     ...BASE,

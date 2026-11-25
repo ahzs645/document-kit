@@ -25,6 +25,18 @@ export interface WorksheetCell {
    * readers that predate the feature, and points here for the real one.
    */
   readonly valueMetadataIndex?: number;
+  /**
+   * document-kit: §18.3.1.40 `<f>` — the cell's formula as written, without the
+   * leading `=`. A shared formula's dependents (`t="shared"` with only `si`)
+   * write no text; they carry {@link sharedFormula} alone.
+   */
+  readonly formula?: string;
+  /**
+   * document-kit: §18.3.1.40 `<f t="shared" si>` — the shared formula group the
+   * cell belongs to. The group's text is on its master cell (the one whose `<f>`
+   * has text and a `ref`), written for the master's position.
+   */
+  readonly sharedFormula?: number;
 }
 
 /** §18.3.1.13 `<col>` — a width (in character units) for the column span `min..max`. */

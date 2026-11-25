@@ -782,6 +782,7 @@ function blockWith(block: Block, ctx: Ctx, setting: Block['textRules']): Block {
     case 'table':
       return tableWith(block, ctx, setting, rich)
     case 'figure':
+    case 'spreadsheet':
       return set(block, {
         caption: block.caption ? { ...block.caption, text: rich(block.caption.text, 'caption') } : undefined,
         note: opt(block.note, 'note'),

@@ -7,11 +7,14 @@ import type { Block, Caption, Document, Theme } from './types'
 
 export type CaptionKind = 'table' | 'figure'
 
-export type CaptionedBlock = Extract<Block, { type: 'table' | 'figure' | 'figureGrid' }>
+export type CaptionedBlock = Extract<Block, { type: 'table' | 'spreadsheet' | 'figure' | 'figureGrid' }>
 
-/** Which count a block's caption takes: a table's, or a figure's (figures and figure grids share one). */
+/**
+ * Which count a block's caption takes: a table's (tables and spreadsheets share one), or a figure's (figures and figure
+ * grids share one).
+ */
 export function captionKind(block: Block): CaptionKind | null {
-  if (block.type === 'table') return 'table'
+  if (block.type === 'table' || block.type === 'spreadsheet') return 'table'
   if (block.type === 'figure' || block.type === 'figureGrid') return 'figure'
   return null
 }

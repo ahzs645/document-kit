@@ -1348,6 +1348,7 @@ function parseCell(c: unknown, fallbackRow: number, fallbackCol: number): Worksh
     row: address.row,
     type,
     ...(vm !== undefined && Number.isInteger(vm) && vm > 0 ? { valueMetadataIndex: vm } : {}),
+    ...cellFormula(obj['f']),
   } as const;
   if (type === 'inlineStr') {
     const is = obj['is'];
@@ -1368,6 +1369,20 @@ function parseCell(c: unknown, fallbackRow: number, fallbackCol: number): Worksh
     ...base,
     rawValue,
     ...(Number.isFinite(styleIndex) ? { styleIndex: styleIndex as number } : {}),
+  };
+}
+
+// document-kit: §18.3.1.40 `<f>` — the formula text (no leading `=`) and, for
+// a shared formula, its group index. An array or data-table formula keeps its
+// text; only the cached `<v>` is read for rendering, so nothing else changes.
+function cellFormula(f: unknown): { formula?: string; sharedFormula?: number } {
+  if (f === undefined || f === null) return {};
+  const text = textOf(f).trim();
+  const obj = typeof f === 'object' ? (f as Record<string, unknown>) : undefined;
+  const si = obj && strAttr(obj, 't') === 'shared' ? Number(strAttr(obj, 'si')) : Number.NaN;
+  return {
+    ...(text !== '' ? { formula: text.replace(/^=/, '') } : {}),
+    ...(Number.isInteger(si) && si >= 0 ? { sharedFormula: si } : {}),
   };
 }
 

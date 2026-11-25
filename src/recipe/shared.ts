@@ -1,7 +1,7 @@
 /**
  * The components the kit ships, as JSON (`src/recipe/components/*.json`), generic enough for any report: a cover page,
  * a table of contents, label and value fields, a text section, a notice, a data table, a figure, a figure page, a
- * signature, the to-complete list, a "Page X of Y" footer and a running header. An application's library starts from
+ * spreadsheet, a signature, the to-complete list, a "Page X of Y" footer and a running header. An application's library starts from
  * them and adds its own.
  */
 import contents from './components/contents.json'
@@ -14,6 +14,7 @@ import notice from './components/notice.json'
 import pageFooter from './components/page-footer.json'
 import runningHeader from './components/running-header.json'
 import signature from './components/signature.json'
+import spreadsheet from './components/spreadsheet.json'
 import textSection from './components/text-section.json'
 import toComplete from './components/to-complete.json'
 import { cloneJson } from './json'
@@ -29,6 +30,7 @@ const SHIPPED: readonly unknown[] = [
   dataTable,
   figure,
   figurePage,
+  spreadsheet,
   signature,
   toComplete,
   pageFooter,

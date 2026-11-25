@@ -177,6 +177,7 @@ describe('the shared components', () => {
       'data-table',
       'figure',
       'figure-page',
+      'spreadsheet',
       'signature',
       'to-complete',
       'page-footer',

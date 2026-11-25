@@ -53,6 +53,7 @@ A section is a run of pages with one page set-up:
 | `list` | Bulleted or ordered, nested to any depth; an item may change kind for its children. Real Word numbering; each ordered list counts from its own `start`. |
 | `fields` | Label and value rows, as lines (`Label: value`, optional tab stop) or as a two-column table. A `null` value prints a blank rule. In lines, `rowSpacing` is the space after each row, and a row with `sameLine: true` goes on the line of the row before it after `sameLineGap` points (24) — "E-mail: …   Phone: …" — when it fits; when it does not, it moves whole to the next line, since its spaces and hyphens are written unbreakable (the hyphen as Word's no-break hyphen, which Word and `document-kit/layout` draw as the font's own hyphen and read back as `-`). It then shares the paragraph of the row before it, so it lacks that row's `rowSpacing` above it. |
 | `table` | Rows with roles: `header` (theme header look, repeated at the top of each page while among the first rows), `group` (shaded band), `note` (one small cell across the table), `spacer` (a short empty row), `body`. Cells span columns and rows (`colSpan`, `rowSpan`, listed as in HTML: a covered cell is not written). Per-cell alignment, vertical alignment, shading, borders, padding (`padding`, over the table's `cellPadding`), text style, a corner-to-corner rule (`diagonal`, a struck cell), text turned a quarter (`textDirection: 'up'` or `'down'`), and blocks inside a cell (paragraphs, lists, pictures, nested tables). Column shares, width as a share of the text, table borders, cell padding, text size, a caption above or below, a note under it, rows kept whole (`cantSplit`), a row kept with the next (`keepWithNext`, on by default for a `header` row with a row after it), the whole table on one page (`keepTogether`), its own line height (`line`), and `autoFit` (Word's AutoFit to contents, the shares only a start; fixed by default). A `header` row further down the table (a stacked block's own header) is drawn in the header look and not repeated. |
+| `spreadsheet` | One sheet of an Excel workbook (`.xlsx` bytes in `workbook`), written as a native table: details below. |
 | `figure` | A PNG or JPEG with its pixel size (read from its header when not given), fitted into a box (`fit: { width, height, upscale }`, or `'page'` to fill what the section's page leaves under the caption), a caption, a note, alignment. `crop: { top, right, bottom, left }` shows a band of it (the share, 0 to 1, cut away at each edge; the part shown is what is fitted), and `border: { width, color }` draws a solid frame round it. `image: null` prints a placeholder box with `placeholder` text. |
 | `figureGrid` | Pictures in `columns` columns (one column stacks them), each with a label above or below and a placeholder when missing, under one caption. |
 | `signature` | A label, the signature picture or room to sign by hand, the signing rule with the name (and title) under it, and lines under that (`Title`, `Date`), any of which can be blank. Kept on one page. Options below. |
@@ -184,6 +185,37 @@ second (`tests/model/text-rules.test.ts`).
 
 `compileTextRules(rules)` reads a list once; `ruleText(richText, compiled, { use: ids })` applies named rules to one
 value (what the recipes' `rules` filter does).
+
+## Spreadsheets
+
+`spreadsheet(bytes, { sheet: 'Budget', range: 'A1:F60' })` prints one sheet of an `.xlsx` as a native Word table, so
+it is set, searched and edited as the rest of the document is, and the layout breaks it across pages like any table.
+The Word writer reads the workbook (`document-kit/ream`'s Excel reader) and turns the sheet into a `table` block
+(`spreadsheetTable(block, { width })` from `document-kit/docx` gives that table to an application):
+
+- **What prints**: `sheet` by tab name or 0-based position (the first visible sheet when absent); `range` in A1 form,
+  else the sheet's print area, else A1 to the last cell holding a value, a fill or a border. Hidden rows and columns
+  are left out.
+- **The look**: the sheet's column widths (measured as Excel does, in the workbook's Normal font), merged cells,
+  fonts (face, size, bold, italic, underline, strike, colour; rich text run by run), solid fills, cell borders
+  (hair, thin, medium, thick, double, dotted, dashed), horizontal and vertical alignment (Excel's General alignment:
+  numbers right, text left), indents, wrapped text, custom row heights (as least heights) and the grid lines when
+  the sheet prints them (`gridLines` overrides). Text that does not wrap runs on into the empty cells beside it, as
+  Excel prints it. No row breaks across a page.
+- **Values**: number formats as Excel applies them (currency, thousands, percent, dates, coloured sections). A
+  formula prints the value the file cached; a formula with none (openpyxl writes none) is evaluated from the other
+  cells, on any sheet of the workbook: arithmetic, comparisons, cell and range references, defined names, shared
+  formulas and most of Excel's common functions (`SUM`, `AVERAGE`, `ROUND`, `IF`, `VLOOKUP`, …). A formula that
+  refers to itself prints `#REF!`. `formulas: 'evaluate'` recalculates every formula, ignoring cached values.
+- **Pages**: the leading rows repeat at the top of each page (`headerRows`; else the sheet's print titles, else its
+  frozen rows). A sheet set to fit its page width is scaled, text and columns together, to the section's text
+  width; `scale` (percent) sets it. Columns still wider than the text width are narrowed to fit. Give the section the
+  workbook's page set-up to print it as the workbook does: `{ paper: 'tabloid', orientation: 'landscape' }` is
+  17 × 11 in.
+- Caption (numbered with the tables), note, `align`, `spaceAfter` as a table's. `workbook: null` prints a placeholder
+  box (`placeholder`, else "Spreadsheet: *sheet*") and is listed to complete (kind `spreadsheet`).
+
+Charts, pictures, shapes, comments and conditional formats on the sheet are not printed.
 
 ## Keeping table rows together
 

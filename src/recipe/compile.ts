@@ -423,7 +423,7 @@ function walkValue(value: unknown, pos: Pos, ctx: Ctx, sym: Sym, loc: Loc, out: 
     return value
   }
   if (value === null) {
-    if (!['richNull', 'richOpt', 'cell', 'image', 'any', 'slots', 'scalar', 'text', 'caption'].includes(pos))
+    if (!['richNull', 'richOpt', 'cell', 'image', 'file', 'any', 'slots', 'scalar', 'text', 'caption'].includes(pos))
       return fail('bad-node', `null does not stand in a ${pos} place`, loc)
     return null
   }
@@ -452,6 +452,9 @@ function walkValue(value: unknown, pos: Pos, ctx: Ctx, sym: Sym, loc: Loc, out: 
     case 'image':
       if (ctx.fromCode) return value as unknown as Json
       return fail('bad-node', 'a picture comes from the data ("{{ path }}"); JSON cannot hold its bytes', loc)
+    case 'file':
+      if (ctx.fromCode) return value as unknown as Json
+      return fail('bad-node', 'a file comes from the data ("{{ path }}"); JSON cannot hold its bytes', loc)
     case 'block': {
       if (typeof value.type !== 'string' || !keysOf('block', value))
         return fail('bad-node', `a block's type is one of ${Object.keys(BLOCK_KEYS).join(', ')}, written as such`, at(loc, 'type'))

@@ -9,7 +9,17 @@ import { tableGrid, toCell } from './table'
 import { walkDocument, type BlockVisit } from './walk'
 import type { Block, Document, RichText } from './types'
 
-export type ToCompleteKind = 'blank' | 'field' | 'cell' | 'sentence' | 'figure' | 'signature' | 'choice' | 'answer' | 'pending'
+export type ToCompleteKind =
+  | 'blank'
+  | 'field'
+  | 'cell'
+  | 'sentence'
+  | 'figure'
+  | 'spreadsheet'
+  | 'signature'
+  | 'choice'
+  | 'answer'
+  | 'pending'
 
 export interface ToCompleteItem {
   kind: ToCompleteKind
@@ -145,6 +155,18 @@ function scanBlock(block: Block, push: Push) {
       scanText(block.note, push)
       return
     }
+    case 'spreadsheet':
+      if (block.caption) scanText(block.caption.text, push)
+      if (block.workbook === null) {
+        const sheet = typeof block.sheet === 'string' ? block.sheet : ''
+        push({
+          kind: 'spreadsheet',
+          what: plainText(block.caption?.text) || plainText(block.placeholder) || sheet || 'Spreadsheet',
+          ...withSource(block.source),
+        })
+      }
+      scanText(block.note, push)
+      return
     case 'figure':
       if (block.caption) scanText(block.caption.text, push)
       if (block.image === null) {

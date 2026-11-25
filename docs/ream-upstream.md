@@ -184,8 +184,17 @@ Each change is marked in the source with a `document-kit:` comment unless noted.
     1.42 MB to 0.78 MB, every page rendering the same. Pinned by `tests/ream/image.test.ts`
     ("kept as a palette") and `tests/layout/compact-pdf.test.ts`.
 
+17. **Formulas kept on parsed cells** (`core/spreadsheet-model/types.ts`, `WorksheetCell.formula`
+    and `WorksheetCell.sharedFormula`; `excel/worksheet-parser.ts`, `cellFormula`; both marked
+    `document-kit:`). Upstream reads a cell's cached `<v>` and drops its `<f>`. A workbook
+    written by a library that stores no cached values (openpyxl) then has an empty cell where
+    every total stands. The formula text (without `=`) and a shared formula's group index are
+    now kept on the cell, so `document-kit/docx`'s spreadsheet block can evaluate what the
+    file did not cache. Nothing upstream reads the new fields; rendering is unchanged. Pinned by
+    `tests/docx/spreadsheet.test.ts`.
+
 Nothing else differs. `diff -r` against the upstream tree, after running the rewrite script
-over a fresh copy, shows only the sixteen changes above.
+over a fresh copy, shows only the seventeen changes above.
 
 ## Bringing in a newer upstream
 
@@ -195,7 +204,7 @@ over a fresh copy, shows only the sixteen changes above.
    included; skip `corpus/`, `stand/`, `docs/`, `scripts/`). Delete files upstream deleted.
 3. Run `node scripts/rewrite-ream-aliases.mjs`, then `node scripts/rewrite-ream-aliases.mjs
    --check` (exits 1 if an alias import or root-relative fixture path is left).
-4. Re-apply changes 1, 2 and 4 to 16 above unless upstream has made them itself (check
+4. Re-apply changes 1, 2 and 4 to 17 above unless upstream has made them itself (check
    `FIXED_MTIME`, a `w:r` split for complex fields, every fallback to the global `fetch` in
    `core/fonts`, `core/converter` and `excel`, `familyNamesInFlow`, `w:vAlign`, PAGEREF and
    body fields, §17.4.66 border conflicts, `w:keepNext` in table rows, and the two foot-frame

@@ -1,0 +1,34 @@
+{
+  "kind": "component",
+  "id": "spreadsheet",
+  "title": "Spreadsheet",
+  "description": "One sheet of an Excel workbook from the data (.xlsx bytes), printed as a native table with the sheet's widths, merges, fills, fonts and number formats, formulas evaluated where the file cached no value. Put it in a section with the page the sheet prints on (tabloid landscape for 17 x 11 in). A workbook the data lacks prints a placeholder box and is listed.",
+  "params": {
+    "workbook": { "required": true },
+    "sheet": { "default": null, "description": "The tab name, or its 0-based position; the first visible sheet when null." },
+    "range": { "default": null, "description": "An A1 range (A1:F60); the print area, else the used cells, when null." },
+    "headerRows": { "default": null, "description": "Leading rows repeated on each page; the sheet's print titles or frozen rows when null." },
+    "formulas": { "default": "cached", "description": "cached: the file's values, evaluating formulas without one; evaluate: every formula." },
+    "scale": { "default": null, "description": "Print scale, percent; the sheet's own (fit to width when it asks) when null." },
+    "gridLines": { "default": null },
+    "caption": { "default": null },
+    "numbered": { "default": true },
+    "note": { "default": null },
+    "placeholder": { "default": null }
+  },
+  "blocks": [
+    {
+      "type": "spreadsheet",
+      "workbook": "{{ params.workbook }}",
+      "sheet": "{{ params.sheet }}",
+      "range": "{{ params.range }}",
+      "headerRows": "{{ params.headerRows }}",
+      "formulas": "{{ params.formulas }}",
+      "scale": "{{ params.scale }}",
+      "gridLines": "{{ params.gridLines }}",
+      "caption": { "text": "{{ params.caption }}", "numbered": "{{ params.numbered }}" },
+      "note": "{{ params.note }}",
+      "placeholder": "{{ params.placeholder }}"
+    }
+  ]
+}

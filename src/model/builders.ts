@@ -34,6 +34,7 @@ import type {
   SignatureBlock,
   SlotValues,
   SpacerBlock,
+  SpreadsheetBlock,
   TabRun,
   TableBlock,
   TableCell,
@@ -41,6 +42,7 @@ import type {
   TextRun,
   TextStyle,
   TocBlock,
+  WorkbookData,
 } from './types'
 
 type Options<T, Omitted extends keyof T> = Omit<T, Omitted | 'type'>
@@ -191,6 +193,19 @@ export const table = (rows: readonly TableRow[], options: Options<TableBlock, 'r
   ...options,
   type: 'table',
   rows,
+})
+
+/**
+ * One sheet of an Excel workbook as a native table: `spreadsheet(bytes, { sheet: 'Budget', range: 'A1:F60' })`. The
+ * workbook is its `.xlsx` bytes (or `{ bytes }`); null prints the placeholder and is listed to complete.
+ */
+export const spreadsheet = (
+  workbook: Uint8Array | WorkbookData | null,
+  options: Options<SpreadsheetBlock, 'workbook'> = {},
+): SpreadsheetBlock => ({
+  ...options,
+  type: 'spreadsheet',
+  workbook: workbook instanceof Uint8Array ? { bytes: workbook } : workbook,
 })
 
 export const caption = (content: RichText, numbered?: Caption['numbered']): Caption => ({

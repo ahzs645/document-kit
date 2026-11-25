@@ -76,7 +76,7 @@ default. A `with` naming a parameter the component does not declare is an error,
 
 ### Block templates
 
-A block template is the model's JSON (`docs/model.md`: `heading`, `paragraph`, `list`, `fields`, `table`, `figure`,
+A block template is the model's JSON (`docs/model.md`: `heading`, `paragraph`, `list`, `fields`, `table`, `spreadsheet`, `figure`,
 `figureGrid`, `signature`, `choices`, `pinned`, `pageBreak`, `toc`, `spacer`, `custom`) in which any string may hold tags. Every key is
 checked against the model at compile time: a misspelt key is an error naming its JSON path.
 
@@ -90,6 +90,9 @@ Two shorthands the model does not have:
 
 A picture (`image` of a figure, a signature or an inline image) comes from the data as bytes (`Uint8Array`, or
 `{ bytes }`): JSON cannot hold it. One the data lacks is `null`: a placeholder box, listed to complete.
+A spreadsheet's `workbook` comes from the data the same way, as the `.xlsx` file's bytes:
+`{ "type": "spreadsheet", "workbook": "{{ budget }}", "sheet": "Budget" }`. Give its section the page it prints on
+(`"page": { "paper": "tabloid", "orientation": "landscape" }`).
 
 ### Tags
 
@@ -493,6 +496,7 @@ Every refusal is a `RecipeError` with a `code` and a `path` (`component/notice:b
 | `data-table` | `columns`* (labels), `rows` (each a list of cells, `{ group }`, `{ note }` or `{ header: [labels] }`), `caption`, `numbered` (true; false: the caption alone, taking no number; `"silent"`), `note`, `widths`, `align`, `size`, `padding` ({ top, bottom, left, right }), `line`, `repeatHeader`, `autoFit`, `empty` |
 | `figure` | `image`*, `caption`, `numbered` (true), `note`, `placeholder`, `width`, `height` (300) |
 | `figure-page` | `title`*, `image`*, `caption`, `facts`, `height` (360), `level`, `placeholder` |
+| `spreadsheet` | `workbook`* (.xlsx bytes from the data), `sheet`, `range`, `headerRows`, `formulas` (`cached`; `evaluate`), `scale`, `gridLines`, `caption`, `numbered` (true), `note`, `placeholder` |
 | `signature` | `name`*, `label` ("Signed"), `labelPosition`, `labelGap`, `image`, `imageWidth` (140), `imageHeight` (55), `inkGap` (room to sign by hand), `title`, `titleLayout` (`row`: a "Title:" line, the default; `sameLine`: "Name, Title"; `nextLine`), `titleSeparator`, `date`, `dateLine` (true), `lines` ([{ label, value }] in place of the title and date lines), `align`, `ruleWidth`, `ruleThickness`, `ruleColor`, `ruleGap`, `spaceAbove`, `spaceBelow`, `keepTogether` (true) |
 | `to-complete` | `title`, `level`, `none` |
 | `page-footer` | `text`, `page`, `of`: "text … Page X of Y" |

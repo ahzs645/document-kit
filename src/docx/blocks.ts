@@ -30,6 +30,7 @@ import type {
   PinnedBlock,
   RichText,
   SignatureBlock,
+  SpreadsheetBlock,
   TableBlock,
   TableRow,
   TocBlock,
@@ -46,7 +47,8 @@ import {
   writeParagraph,
 } from './paragraphs'
 import { bookmarked } from './bookmarks'
-import { tableGaps, writeTable } from './table'
+import { spreadsheetTable } from './spreadsheet'
+import { autoLineTables, tableGaps, writeTable } from './table'
 import { border, twips } from './units'
 
 export type FileChild = Paragraph | Table | TableOfContents
@@ -103,6 +105,8 @@ function writeBlock(block: Block, context: WriterContext, breakBefore: boolean):
       return writeFields(block, context, breakBefore)
     case 'table':
       return writeTable(block, context, tableBlocks, breakBefore)
+    case 'spreadsheet':
+      return writeSpreadsheet(block, context, breakBefore)
     case 'figure':
       return writeFigure(block, context, breakBefore)
     case 'figureGrid':
@@ -337,6 +341,24 @@ function placeholderBox(text: RichText | undefined, width: number, height: numbe
     ],
   }
   return writeTable(placeholder, context, tableBlocks, false).filter((child): child is Table => child instanceof Table)
+}
+
+/* ------------------------------------------------------------------ spreadsheets */
+
+/** A sheet of a workbook as a table, numbered as the block's caption is; a missing workbook as a placeholder box. */
+function writeSpreadsheet(block: SpreadsheetBlock, context: WriterContext, breakBefore: boolean): FileChild[] {
+  if (!block.workbook) {
+    const out: FileChild[] = []
+    if (breakBefore) out.push(gapParagraph(1, true))
+    const label = block.placeholder ?? (typeof block.sheet === 'string' ? `Spreadsheet: ${block.sheet}` : 'Spreadsheet')
+    out.push(...placeholderBox(label, context.width, 72, context))
+    return out
+  }
+  const table = spreadsheetTable(block, { width: context.width })
+  autoLineTables.add(table)
+  const number = context.captions.get(block)
+  const captions = number === undefined ? context.captions : new Map([...context.captions, [table, number]])
+  return writeTable(table, { ...context, captions }, tableBlocks, breakBefore)
 }
 
 function writeFigure(block: FigureBlock, context: WriterContext, breakBefore: boolean): FileChild[] {

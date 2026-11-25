@@ -612,6 +612,59 @@ export interface SpacerBlock extends BlockBase {
   height: number
 }
 
+/** A workbook as bytes: the `.xlsx` file itself. */
+export interface WorkbookData {
+  bytes: Uint8Array
+}
+
+/**
+ * One sheet of an Excel workbook (`.xlsx`), printed as a native table: the sheet's column widths, merged cells, fonts,
+ * fills, borders, number formats (currency, percent, dates), wrapped text and alignment. A formula prints its cached
+ * value; a formula the file holds no value for (a workbook written by openpyxl, say) is evaluated from the sheet,
+ * other sheets of the workbook included (SUM, arithmetic, cell and range references, and most of Excel's common
+ * functions). `formulas: 'evaluate'` recalculates every formula and ignores cached values.
+ *
+ * The leading `headerRows` rows repeat at the top of each page the table runs onto. Give the section a page set-up to
+ * print the sheet as the workbook does (`{ paper: 'tabloid', orientation: 'landscape' }` for 17 × 11 in).
+ *
+ * A null `workbook` prints the placeholder and is listed as still to complete.
+ */
+export interface SpreadsheetBlock extends BlockBase {
+  type: 'spreadsheet'
+  workbook: WorkbookData | null
+  /** The sheet by tab name, or by 0-based position. The first visible sheet when absent. */
+  sheet?: string | number
+  /**
+   * The cells printed, an A1 range (`A1:F60`). Absent: the sheet's print area when the workbook names one, else from A1
+   * to the last row and column holding a value or a fill.
+   */
+  range?: string
+  /**
+   * How many leading rows of the range repeat at the top of each page. Absent: the sheet's print titles (rows to
+   * repeat) when the workbook names them, else its frozen rows, else none.
+   */
+  headerRows?: number
+  /** `cached` (default): the values the file stored, evaluating only formulas without one; `evaluate`: every formula. */
+  formulas?: 'cached' | 'evaluate'
+  /**
+   * Print scale, percent, as Excel's page set-up: text, row heights and column widths together. Absent: the sheet's
+   * own, fitted to the text width when the sheet is set to fit its page width. Columns still wider than the text width
+   * are narrowed to fit, the text keeping its size.
+   */
+  scale?: number
+  /** Draw the sheet's grid lines as hairline cell borders. The sheet's own print setting when absent. */
+  gridLines?: boolean
+  align?: 'left' | 'center' | 'right'
+  caption?: Caption
+  /** Above (default) or below the sheet. */
+  captionPosition?: 'above' | 'below'
+  note?: RichText
+  /** Printed in place of the sheet when the workbook is missing. */
+  placeholder?: RichText
+  /** Space after the sheet, points, as a table's. */
+  spaceAfter?: number
+}
+
 /**
  * A block the kit does not know: a rating matrix, a scale bar, a results table with its own rules. A writer expands
  * it through the application's registry ({@link defineCustomBlocks}) into the kit's own blocks; a kind nobody
@@ -629,6 +682,7 @@ export type Block =
   | ListBlock
   | FieldsBlock
   | TableBlock
+  | SpreadsheetBlock
   | FigureBlock
   | FigureGridBlock
   | SignatureBlock

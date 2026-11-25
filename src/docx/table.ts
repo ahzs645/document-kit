@@ -1,6 +1,7 @@
 /** Tables: the grid, merges, row roles, repeating header rows, borders, shading, captions and notes. */
 import {
   HeightRule,
+  LineRuleType,
   Paragraph,
   Table,
   TableCell as DocxCell,
@@ -205,7 +206,12 @@ export function writeTable(
             compact({
               style: TABLE_STYLE_ID,
               alignment: alignment(cellAlign),
-              spacing: table.line === undefined ? undefined : { line: lineMultiple(table.line) },
+              spacing:
+                table.line === undefined
+                  ? undefined
+                  : autoLineTables.has(table)
+                    ? { line: lineMultiple(table.line), lineRule: LineRuleType.AUTO }
+                    : { line: lineMultiple(table.line) },
               children: runs,
             }),
           ),
@@ -276,6 +282,13 @@ export function writeTable(
   }
   return out
 }
+
+/**
+ * Tables whose line height is written with an explicit `w:lineRule="auto"`. Word reads a `w:line` without a rule as a
+ * multiple; LibreOffice does not, and sets large text (a spreadsheet's 20pt title) on lines too close to hold it. Only
+ * spreadsheet tables are written this way for now, so the documents already written keep their layout.
+ */
+export const autoLineTables = new WeakSet<object>()
 
 /**
  * The space paragraphs written after tables. writeBlocks drops one when the next block starts a new page (or
