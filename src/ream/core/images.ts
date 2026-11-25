@@ -7,8 +7,9 @@
 // per-scanline filters reversed, then re-compressed; RGBA / Gray+Alpha PNGs
 // split their alpha channel into a separate soft-mask plane.
 //
-// Every PNG colour type is read: greyscale, RGB, palette (expanded to RGB, its
-// `tRNS` becoming the soft mask) and both alpha forms, at bit depths 1/2/4/8
+// Every PNG colour type is read: greyscale, RGB, palette (expanded to RGB, or
+// with `keepPalette` kept as one index a pixel under a PDF /Indexed space; its
+// `tRNS` becoming the soft mask either way) and both alpha forms, at bit depths 1/2/4/8
 // (stretched to 8) and 16 (truncated to its high byte), interlaced or not.
 // Throws on a malformed input so the caller can decide to fall back or surface
 // the error.
@@ -123,8 +124,8 @@ export function knockOutColor(bytes: Uint8Array, hex: string): Uint8Array | unde
   if (prepared.filter !== 'FlateDecode' || prepared.bitsPerComponent !== 8) return undefined;
   const key = [0, 2, 4].map((i) => Number.parseInt(hex.slice(i, i + 2), 16));
   if (key.some((c) => !Number.isFinite(c))) return undefined;
-  const gray = prepared.colorSpace === 'DeviceGray';
-  const src = unzlibSync(prepared.data);
+  const gray = prepared.colorSpace === 'DeviceGray' && !prepared.palette;
+  const src = expandPalette(unzlibSync(prepared.data), prepared.palette);
   const existing = prepared.smaskData ? unzlibSync(prepared.smaskData) : undefined;
   const { widthPx: w, heightPx: h } = prepared;
   const channels = gray ? 1 : 3;
@@ -142,6 +143,14 @@ export function knockOutColor(bytes: Uint8Array, hex: string): Uint8Array | unde
   return encodePng(w, h, 'rgba', out);
 }
 
+/** document-kit: a palette image's indices as RGB samples (anything else as it is). */
+function expandPalette(samples: Uint8Array, palette: Uint8Array | undefined): Uint8Array {
+  if (!palette) return samples;
+  const rgb = new Uint8Array(samples.length * 3);
+  for (let i = 0; i < samples.length; i++) rgb.set(palette.subarray(samples[i]! * 3, samples[i]! * 3 + 3), i * 3);
+  return rgb;
+}
+
 /** Options controlling how {@link prepareImage} emits an image. */
 export interface EmbedImageOptions {
   /**
@@ -149,6 +158,11 @@ export interface EmbedImageOptions {
    * composited onto an opaque white background and no `/SMask` is emitted.
    */
   readonly flattenAlpha?: boolean;
+  /**
+   * document-kit: keep a palette PNG as a palette — its indices under an `/Indexed` space
+   * ({@link PreparedImage.palette}) — instead of expanding it to RGB.
+   */
+  readonly keepPalette?: boolean;
 }
 
 /**
@@ -181,6 +195,13 @@ export interface PreparedImage {
   readonly data: Uint8Array;
   /** PNG alpha channel, already FlateDecode-compressed (DeviceGray, 8 bpc). */
   readonly smaskData?: Uint8Array;
+  /**
+   * document-kit: a palette image's colours, three bytes (RGB) an entry, at most 256. When
+   * present, `data` holds one 8-bit palette index a pixel and the image is
+   * drawn in an `/Indexed` space over `colorSpace` (ISO 32000-1 §8.6.6.3): the
+   * same pixels as the RGB expansion at about a third of the size.
+   */
+  readonly palette?: Uint8Array;
   /**
    * The resolution the picture states for itself, in pixels per inch, when it
    * states one (JFIF's `Xdensity`/`Ydensity`, PNG's `pHYs`). It is what makes a
@@ -653,6 +674,9 @@ interface DecodedPng {
   readonly colorSpace: 'DeviceRGB' | 'DeviceGray';
   readonly bitsPerComponent: number;
   readonly smaskRaw?: Uint8Array;
+  /** For a palette image: its RGB entries, and one entry index a pixel (`raw` holds the RGB expansion). */
+  readonly palette?: Uint8Array;
+  readonly indices?: Uint8Array;
   readonly dpiX?: number;
   readonly dpiY?: number;
 }
@@ -662,6 +686,10 @@ function preparePng(bytes: Uint8Array, options: EmbedImageOptions = {}): Prepare
   if (options.flattenAlpha && decoded.smaskRaw) {
     decoded = flattenAlphaOnWhite(decoded);
   }
+  // document-kit: with `keepPalette`, a palette image stays one: its indices under an /Indexed space. Flattening
+  // (PDF/A-1) mixes each pixel with white, which leaves the palette, so a
+  // flattened one goes as the RGB it now is.
+  const indexed = options.keepPalette && decoded.palette && decoded.indices ? { palette: decoded.palette, indices: decoded.indices } : undefined;
   return {
     format: 'png',
     mimeType: 'image/png',
@@ -670,7 +698,8 @@ function preparePng(bytes: Uint8Array, options: EmbedImageOptions = {}): Prepare
     colorSpace: decoded.colorSpace,
     bitsPerComponent: decoded.bitsPerComponent,
     filter: 'FlateDecode',
-    data: zlibSync(decoded.raw),
+    data: zlibSync(indexed ? indexed.indices : decoded.raw),
+    ...(indexed ? { palette: indexed.palette } : {}),
     ...(decoded.smaskRaw ? { smaskData: zlibSync(decoded.smaskRaw) } : {}),
     ...(decoded.dpiX !== undefined && decoded.dpiY !== undefined
       ? { dpiX: decoded.dpiX, dpiY: decoded.dpiY }
@@ -921,12 +950,15 @@ function splitChannels(
   // mask. Left unread, 45 of the corpus's images drew as nothing at all.
   if (colorType === 3) {
     if (!palette || palette.length < 3) throw new Error('PNG: palette image without PLTE');
-    const entries = Math.floor(palette.length / 3);
+    const entries = Math.min(256, Math.floor(palette.length / 3));
     const rgb = new Uint8Array(pixelCount * 3);
+    const indices = new Uint8Array(pixelCount);
     const alpha = paletteAlpha && paletteAlpha.length > 0 ? new Uint8Array(pixelCount) : undefined;
     for (let i = 0; i < pixelCount; i++) {
       const idx = raw[i]!;
-      const src = (idx < entries ? idx : 0) * 3;
+      // An index past the palette's end reads as entry 0, as it always has.
+      indices[i] = idx < entries ? idx : 0;
+      const src = indices[i]! * 3;
       rgb[i * 3] = palette[src]!;
       rgb[i * 3 + 1] = palette[src + 1]!;
       rgb[i * 3 + 2] = palette[src + 2]!;
@@ -938,6 +970,8 @@ function splitChannels(
       raw: rgb,
       colorSpace: 'DeviceRGB',
       bitsPerComponent: 8,
+      palette: palette.subarray(0, entries * 3),
+      indices,
       ...(alpha ? { smaskRaw: alpha } : {}),
     };
   }

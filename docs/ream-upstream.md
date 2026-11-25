@@ -168,8 +168,24 @@ Each change is marked in the source with a `document-kit:` comment unless noted.
     line and a half over a forty-row page. A size of zero is kept. Pinned by
     `tests/layout/pictures-and-cells.test.ts` ("a border thinner than Word draws").
 
+16. **Compact PDFs** (`layout/styled-layout.ts`, `StyledRenderOptions.compact` and
+    `collectImageResources`; `pdf/styled-page-emitter.ts`, the page content stream and the
+    PDF/A ICC profile; `core/images.ts`, `EmbedImageOptions.keepPalette`,
+    `PreparedImage.palette`, `preparePng`, `splitChannels` and `knockOutColor`;
+    `pdf/image-xobject.ts`, `addImage`; all marked `document-kit:`). Upstream writes each
+    page's drawing as a plain stream and expands a palette PNG to RGB, so a long report's PDF
+    was about five times the size it needs to be, most of it operators in plain text. With the
+    new `compact` option the page content (§7.4.4) and the ICC profile are deflated, and a
+    palette PNG is kept as one index a pixel under `[/Indexed /DeviceRGB hival <lookup>]`
+    (§8.6.6.3), its `tRNS` still the soft mask; a palette image whose alpha PDF/A-1 flattens
+    goes as RGB, as before. Off by default, so the engine's own output and its byte gate are
+    unchanged; `src/layout` (`layoutDocx`, hence `docxToPdf`) turns it on. On a 51-page
+    report the PDF went from 1.90 MB to 0.43 MB, and on 20 pages with 18 palette charts from
+    1.42 MB to 0.78 MB, every page rendering the same. Pinned by `tests/ream/image.test.ts`
+    ("kept as a palette") and `tests/layout/compact-pdf.test.ts`.
+
 Nothing else differs. `diff -r` against the upstream tree, after running the rewrite script
-over a fresh copy, shows only the fifteen changes above.
+over a fresh copy, shows only the sixteen changes above.
 
 ## Bringing in a newer upstream
 
@@ -179,11 +195,11 @@ over a fresh copy, shows only the fifteen changes above.
    included; skip `corpus/`, `stand/`, `docs/`, `scripts/`). Delete files upstream deleted.
 3. Run `node scripts/rewrite-ream-aliases.mjs`, then `node scripts/rewrite-ream-aliases.mjs
    --check` (exits 1 if an alias import or root-relative fixture path is left).
-4. Re-apply changes 1, 2 and 4 to 15 above unless upstream has made them itself (check
+4. Re-apply changes 1, 2 and 4 to 16 above unless upstream has made them itself (check
    `FIXED_MTIME`, a `w:r` split for complex fields, every fallback to the global `fetch` in
    `core/fonts`, `core/converter` and `excel`, `familyNamesInFlow`, `w:vAlign`, PAGEREF and
    body fields, §17.4.66 border conflicts, `w:keepNext` in table rows, and the two foot-frame
-   checks of changes 10 and 11, the no-break hyphen of change 12, percentage widths with their sign of change 13, the stand-in grid of change 14, border widths of change 15). Search for
+   checks of changes 10 and 11, the no-break hyphen of change 12, percentage widths with their sign of change 13, the stand-in grid of change 14, border widths of change 15, the `compact` option of change 16). Search for
    `document-kit:` in the old tree to find each place. Search for new uses of
    `fetch`, `XMLHttpRequest` and `node:` in `src/ream` and treat any as change 4.
 5. Check `src/layout` still compiles against the internals it imports (`core/converter/project`,

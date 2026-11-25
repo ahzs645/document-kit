@@ -332,6 +332,14 @@ const WORD_LINE_METRICS: ReadonlyMap<string, readonly [number, number, number]> 
  * back to a sensible default.
  */
 export interface StyledRenderOptions {
+  /**
+   * document-kit: write a compact PDF: each page's drawing deflated (§7.4.4) and a palette
+   * PNG kept as a palette under an `/Indexed` space (§8.6.6.3) rather than
+   * expanded to RGB. The pages are the same; a long report is about a fifth
+   * the size. Off by default so the engine's own output — and the byte gate —
+   * stay as they were; `document-kit/layout` turns it on.
+   */
+  readonly compact?: boolean;
   /** The resolved font set every run draws with (the guaranteed fallback registry). */
   readonly registry: FontRegistry;
   /** Renderer-compatibility profile for the line-height model (default `'ream'`). */
@@ -4148,6 +4156,8 @@ function collectImageResources(
 
   // Only PDF/A-1 forbids transparency; PDF/A-2/3 keep the image soft mask.
   const flattenAlpha = options.pdfA ? parsePdfAProfile(options.pdfA).part === 1 : false;
+  // document-kit: `compact` keeps a palette PNG as a palette (see StyledRenderOptions.compact).
+  const keepPalette = options.compact === true;
   let counter = 0;
   for (const resourceId of seen) {
     const bytes = options.resources.get(resourceId);
@@ -4171,7 +4181,7 @@ function collectImageResources(
           if (prim.kind !== 'image') continue;
           let blitted: PreparedImage;
           try {
-            blitted = prepareImage(prim.png, { flattenAlpha });
+            blitted = prepareImage(prim.png, { flattenAlpha, keepPalette });
           } catch {
             metafileImages.push('');
             continue;
@@ -4196,7 +4206,7 @@ function collectImageResources(
     }
     let prepared: PreparedImage;
     try {
-      prepared = prepareImage(bytes, { flattenAlpha });
+      prepared = prepareImage(bytes, { flattenAlpha, keepPalette });
     } catch {
       continue;
     }

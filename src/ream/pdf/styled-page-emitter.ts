@@ -52,7 +52,7 @@ import { embedTtfFont } from './cid-font';
 import { embedAssociatedFile } from './embedded-file';
 import { buildSrgbIccProfile } from './icc-profile';
 import { addImage } from './image-xobject';
-import { dict, name, ref, stream, unicodeString } from './objects';
+import { deflatedStream, dict, name, ref, stream, unicodeString } from './objects';
 import { addSignaturePlaceholder } from './signature';
 import { buildXmpPacket } from './xmp';
 
@@ -79,7 +79,7 @@ function washItems(
 // options — never the layout options (oop-design §4.1: the seam must not leak).
 type EmitOptions = Pick<
   StyledRenderOptions,
-  'attachments' | 'info' | 'language' | 'pdfUA' | 'signaturePlaceholder'
+  'attachments' | 'compact' | 'info' | 'language' | 'pdfUA' | 'signaturePlaceholder'
 >;
 
 /**
@@ -322,7 +322,9 @@ function assembleStyledPdf(
   let pdfaIccRef: PdfRef | undefined;
   let transparencyGroup: PdfDict | undefined;
   if (pdfaProfile) {
-    pdfaIccRef = doc.add(stream({ N: 3, Alternate: name('DeviceRGB') }, buildSrgbIccProfile()));
+    // document-kit: the ICC profile deflated too when `compact`.
+    const icc = buildSrgbIccProfile();
+    pdfaIccRef = doc.add(options.compact ? deflatedStream({ N: 3, Alternate: name('DeviceRGB') }, icc) : stream({ N: 3, Alternate: name('DeviceRGB') }, icc));
     if (pdfaProfile.part >= 2) {
       // PDF/A-2/3 §6.2.4.3 — a page that uses transparency (here, a soft-masked
       // image) must carry a transparency group with a device-independent blend
@@ -357,7 +359,9 @@ function assembleStyledPdf(
       wantDuotone,
       gradientMaskNames,
     );
-    const contentsRef = doc.add(stream({}, contentBytes));
+    // document-kit: §7.4.4 — a page's drawing is plain text; deflated
+    // (`compact`), a long report's PDF is about a fifth the size.
+    const contentsRef = doc.add(options.compact ? deflatedStream({}, contentBytes) : stream({}, contentBytes));
     const pageEntries: Record<string, PdfValue> = {
       Type: name('Page'),
       Parent: ref(pagesRef.id),

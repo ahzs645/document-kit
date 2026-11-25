@@ -34,6 +34,9 @@ const pdf = laid.toPdf({ info });    // same as docxToPdf, without laying out ag
 - `docxToPdf(docx, { fonts?, password?, info?, pdfA?, tagged? })` →
   `Promise<{ bytes, pageCount, pageSizes, losses }>`. `info` (title, author, …) is laid over the Word
   file's own properties; `pdfA` is a level such as `'PDF/A-2b'`; `tagged` writes a tagged PDF.
+  The PDF is written compact: each page's drawing is deflated, and a palette (8-bit indexed) PNG
+  stays a palette under an `/Indexed` colour space rather than being expanded to RGB. The pages are
+  the same; a long report is about a fifth of the size (`docs/ream-upstream.md`, change 16).
 - `docxToPages(docx, { fonts?, password?, sharedGlyphs? })` →
   `Promise<{ pages, pageSizes, pageText, pageLines, losses, glyphDefs? }>`. The same layout the PDF gets.
   - `pages[i]` is a standalone SVG document for page *i*, drawn by the engine's SVG writer one

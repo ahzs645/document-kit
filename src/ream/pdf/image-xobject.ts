@@ -9,7 +9,7 @@
 import type { PdfRef } from './objects';
 import type { PdfDocument } from './writer';
 import type { EmbedImageOptions, PreparedImage } from '../core/images';
-import { name, stream } from './objects';
+import { PdfHexString, name, stream } from './objects';
 import { prepareImage } from '../core/images';
 
 // Compatibility re-exports — the decode experts moved to core/images.
@@ -58,7 +58,13 @@ export function addImage(doc: PdfDocument, prepared: PreparedImage): EmbeddedIma
     Subtype: name('Image'),
     Width: prepared.widthPx,
     Height: prepared.heightPx,
-    ...(prepared.colorSpace ? { ColorSpace: name(prepared.colorSpace) } : {}),
+    // document-kit: §8.6.6.3 — a palette image: [/Indexed base hival lookup], the lookup a
+    // string of `hival + 1` base-space colours.
+    ...(prepared.palette && prepared.colorSpace
+      ? { ColorSpace: [name('Indexed'), name(prepared.colorSpace), prepared.palette.length / 3 - 1, new PdfHexString(prepared.palette)] }
+      : prepared.colorSpace
+        ? { ColorSpace: name(prepared.colorSpace) }
+        : {}),
     ...(prepared.bitsPerComponent !== undefined
       ? { BitsPerComponent: prepared.bitsPerComponent }
       : {}),
