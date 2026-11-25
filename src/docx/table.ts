@@ -269,9 +269,20 @@ export function writeTable(
   if (table.note !== undefined) out.push(styledParagraph('note', table.note, context, compact({ source: table.source })))
   // Space before the next block, so text does not sit on the table's last rule.
   const after = table.spaceAfter ?? context.theme.table.spaceAfter ?? 0
-  if (after > 0 && context.part === 'body' && !context.inCell && !context.frame) out.push(gapParagraph(after))
+  if (after > 0 && context.part === 'body' && !context.inCell && !context.frame) {
+    const gap = gapParagraph(after)
+    tableGaps.add(gap)
+    out.push(gap)
+  }
   return out
 }
+
+/**
+ * The space paragraphs written after tables. writeBlocks drops one when the next block starts a new page (or
+ * nothing follows): there is nothing to keep apart, and a table that fills its page would otherwise push the
+ * empty paragraph onto a page of its own, before the page break.
+ */
+export const tableGaps = new WeakSet<object>()
 
 function tableBorders(context: WriterContext) {
   const look = context.theme.table

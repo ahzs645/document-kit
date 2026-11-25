@@ -1,7 +1,7 @@
 // Space after a table: the theme's table.spaceAfter, a table's own spaceAfter over it, none inside a table cell.
 import { describe, expect, it } from 'vitest'
 
-import { document, headerRow, paragraph, row, section, table, type Block, type Document } from '../../src/model'
+import { document, heading, headerRow, pageBreak, paragraph, row, section, table, type Block, type Document } from '../../src/model'
 import { writeDocx } from '../../src/docx'
 import { readPackage } from './helpers'
 
@@ -34,5 +34,14 @@ describe('space after a table', () => {
     const cell = xml.slice(xml.indexOf('<w:tc>'), xml.lastIndexOf('</w:tc>'))
     expect(cell).not.toMatch(gap(180))
     expect(afterTable(xml)).toMatch(gap(180))
+  })
+
+  it('leaves no space before a block that starts a new page, or at the end', async () => {
+    // A table that ends at the foot of a page would otherwise push the empty space paragraph onto a blank page.
+    const beforeBreak = await xmlOf([small(), { ...heading(2, 'Next'), pageBreakBefore: true } as Block])
+    expect(afterTable(beforeBreak)).not.toMatch(gap(180))
+    const beforePageBreak = await xmlOf([small(), pageBreak(), paragraph('After.')])
+    expect(afterTable(beforePageBreak)).not.toMatch(gap(180))
+    expect(afterTable(await xmlOf([small()]))).not.toMatch(gap(180))
   })
 })

@@ -46,7 +46,7 @@ import {
   writeParagraph,
 } from './paragraphs'
 import { bookmarked } from './bookmarks'
-import { writeTable } from './table'
+import { tableGaps, writeTable } from './table'
 import { border, twips } from './units'
 
 export type FileChild = Paragraph | Table | TableOfContents
@@ -64,13 +64,19 @@ const HEADINGS = [
 export function writeBlocks(blocks: readonly Block[], context: WriterContext): FileChild[] {
   const out: FileChild[] = []
   let breakNext = false
-  for (const block of blocks) {
+  for (const [index, block] of blocks.entries()) {
     if (block.type === 'pageBreak') {
       breakNext = true
       continue
     }
     const breakBefore = (breakNext || block.pageBreakBefore === true) && context.part === 'body' && !context.frame
     const written = writeBlock(block, context, breakBefore)
+    // A table's trailing space is pointless when the next block starts a new page, and harmful when the table
+    // ends at the foot of its page: the empty paragraph would spill onto a blank page of its own.
+    const next = blocks[index + 1]
+    const nextStartsPage = !next || next.type === 'pageBreak' || next.pageBreakBefore === true
+    const last = written[written.length - 1]
+    if (nextStartsPage && last && tableGaps.has(last)) written.pop()
     if (written.length) breakNext = false
     else if (breakBefore) breakNext = true
     out.push(...written)
