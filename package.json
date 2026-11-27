@@ -18,6 +18,10 @@
       "types": "./dist/types/docx/index.d.ts",
       "import": "./dist/docx.js"
     },
+    "./html": {
+      "types": "./dist/types/html/index.d.ts",
+      "import": "./dist/html.js"
+    },
     "./layout": {
       "types": "./dist/types/layout/index.d.ts",
       "import": "./dist/layout.js"

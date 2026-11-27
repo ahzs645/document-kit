@@ -12,8 +12,8 @@ const files = (dir: string): string[] =>
   )
 
 describe('browser safety', () => {
-  it('keeps Node and the DOM out of the model and the Word writer', () => {
-    const sources = [...files(join(root, 'model')), ...files(join(root, 'docx')), join(root, 'index.ts')]
+  it('keeps Node and the DOM out of the model, the Word writer and the HTML writer', () => {
+    const sources = [...files(join(root, 'model')), ...files(join(root, 'docx')), ...files(join(root, 'html')), join(root, 'index.ts')]
     expect(sources.length).toBeGreaterThan(10)
     for (const file of sources) {
       const code = readFileSync(file, 'utf8')

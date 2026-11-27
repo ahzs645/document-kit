@@ -23,6 +23,7 @@ and nothing that belongs to one of them.
 |---|---|---|
 | `src/model` | The block model: a document as data before layout | `document-kit` |
 | `src/docx` | Writes the block model as a Word file (the `docx` library) | `document-kit/docx` |
+| `src/html` | Writes the block model as one print-styled HTML page, from the same theme and styles | `document-kit/html` |
 | `src/layout` | Word file to PDF, page pictures (SVG) and HTML, with fonts passed in | `document-kit/layout` |
 | `src/template` | Fills a Word template's tags from data | `document-kit/template` |
 | `src/recipe` | Reports from JSON components and recipes: compile, render, layering, own recipes, code components | `document-kit/recipe` |

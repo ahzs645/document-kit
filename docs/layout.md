@@ -254,6 +254,8 @@ supplied or embedded face draws, so they are no longer named as missing symbols;
   outlines unless `sharedGlyphs` is asked for.
 - **Tick boxes only.** Of the symbols the bundled faces lack, only ☐ ☑ ☒ are drawn (see Losses);
   other symbols still print as empty boxes with a loss.
-- **HTML has no headers, footers or page numbers.**
+- **`docxToHtml` has no headers, footers or page numbers**: it flows a Word file. To print the
+  block model as HTML with its pages, headers, footers, frames and fonts, use `writeHtml` from
+  `document-kit/html` (`docs/html.md`), which reads the document the Word writer reads.
 - **Fidelity is the engine's.** Stand-ins match widths, not shapes. Layout differences from
   Word in particular documents are the engine's to fix (and record in `docs/ream-upstream.md`).
