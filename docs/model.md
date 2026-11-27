@@ -191,6 +191,36 @@ section(
 )
 ```
 
+## Embedded fonts
+
+`writeDocx(doc, { embedFonts })` embeds fonts in the file (Word's *Embed fonts*), by family name, so the document
+shows in its own faces where they are not installed, and `document-kit/layout` draws with them:
+
+```ts
+const fonts: NamedFont[] = [
+  { family: 'Brand Sans', bytes: regular },             // weight 400, upright: the regular face
+  { family: 'Brand Sans', weight: 700, bytes: bold },   // 600 and heavier: the bold face
+  { family: 'Brand Sans', style: 'italic', bytes: italic },
+]
+const docx = await writeDocx(doc, { embedFonts: fonts })
+fontEmbeddingReport(fonts, 'docx')   // [{ family, weight, style, slot, format, fsType, embedded, reason }, …]
+```
+
+- Word knows four faces a family: regular, bold, italic, bold italic. A face of weight 600 or more fills the bold
+  slot; where two faces want one slot, the one nearer 400 (or 700) has it. A light or black cut is a family of its
+  own (`Brand Sans Light`). Runs and styles name the family (`font: 'Brand Sans'`).
+- Each face is checked against its own licence flags (OS/2 `fsType`) and against what Word can carry, and only
+  those `fontEmbeddingReport(fonts, 'docx')` marks `embedded` go in: **TrueType outlines** whose flags allow
+  **installable or editable** embedding. Refused, with the reason in the report: OpenType faces with CFF outlines
+  (`.otf`; Word embeds TrueType only: install the face, or supply a TrueType build), preview & print embedding (an
+  editable Word file cannot use it), restricted and bitmap-only faces, a face with no OS/2 table, a collection, a
+  family with no regular or bold face. A refused face is never dropped silently: `writeDocx` leaves it out, the
+  report says why, and the application can carry the list (a custom property, say).
+- Faces go in whole, never subset, obfuscated as ECMA-376 §17.8.1 says, under `w:embedRegular`, `w:embedBold`,
+  `w:embedItalic`, `w:embedBoldItalic` in the font table, with `w:embedTrueTypeFonts` set. The obfuscation key is
+  made from the font's own bytes, so the same fonts write the same file.
+- The licence flags are the font's statement; the vendor's licence terms still go with the file.
+
 ## Signature options
 
 | Option | Default | |
@@ -399,8 +429,9 @@ The `docx` library gives hyperlink relationships random ids, and numbers drawing
 run on across every document made in the same page; it stamps the creation time and every zip entry with the moment
 of writing. `writeDocx` renames the random relationship ids (`rIdL1`…), numbers drawing ids, bookmark ids and the
 contents' `_Toc` names from 1 in each file, writes the zip entries with one fixed time, and, when the document gives
-`metadata.created`, writes that time in `docProps/core.xml`. The same document gives the same `word/document.xml`
-always, and the same bytes whenever `created` is given.
+`metadata.created`, writes that time in `docProps/core.xml`. An embedded font's obfuscation key (random in the library)
+is made from the font's bytes. The same document gives the same `word/document.xml` always, and the same bytes
+whenever `created` is given.
 
 ## From the applications' blocks to the kit's
 

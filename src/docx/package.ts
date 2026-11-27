@@ -6,6 +6,8 @@
  *   run on across every document made in the same page, are numbered from 1 in each file;
  * - the created and modified times in `docProps/core.xml` are the document's own when it gives them;
  * - the zip entries carry one fixed time instead of the moment of writing;
+ * - an embedded font's obfuscation key (`w:fontKey`, a random GUID) is made from the font's own bytes, and the font file
+ *   re-obfuscated with it;
  * - the custom properties (`docProps/custom.xml`), when given, are written with their types.
  *
  * Runs on the package's bytes with fflate and string replacement only, so it works in a browser.
@@ -99,6 +101,31 @@ export function normalizePackage(bytes: Uint8Array, options: NormalizeOptions = 
     )
   }
 
+  // Embedded fonts: each face's key made from its own bytes, so the same fonts give the same file.
+  const fontTable = text.get('word/fontTable.xml')
+  const fontRels = text.get('word/_rels/fontTable.xml.rels')
+  if (fontTable !== undefined && fontRels !== undefined && fontTable.includes('w:fontKey')) {
+    const targets = new Map<string, string>()
+    for (const m of fontRels.matchAll(/<Relationship\b[^>]*>/g)) {
+      const id = /\bId="([^"]+)"/.exec(m[0])?.[1]
+      const target = /\bTarget="([^"]+)"/.exec(m[0])?.[1]
+      if (id && target) targets.set(id, target.startsWith('/') ? target.slice(1) : `word/${target}`)
+    }
+    let table = fontTable
+    for (const m of fontTable.matchAll(/<w:embed(?:Regular|Bold|Italic|BoldItalic)\b[^>]*\/>/g)) {
+      const element = m[0]
+      const id = /\br:id="([^"]+)"/.exec(element)?.[1]
+      const key = /\bw:fontKey="\{?([0-9A-Fa-f-]{36})\}?"/.exec(element)?.[1]
+      const file = id ? targets.get(id) : undefined
+      if (!key || !file || !files[file]) continue
+      const plain = obfuscateFont(files[file]!, key)
+      const next = fontKeyOf(plain, file)
+      files[file] = obfuscateFont(plain, next)
+      table = table.replace(element, element.replace(/(\bw:fontKey=")[^"]*(")/, `$1{${next}}$2`))
+    }
+    text.set('word/fontTable.xml', table)
+  }
+
   // Custom properties, with their types.
   if (options.customProperties) {
     text.set('docProps/custom.xml', customXml(options.customProperties))
@@ -142,6 +169,32 @@ function isoTime(value: string): string {
   const time = Date.parse(value)
   if (Number.isNaN(time)) throw new Error(`document-kit: "${value}" is not an ISO 8601 time`)
   return new Date(time).toISOString().replace(/\.\d{3}Z$/, 'Z')
+}
+
+/**
+ * ECMA-376 Part 1 §17.8.1 font obfuscation: the first 32 bytes of the file XORed with the key's 16 bytes, the key read
+ * from its GUID's hex digits in reverse. The same operation hides and reveals.
+ */
+export function obfuscateFont(bytes: Uint8Array, key: string): Uint8Array<ArrayBuffer> {
+  const hex = key.replace(/[{}-]/g, '')
+  if (!/^[0-9A-Fa-f]{32}$/.test(hex)) throw new Error(`document-kit: "${key}" is not a font key GUID`)
+  const digits = Array.from({ length: 16 }, (_, i) => parseInt(hex.slice(i * 2, i * 2 + 2), 16)).reverse()
+  const out = new Uint8Array(bytes)
+  for (let i = 0; i < 32 && i < out.length; i += 1) out[i] = out[i]! ^ digits[i % 16]!
+  return out
+}
+
+/** A GUID made from a font's bytes and its part name: four FNV-1a hashes with different seeds. */
+function fontKeyOf(bytes: Uint8Array, part: string): string {
+  const words: string[] = []
+  for (const seed of [0x811c9dc5, 0x01000193, 0x9e3779b9, 0x85ebca6b]) {
+    let h = seed >>> 0
+    for (let i = 0; i < part.length; i += 1) h = Math.imul(h ^ part.charCodeAt(i), 0x01000193) >>> 0
+    for (let i = 0; i < bytes.length; i += 1) h = Math.imul(h ^ bytes[i]!, 0x01000193) >>> 0
+    words.push(h.toString(16).padStart(8, '0').toUpperCase())
+  }
+  const all = words.join('')
+  return `${all.slice(0, 8)}-${all.slice(8, 12)}-${all.slice(12, 16)}-${all.slice(16, 20)}-${all.slice(20, 32)}`
 }
 
 const escapeXml = (value: string): string =>

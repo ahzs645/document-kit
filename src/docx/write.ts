@@ -9,16 +9,20 @@ import {
   Table,
   TableOfContents,
   VerticalAlignSection,
+  type IPropertiesOptions,
   type ISectionOptions,
 } from 'docx'
 import {
   applyTextRules,
   expandDocument,
+  fontEmbeddingReport,
+  groupFonts,
   numberCaptions,
   pageBox,
   resolveTheme,
   styleTable,
   type CustomRegistry,
+  type NamedFont,
   type StyleTable,
 } from '../model/index'
 import type { Block, Document, Section, TextStyle } from '../model/types'
@@ -41,6 +45,14 @@ export interface WriteDocxOptions {
   nullCells?: 'empty' | 'rule'
   /** The application named in the file's properties (`docProps/core.xml` creator), when the author is not given. */
   creator?: string
+  /**
+   * Fonts to embed in the file (Word's *Embed fonts*), by family name, so it shows in its own faces where they are
+   * not installed, and `document-kit/layout` draws with them. Each face is checked first ({@link fontEmbeddingReport}
+   * with target `docx`): only TrueType faces whose licence flags allow installable or editable embedding go in,
+   * whole. A face that cannot (an OpenType CFF face, a restricted one) is left out; ask `fontEmbeddingReport` for the
+   * list and the reasons.
+   */
+  embedFonts?: readonly NamedFont[]
 }
 
 const SECTION_ALIGN = {
@@ -98,6 +110,7 @@ function buildDocx(source: Document, options: WriteDocxOptions): DocxDocument {
   return new DocxDocument({
     sections,
     styles: stylesFor(theme, styles),
+    ...(options.embedFonts?.length ? embeddedFonts(options.embedFonts) : {}),
     numbering: lists.numbering(),
     ...(footnotes.size && { footnotes: footnotes.definitions, features: { updateFields: true } }),
     ...(metadata.title ? { title: metadata.title } : {}),
@@ -107,6 +120,37 @@ function buildDocx(source: Document, options: WriteDocxOptions): DocxDocument {
     creator: metadata.author ?? options.creator ?? 'document-kit',
     lastModifiedBy: metadata.author ?? options.creator ?? 'document-kit',
   })
+}
+
+type FontData = NonNullable<IPropertiesOptions['fonts']>[number]['data']
+
+/** The faces that may be embedded, as the docx library's font table: one entry a family, its faces by slot. */
+function embeddedFonts(fonts: readonly NamedFont[]) {
+  const report = fontEmbeddingReport(fonts, 'docx')
+  const allowed = fonts.filter((_, index) => report[index]!.embedded)
+  const { families } = groupFonts(allowed)
+  // The library types a face's bytes as Node's Buffer; it only slices and maps them, which a Uint8Array does too.
+  const bytes = (font: NamedFont | undefined) =>
+    font
+      ? ((font.bytes instanceof Uint8Array ? font.bytes : new Uint8Array(font.bytes)) as unknown as FontData)
+      : undefined
+  const list = [...families.values()].flatMap(({ family, faces }) => {
+    const regular = bytes(faces.regular ?? faces.bold)
+    if (!regular) return []
+    const bold = bytes(faces.bold)
+    const italic = bytes(faces.italic)
+    const boldItalic = bytes(faces.boldItalic)
+    return [
+      {
+        name: family,
+        data: regular,
+        ...(bold && faces.regular ? { bold } : {}),
+        ...(italic ? { italic } : {}),
+        ...(boldItalic ? { boldItalic } : {}),
+      },
+    ]
+  })
+  return list.length ? { fonts: list } : {}
 }
 
 function writeSection(section: Section, context: WriterContext): ISectionOptions {

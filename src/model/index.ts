@@ -62,3 +62,17 @@ export {
   type ResolvedParagraphStyle,
   type StyleTable,
 } from './styles'
+export {
+  familyKey,
+  fontEmbeddingReport,
+  fontFileInfo,
+  fontSlot,
+  groupFonts,
+  type EmbeddingLevel,
+  type EmbeddingTarget,
+  type FontEmbedding,
+  type FontFileInfo,
+  type FontFormat,
+  type FontSlot,
+  type NamedFont,
+} from './fonts'

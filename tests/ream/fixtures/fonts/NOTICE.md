@@ -23,6 +23,15 @@ The licence is reproduced in `Arimo-OFL.txt`.
 |---|---|---|
 | `Arimo-Regular.ttf` | `02219a6ff8456d98` | `Arimo_400Regular.ttf` from `@expo-google-fonts/arimo` on jsDelivr — the face the library downloads for a document that names no font. `tests/ligatures.test.ts` turns on its coverage: no U+FB00, U+FB01/U+FB02 with their private-use twins U+F001/U+F002, and U+210E. `tests/turkic-cyrillic.test.ts` on its one glyph for the Latin and the Cyrillic schwa (U+0259/U+04D9, U+018F/U+04D8), its composed Cyrillic letters and its `mark` anchors (the acute over а at −284, −340, as `hb-shape` 15.0.0 gives it). |
 
+## Inconsolata 001.010 — OFL-1.1
+
+Copyright 2006 Raph Levien. The licence is reproduced in `Inconsolata-OFL.txt`; the font reserves
+no name.
+
+| File | sha256 (16) | Why it is here |
+|---|---|---|
+| `Inconsolata-Regular.otf` | `1561e616c414a1b8` | `Inconsolata.otf` as `bwip-js` 4.11.4 ships it in its `fonts/`: an OpenType face with CFF outlines (`OTTO`, not CID-keyed) and `fsType` 8 (editable embedding). `tests/layout/named-fonts.test.ts` lays text out in it as a caller-named face and checks the PDF carries it as `/FontFile3`; `tests/model/fonts.test.ts`, `tests/docx/embedded-fonts.test.ts` and `tests/html/write.test.ts` check that Word embedding refuses it and HTML carries it. |
+
 ## Caladea 1.001 — OFL-1.1
 
 Copyright 2012 The Caladea Project Authors (<https://github.com/huertatipografica/Caladea>).
