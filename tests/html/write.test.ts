@@ -172,3 +172,45 @@ describe('writeHtml', () => {
     expect(html).toContain('data:image/png;base64,iVBORw0KGgo')
   })
 })
+
+/** Every start tag in the page, its attributes read as a browser reads them (double-quoted values, references decoded). */
+function startTags(html: string): Array<{ name: string; attributes: Record<string, string>; whole: boolean }> {
+  const decode = (value: string) =>
+    value.replace(/&(quot|amp|lt|gt|#39);/g, (_, name: string) => ({ quot: '"', amp: '&', lt: '<', gt: '>', '#39': "'" })[name]!)
+  return [...html.matchAll(/<([a-z][a-z0-9]*)((?:\s[^\s=>]+(?:="[^"]*")?)*)(\s*[^>]*)>/g)].map((m) => ({
+    name: m[1]!,
+    attributes: Object.fromEntries([...m[2]!.matchAll(/\s([^\s=>]+)(?:="([^"]*)")?/g)].map((a) => [a[1]!, decode(a[2] ?? '')])),
+    // Nothing left over between the last attribute and the tag's end: no attribute ended early.
+    whole: m[3]!.trim() === '',
+  }))
+}
+
+describe('attribute values', () => {
+  const family = 'Brand "Display" Sans'
+
+  it('escapes a font stack\'s quoted names in a style attribute, so nothing after the font is lost', () => {
+    const html = writeHtml(
+      document([section([table([headerRow(['Header text']), row(['Body'])]), paragraph([text('Run in the face', { font: family, color: '#336699' })])])], {
+        theme: { table: { headerText: { font: family, color: 'aa3311', bold: true } } },
+      }),
+    )
+    const tags = startTags(html.slice(html.indexOf('<body')))
+    expect(tags.every((tag) => tag.whole)).toBe(true)
+    const header = tags.find((tag) => tag.name === 'p' && tags[tags.indexOf(tag) - 1]?.name === 'th')!
+    expect(header.attributes.style).toContain(`font-family:"Brand \\22 Display\\22  Sans", sans-serif`)
+    expect(header.attributes.style).toContain('color:#aa3311')
+    expect(header.attributes.style).toContain('font-weight:700')
+    const runs = tags.filter((tag) => tag.name === 'span' && tag.attributes.style?.includes('Display'))
+    // The header cell's text and the paragraph's run, each with what follows its font.
+    expect(runs.map((tag) => tag.attributes.style)).toEqual([
+      'font-family:"Brand \\22 Display\\22  Sans", sans-serif;color:#aa3311;font-weight:700',
+      'font-family:"Brand \\22 Display\\22  Sans", sans-serif;color:#336699',
+    ])
+  })
+
+  it('keeps the style sheet whole whatever a font is named', () => {
+    const html = writeHtml(document([section([paragraph('x')])], { theme: { body: { font: 'Odd</style><b>Face' } } }))
+    expect(html.match(/<\/style>/g)).toHaveLength(1)
+    expect(html).not.toContain('<b>')
+  })
+})

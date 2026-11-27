@@ -3,7 +3,7 @@
  * properties, an embedded face) written as Word, laid out with a face named by the caller, and written as HTML, all
  * from the built package in the page. Made-up content only. Throws on failure; returns a JSON-serialisable summary.
  */
-import { document, floatingImage, fontEmbeddingReport, frame, heading, paragraph, section, text } from 'document-kit'
+import { document, floatingImage, fontEmbeddingReport, frame, heading, headerRow, paragraph, row, section, table, text } from 'document-kit'
 import { writeDocx } from 'document-kit/docx'
 import { writeHtml } from 'document-kit/html'
 import { createFontProvider, layoutDocx } from 'document-kit/layout'
@@ -30,12 +30,15 @@ export default async function brandCase(ctx) {
         ],
         { page: { paper: 'letter', margins: { top: 0, bottom: 0, left: 0, right: 0, header: 0, footer: 0 } }, header: [floatingImage(art, 'page', { alt: 'Artwork' })] },
       ),
-      section([paragraph([text('Tracked', { characterStyle: 'Wide' })], { style: 'CoverLine' })], { header: [] }),
+      section([paragraph([text('Tracked', { characterStyle: 'Wide' })], { style: 'CoverLine' }), table([headerRow(['Quoted face']), row(['Body'])])], { header: [] }),
     ],
     {
       metadata: { title: 'Made-up brand document', custom: { 'app.id': 'case-1' } },
-      theme: { body: { font: 'Brand Serif' } },
-      styles: { paragraph: [{ id: 'CoverLine', text: { size: 14, characterSpacing: 1 } }], character: [{ id: 'Wide', text: { characterSpacing: 3 } }] },
+      theme: { body: { font: 'Brand Serif' }, table: { headerText: { font: 'Brand "Quoted" Face', color: 'aa3311', bold: true } } },
+      styles: {
+        paragraph: [{ id: 'CoverLine', text: { size: 14, characterSpacing: 1 } }],
+        character: [{ id: 'Wide', text: { characterSpacing: 3 } }],
+      },
     },
   )
   const report = fontEmbeddingReport(brand, 'docx')
@@ -67,6 +70,12 @@ export default async function brandCase(ctx) {
   const placed = frameEl.contentDocument.querySelector('.dk-frame').getBoundingClientRect()
   const sheetBox = sheets[0].getBoundingClientRect()
   check(Math.abs(placed.left - sheetBox.left - 96) < 1 && Math.abs(placed.top - sheetBox.top - 192) < 1, 'the frame is not where it was put')
+  const view = frameEl.contentWindow
+  // A quoted face name in the header cell's style attribute does not cut off what follows it.
+  const headerText = frameEl.contentDocument.querySelector('th p')
+  const headerStyle = view.getComputedStyle(headerText)
+  check(headerStyle.color === 'rgb(170, 51, 17)', `the header text is ${headerStyle.color}`)
+  check(/Quoted.*Face.*sans-serif/.test(headerStyle.fontFamily), `the header face is ${headerStyle.fontFamily}`)
   frameEl.remove()
   return { pages: laid.pageCount, htmlBytes: html.length, sheets: sheets.length }
 }

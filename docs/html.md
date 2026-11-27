@@ -59,6 +59,10 @@ The browser breaks the lines, not the layout engine, so pages are approximated w
   "Page 2 of 9" at the right edge of a footer). Without stops a tab advances to the next half inch.
 - Paragraph spacing adds as Word adds it (no collapsing margins: every flow is a flex column), a line multiple is
   set on 1.2 em (about a face's own line), and the first block of a sheet, a frame or a header takes no space above.
+- Every `style` attribute is escaped as an attribute value (`styleAttr` in `src/html/css.ts`): a font stack's quoted
+  names, or a font named with quotes, no longer end the attribute and lose what follows. Font names in the style
+  sheet are CSS strings with quotes, backslashes and angle brackets escaped, and the style sheet holds no `<`, so no
+  name can close it.
 
 ## Known gaps
 

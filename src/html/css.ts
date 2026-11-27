@@ -17,11 +17,26 @@ export function color(value: string): string {
   throw new Error(`document-kit: ${JSON.stringify(value)} is not a hex colour; write it as #rrggbb or #rgb (the # is optional)`)
 }
 
+/** Text for HTML content or a quoted attribute value: `&`, `<`, `>`, `"` and `'` written as references. */
 export const escapeHtml = (value: string): string =>
   value.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!)
 
-/** A CSS string literal. */
-export const cssString = (value: string): string => `"${value.replace(/["\\\n\r]/g, (c) => `\\${c.charCodeAt(0).toString(16)} `)}"`
+/**
+ * A CSS string literal. Quotes, backslashes, line ends and angle brackets are written as CSS escapes, so the literal
+ * neither ends early nor closes the `<style>` element it may stand in. In a `style` attribute it still needs the
+ * attribute's own escaping ({@link styleAttr}).
+ */
+export const cssString = (value: string): string =>
+  `"${value.replace(/["\\\n\r<>]/g, (c) => `\\${c.charCodeAt(0).toString(16)} `)}"`
+
+/**
+ * A ` style="…"` attribute from CSS declarations, escaped as an attribute value (a font stack's quoted names would
+ * otherwise end it); nothing when there are no declarations.
+ */
+export function styleAttr(css: string | readonly string[]): string {
+  const text = typeof css === 'string' ? css : css.filter(Boolean).join(';')
+  return text ? ` style="${escapeHtml(text)}"` : ''
+}
 
 /** Word's highlight colours as CSS. */
 export const HIGHLIGHT: Readonly<Record<Highlight, string>> = {

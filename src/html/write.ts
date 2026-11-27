@@ -78,6 +78,7 @@ import {
   LINE,
   paragraphCss,
   pt,
+  styleAttr,
   styleCss,
   textCss,
 } from './css'
@@ -317,7 +318,8 @@ export function writeHtml(source: Document, options: WriteHtmlOptions = {}): str
   return (
     `<!doctype html><html lang="${escapeHtml(options.lang ?? 'en')}"><head><meta charset="utf-8">` +
     `<meta name="viewport" content="width=device-width,initial-scale=1">${meta}` +
-    `<title>${escapeHtml(metadata.title ?? '')}</title><style>\n${css}\n</style></head>` +
+    // No `<` in the style sheet (CSS needs none outside strings, which escape it), so nothing in it can close it.
+    `<title>${escapeHtml(metadata.title ?? '')}</title><style>\n${css.replace(/</g, '\\3c ')}\n</style></head>` +
     `<body class="dk-doc">\n${html}\n</body></html>`
   )
 }
@@ -363,7 +365,7 @@ function blockHtml(block: Block, ctx: Ctx): string {
     case 'pinned': {
       if (ctx.inFrame || ctx.part !== 'body') return blocksHtml(block.blocks, ctx)
       const space = block.spaceBelow ? `padding-bottom:${pt(block.spaceBelow)}` : ''
-      ctx.sheet.pinned.push(`<div class="dk-pinned dk-flow" style="${space}">${blocksHtml(block.blocks, { ...ctx, inFrame: true })}</div>`)
+      ctx.sheet.pinned.push(`<div class="dk-pinned dk-flow"${styleAttr(space)}>${blocksHtml(block.blocks, { ...ctx, inFrame: true })}</div>`)
       return ''
     }
     case 'frame':
@@ -373,7 +375,7 @@ function blockHtml(block: Block, ctx: Ctx): string {
     case 'toc':
       return tocHtml(block, ctx)
     case 'spacer':
-      return block.height > 0 ? `<div class="dk-spacer" style="height:${pt(block.height)};flex:none"></div>` : ''
+      return block.height > 0 ? `<div class="dk-spacer"${styleAttr(`height:${pt(block.height)};flex:none`)}></div>` : ''
     case 'pageBreak':
       return ''
     case 'custom':
@@ -400,7 +402,7 @@ function headingHtml(block: HeadingBlock, ctx: Ctx): string {
   if (ctx.part === 'body') {
     ctx.state.headings.push({ level, id, text: plainText(block.content), page: ctx.sheet.plan.label })
   }
-  const style = block.align ? ` style="text-align:${block.align}"` : ''
+  const style = block.align ? styleAttr(`text-align:${block.align}`) : ''
   return `<h${level} class="dk-p dk-ps-Heading${level}" id="${escapeHtml(id)}"${style}>${tabbed(content, undefined, ctx)}</h${level}>`
 }
 
@@ -442,12 +444,12 @@ function paragraphHtml(block: ParagraphBlock, ctx: Ctx): string {
   const content = tabbed(inlineHtml(block.content, ctx, base), block.tabs, ctx, indent?.left ?? 0)
   const id = block.bookmark ? ` id="${escapeHtml(idFor(ctx.state, block.bookmark, 'dk-b'))}"` : ''
   const tabbedClass = content.startsWith(TABBED) ? ' dk-tabbed' : ''
-  return `<p class="dk-p dk-ps-${style}${tabbedClass}"${id}${css.length ? ` style="${css.join(';')}"` : ''}>${content.replace(TABBED, '')}</p>`
+  return `<p class="dk-p dk-ps-${style}${tabbedClass}"${id}${styleAttr(css)}>${content.replace(TABBED, '')}</p>`
 }
 
 /** A paragraph of rich text in one of the theme's styles (a note, a caption), as the writers add them. */
 function styled(styleId: string, content: string, css: string[] = []): string {
-  return `<p class="dk-p dk-ps-${styleId}"${css.length ? ` style="${css.join(';')}"` : ''}>${content}</p>`
+  return `<p class="dk-p dk-ps-${styleId}"${styleAttr(css)}>${content}</p>`
 }
 
 const TAB = '\u0001'
@@ -479,7 +481,7 @@ function tabbed(content: string, stops: readonly TabStop[] | undefined, ctx: Ctx
         : stop.align === 'center'
           ? `left:${pt(at)};transform:translateX(-50%)`
           : `left:${pt(at)}`
-    out += `<span class="dk-at" style="${place}">${part}</span>`
+    out += `<span class="dk-at"${styleAttr(place)}>${part}</span>`
   })
   if (!parts[0]) out = `&#8203;${out}`
   return TABBED + out
@@ -510,8 +512,8 @@ function styleOf(value: object): TextStyle {
 function styledText(html: string, style: TextStyle, ctx: Ctx): string {
   characterStyleId(ctx.state.styles, style.characterStyle)
   const css = textCss(style)
-  const cls = style.characterStyle ? ` class="dk-cs-${style.characterStyle}"` : ''
-  let out = css.length || cls ? `<span${cls}${css.length ? ` style="${css.join(';')}"` : ''}>${html}</span>` : html
+  const cls = style.characterStyle ? ` class="dk-cs-${escapeHtml(style.characterStyle)}"` : ''
+  let out = css.length || cls ? `<span${cls}${styleAttr(css)}>${html}</span>` : html
   if (style.superscript) out = `<sup>${out}</sup>`
   else if (style.subscript) out = `<sub>${out}</sub>`
   return out
@@ -569,7 +571,7 @@ function inlineHtml(text: RichText, ctx: Ctx, base: InlineBase = {}): string {
             : inline.field === 'pages'
               ? String(state.pages)
               : String(state.sectionPages.get(plan.section) ?? 1)
-        out += styledText(`<span class="dk-field" data-field="${inline.field}">${escapeHtml(value)}</span>`, style, ctx)
+        out += styledText(`<span class="dk-field" data-field="${escapeHtml(String(inline.field))}">${escapeHtml(value)}</span>`, style, ctx)
         break
       }
       case 'break':
@@ -584,7 +586,7 @@ function inlineHtml(text: RichText, ctx: Ctx, base: InlineBase = {}): string {
           out += textHtml(`[${inline.what ?? ''}]`, { ...style, ...state.theme.placeholderMark }, ctx, true)
           break
         }
-        out += styledText(`<span class="dk-blank" style="width:${pt(inline.width ?? state.theme.blankWidth)}">&nbsp;</span>`, style, ctx)
+        out += styledText(`<span class="dk-blank"${styleAttr(`width:${pt(inline.width ?? state.theme.blankWidth)}`)}>&nbsp;</span>`, style, ctx)
         break
       }
       case 'checkbox': {
@@ -608,7 +610,7 @@ function dataUrl(image: ImageData): string {
 }
 
 function imgHtml(image: ImageData, width: number, height: number, alt: string | undefined, css: string[] = []): string {
-  return `<img src="${dataUrl(image)}" alt="${escapeHtml(alt ?? '')}" style="${[`width:${pt(width)}`, `height:${pt(height)}`, 'vertical-align:bottom', ...css].join(';')}">`
+  return `<img src="${dataUrl(image)}" alt="${escapeHtml(alt ?? '')}"${styleAttr([`width:${pt(width)}`, `height:${pt(height)}`, 'vertical-align:bottom', ...css])}>`
 }
 
 function footnoteHtml(id: string, ctx: Ctx): string {
@@ -651,7 +653,7 @@ function listHtml(block: ListBlock, ctx: Ctx): string {
         return `<li class="dk-ps-${paragraphStyle({}, ctx)}">${content}${nested}</li>`
       })
       .join('')
-    return `<${tag} class="dk-list" style="list-style-type:${kind}"${ordered && start !== 1 ? ` start="${start}"` : ''}>${lis}</${tag}>`
+    return `<${tag} class="dk-list"${styleAttr(`list-style-type:${kind}`)}${ordered && start !== 1 ? ` start="${start}"` : ''}>${lis}</${tag}>`
   }
   return visit(block.items, block.ordered === true, 0, Math.floor(block.start ?? 1))
 }
@@ -695,13 +697,13 @@ function fieldsHtml(block: FieldsBlock, ctx: Ctx): string {
     const label = inlineHtml(row.label, ctx, { style: { ...style, bold: true } }).split(TAB).join(' ')
     const value =
       row.value === null
-        ? styledText(`<span class="dk-blank" style="width:${pt(ctx.state.theme.blankWidth)}">&nbsp;</span>`, style, ctx)
+        ? styledText(`<span class="dk-blank"${styleAttr(`width:${pt(ctx.state.theme.blankWidth)}`)}>&nbsp;</span>`, style, ctx)
         : inlineHtml(row.value, ctx, { style, ...(row.source ? { source: row.source } : {}) }).split(TAB).join(' ')
     const sep = escapeHtml(tabAt === undefined || joined ? separator : separator.trimEnd())
     const head =
       tabAt === undefined || joined
         ? `${label}${styledText(sep, { ...style, bold: true }, ctx)}`
-        : `<span style="display:inline-block;min-width:${pt(tabAt)};text-indent:0">${label}${styledText(sep, { ...style, bold: true }, ctx)}</span>`
+        : `<span${styleAttr(`display:inline-block;min-width:${pt(tabAt)};text-indent:0`)}>${label}${styledText(sep, { ...style, bold: true }, ctx)}</span>`
     return joined ? `<span style="white-space:nowrap">${head}${value}</span>` : `${head}${value}`
   }
   const gap = block.sameLineGap ?? 24
@@ -710,8 +712,8 @@ function fieldsHtml(block: FieldsBlock, ctx: Ctx): string {
     if (index < lines.length - 1) css.push('break-after:avoid')
     if (tabAt !== undefined) css.push(`padding-left:${pt(tabAt)}`, `text-indent:${pt(-tabAt)}`)
     if (block.rowSpacing !== undefined) css.push(`margin-bottom:${pt(block.rowSpacing)}`)
-    const content = line.map((row, at) => (at ? `<span style="display:inline-block;width:${pt(gap)}"></span>` : '') + rowHtml(row, at > 0)).join('')
-    out += `<p class="dk-p dk-ps-${paragraphStyle({}, ctx)}"${css.length ? ` style="${css.join(';')}"` : ''}>${content}</p>`
+    const content = line.map((row, at) => (at ? `<span${styleAttr(`display:inline-block;width:${pt(gap)}`)}></span>` : '') + rowHtml(row, at > 0)).join('')
+    out += `<p class="dk-p dk-ps-${paragraphStyle({}, ctx)}"${styleAttr(css)}>${content}</p>`
   })
   return out
 }
@@ -811,17 +813,17 @@ function tableHtml(table: TableBlock, ctx: Ctx, number?: number): string {
           if (table.line !== undefined) pcss.push(`line-height:${Math.round(table.line * LINE * 1000) / 1000}`)
           const text =
             cell.content === null && ctx.state.nullCells === 'rule'
-              ? `<span class="dk-blank" style="width:${pt(Math.min(inner * 0.8, theme.blankWidth))}">&nbsp;</span>`
+              ? `<span class="dk-blank"${styleAttr(`width:${pt(Math.min(inner * 0.8, theme.blankWidth))}`)}>&nbsp;</span>`
               : cell.content === null || cell.content === undefined
                 ? ''
                 : tabbed(inlineHtml(cell.content, { ...ctx, width: inner }, { style: base, ...(cell.source ? { source: cell.source } : {}) }), undefined, ctx)
           content = styled('KitTable', text, pcss)
         }
         if (cell.textDirection) {
-          content = `<div style="writing-mode:vertical-rl;${cell.textDirection === 'up' ? 'transform:rotate(180deg);' : ''}margin:auto">${content}</div>`
+          content = `<div${styleAttr(`writing-mode:vertical-rl;${cell.textDirection === 'up' ? 'transform:rotate(180deg);' : ''}margin:auto`)}>${content}</div>`
         }
         const span = `${placed.colSpan > 1 ? ` colspan="${placed.colSpan}"` : ''}${placed.rowSpan > 1 ? ` rowspan="${placed.rowSpan}"` : ''}`
-        return `<${tag}${span}${tag === 'th' ? ' scope="col"' : ''} style="${css.join(';')}">${content}</${tag}>`
+        return `<${tag}${span}${tag === 'th' ? ' scope="col"' : ''}${styleAttr(css)}>${content}</${tag}>`
       })
     const least = role === 'spacer' ? (row.height ?? look.spacerHeight) : (row.height ?? (role === 'header' ? look.headerRowHeight : look.rowHeight))
     const trCss: string[] = []
@@ -829,9 +831,9 @@ function tableHtml(table: TableBlock, ctx: Ctx, number?: number): string {
     if (row.cantSplit ?? table.keepTogether ?? table.cantSplit) trCss.push('break-inside:avoid')
     const keepNext = row.keepWithNext ?? (r < lastRow && (table.keepTogether === true || role === 'header'))
     if (keepNext) trCss.push('break-after:avoid')
-    return `<tr${trCss.length ? ` style="${trCss.join(';')}"` : ''}>${cells.join('')}</tr>`
+    return `<tr${styleAttr(trCss)}>${cells.join('')}</tr>`
   })
-  const cols = `<colgroup>${columnPt.map((w) => `<col style="width:${Math.round((w / widthPt) * 1e5) / 1e3}%">`).join('')}</colgroup>`
+  const cols = `<colgroup>${columnPt.map((w) => `<col${styleAttr(`width:${Math.round((w / widthPt) * 1e5) / 1e3}%`)}>`).join('')}</colgroup>`
   const head = repeat ? `<thead>${rows.slice(0, repeat).join('')}</thead>` : ''
   const self = table.align === 'center' ? 'center' : table.align === 'right' ? 'flex-end' : 'flex-start'
   const tcss = [
@@ -844,11 +846,11 @@ function tableHtml(table: TableBlock, ctx: Ctx, number?: number): string {
   const above = table.caption && (table.captionPosition ?? 'above') === 'above'
   const numbered = number === undefined ? ctx : { ...ctx, state: { ...ctx.state, captions: new Map([...ctx.state.captions, [table, number]]) } }
   if (table.caption && above) out += captionHtml(table, table.caption, numbered, ['break-after:avoid'])
-  out += `<table class="dk-table" style="${tcss.join(';')}">${cols}${head}<tbody>${rows.slice(repeat).join('')}</tbody></table>`
+  out += `<table class="dk-table"${styleAttr(tcss)}>${cols}${head}<tbody>${rows.slice(repeat).join('')}</tbody></table>`
   if (table.caption && !above) out += captionHtml(table, table.caption, numbered)
   if (table.note !== undefined) out += styled('KitNote', inlineHtml(table.note, ctx, table.source ? { source: table.source } : {}))
   const after = table.spaceAfter ?? theme.table.spaceAfter ?? 0
-  if (after > 0 && ctx.part === 'body' && !ctx.inCell && !ctx.inFrame) out += `<div class="dk-gap" style="height:${pt(after)};flex:none"></div>`
+  if (after > 0 && ctx.part === 'body' && !ctx.inCell && !ctx.inFrame) out += `<div class="dk-gap"${styleAttr(`height:${pt(after)};flex:none`)}></div>`
   return out
 }
 
@@ -872,7 +874,7 @@ function placeholderHtml(text: RichText | undefined, width: number, height: numb
     `border:${borderCss(look.placeholderBorder) ?? 'none'}`,
     ...textCss(textStyleOf(look.placeholderText)),
   ]
-  return `<div class="dk-placeholder" role="img" aria-label="${escapeHtml(plainText(text ?? ''))}" style="${css.join(';')}">${text === undefined ? '' : inlineHtml(text, ctx)}</div>`
+  return `<div class="dk-placeholder" role="img" aria-label="${escapeHtml(plainText(text ?? ''))}"${styleAttr(css)}>${text === undefined ? '' : inlineHtml(text, ctx)}</div>`
 }
 
 /** The picture's size and look: fitted into its box as the Word writer fits it, cropped and framed. */
@@ -889,7 +891,7 @@ function pictureHtml(image: ImageData, box: { width: number; height: number; ups
   if (!crop || !(top || right || bottom || left)) return imgHtml(image, size.width, size.height, alt, frame)
   const whole = { width: size.width / (1 - left - right), height: size.height / (1 - top - bottom) }
   return (
-    `<span class="dk-crop" style="${[`width:${pt(size.width)}`, `height:${pt(size.height)}`, ...frame].join(';')}">` +
+    `<span class="dk-crop"${styleAttr([`width:${pt(size.width)}`, `height:${pt(size.height)}`, ...frame])}>` +
     imgHtml(image, whole.width, whole.height, alt, [`left:${pt(-left * whole.width)}`, `top:${pt(-top * whole.height)}`]) +
     '</span>'
   )
@@ -920,7 +922,7 @@ function figureHtml(block: FigureBlock, ctx: Ctx): string {
     const alt = block.alt ?? (block.caption ? plainText(block.caption.text) : undefined)
     const border = block.border ? { width: block.border.width ?? 0.5, color: block.border.color ?? theme.body.color } : undefined
     const keep = block.caption !== undefined && !above ? ';break-after:avoid' : ''
-    out += `<p class="dk-p dk-figure" style="text-align:${align};line-height:1;margin:0${keep}">${pictureHtml(block.image, box, alt, block.crop, border)}</p>`
+    out += `<p class="dk-p dk-figure"${styleAttr(`text-align:${align};line-height:1;margin:0${keep}`)}>${pictureHtml(block.image, box, alt, block.crop, border)}</p>`
   } else {
     out += placeholderHtml(block.placeholder, box.width, box.explicit ? box.height : Math.min(box.height, 144), ctx)
   }
@@ -941,9 +943,9 @@ function figureGridHtml(block: FigureGridBlock, ctx: Ctx): string {
       ? `<p class="dk-p" style="text-align:center;line-height:1">${pictureHtml(item.image, { width: inner, height: itemHeight, upscale: block.upscale ?? false }, item.alt, undefined, undefined)}</p>`
       : placeholderHtml(item.placeholder, inner, Math.min(itemHeight, 144), { ...ctx, width: inner })
     const pad = `padding:${pt(look.cellPadding.top)} ${pt(look.cellPadding.right)} ${pt(look.cellPadding.bottom)} ${pt(look.cellPadding.left)}`
-    return `<div class="dk-flow" style="${pad};break-inside:avoid">${labelAbove ? label + picture : picture + label}</div>`
+    return `<div class="dk-flow"${styleAttr(`${pad};break-inside:avoid`)}>${labelAbove ? label + picture : picture + label}</div>`
   })
-  let out = `<div class="dk-grid" style="grid-template-columns:repeat(${columns},minmax(0,1fr))">${items.join('')}</div>`
+  let out = `<div class="dk-grid"${styleAttr(`grid-template-columns:repeat(${columns},minmax(0,1fr))`)}>${items.join('')}</div>`
   if (block.caption) out += captionHtml(block, block.caption, ctx, ['text-align:center'])
   return out
 }
@@ -956,7 +958,7 @@ function floatingImageHtml(block: FloatingImageBlock, ctx: Ctx): string {
   const x = box.x + (margin ? page.margins.left : 0)
   const y = box.y + (margin ? page.margins.top : 0)
   ctx.sheet.placed.push(
-    `<img class="dk-float" src="${dataUrl(block.image)}" alt="${escapeHtml(block.alt ?? '')}" style="left:${pt(x)};top:${pt(y)};width:${pt(box.width)};height:${pt(box.height)};z-index:${block.behind === false ? 2 : -1}">`,
+    `<img class="dk-float" src="${dataUrl(block.image)}" alt="${escapeHtml(block.alt ?? '')}"${styleAttr(`left:${pt(x)};top:${pt(y)};width:${pt(box.width)};height:${pt(box.height)};z-index:${block.behind === false ? 2 : -1}`)}>`,
   )
   return ''
 }
@@ -972,7 +974,7 @@ function frameHtml(block: FrameBlock, ctx: Ctx): string {
     css.push(block.heightRule === 'exact' ? `height:${pt(block.height)};overflow:hidden` : `min-height:${pt(block.height)}`)
   }
   const inner = blocksHtml(block.blocks, { ...ctx, width: block.width, inFrame: true })
-  ctx.sheet.placed.push(`<div class="dk-frame" style="${css.join(';')}">${inner}</div>`)
+  ctx.sheet.placed.push(`<div class="dk-frame"${styleAttr(css)}>${inner}</div>`)
   return ''
 }
 
@@ -986,7 +988,7 @@ function signatureHtml(block: SignatureBlock, ctx: Ctx): string {
   const nameStyle = block.nameStyle ?? { bold: true }
   const labelBelow = block.labelPosition === 'below'
   const normal = paragraphStyle({}, ctx)
-  const p = (content: string, css: string[]) => `<p class="dk-p dk-ps-${normal}" style="${[`text-align:${align}`, ...css].join(';')}">${content}</p>`
+  const p = (content: string, css: string[]) => `<p class="dk-p dk-ps-${normal}"${styleAttr([`text-align:${align}`, ...css])}>${content}</p>`
   const parts: string[] = []
   const label = () => p(inlineHtml(block.label!, ctx, { style: labelStyle }), ['margin-top:0', `margin-bottom:${pt(labelBelow ? 2 : (block.labelGap ?? 4))}`])
   if (block.label !== undefined && !labelBelow) parts.push(label())
@@ -994,7 +996,7 @@ function signatureHtml(block: SignatureBlock, ctx: Ctx): string {
     const box = block.imageBox ?? { width: 140, height: 55 }
     parts.push(p(pictureHtml(block.image, { ...box, upscale: block.imageUpscale ?? true }, 'Signature', undefined, undefined), ['margin:0', 'line-height:1']))
   } else {
-    parts.push(`<div style="height:${pt(Math.max(1, block.signingSpace ?? 36))};flex:none"></div>`)
+    parts.push(`<div${styleAttr(`height:${pt(Math.max(1, block.signingSpace ?? 36))};flex:none`)}></div>`)
   }
   const rule = borderCss({ style: 'single', width: block.ruleThickness ?? 0.75, color: block.ruleColor ?? ctx.state.theme.body.color })
   const name = block.name === null || block.name === undefined ? '' : inlineHtml(block.name, ctx, { style: nameStyle, ...(block.source ? { source: block.source } : {}) })
@@ -1009,7 +1011,7 @@ function signatureHtml(block: SignatureBlock, ctx: Ctx): string {
     const separator = labelText ? (/[:]\s*$/.test(plainText(line.label)) ? ' ' : ': ') : ''
     const value =
       line.value === null
-        ? `<span class="dk-blank" style="width:${pt(ruleWidth * 0.6)}">&nbsp;</span>`
+        ? `<span class="dk-blank"${styleAttr(`width:${pt(ruleWidth * 0.6)}`)}>&nbsp;</span>`
         : inlineHtml(line.value, ctx, line.source ? { source: line.source } : {})
     parts.push(p(`${labelText ? inlineHtml(line.label, ctx) : ''}${escapeHtml(separator)}${value}`, lineCss))
   }
@@ -1019,7 +1021,7 @@ function signatureHtml(block: SignatureBlock, ctx: Ctx): string {
     `margin-bottom:${pt(block.spaceBelow ?? 2)}`,
     ...(block.keepTogether !== false ? ['break-inside:avoid'] : []),
   ]
-  return `<div class="dk-signature dk-flow" style="${css.join(';')}">${parts.join('')}</div>`
+  return `<div class="dk-signature dk-flow"${styleAttr(css)}>${parts.join('')}</div>`
 }
 
 /* ------------------------------------------------------------------ contents */
@@ -1037,7 +1039,7 @@ function tocEntries(block: TocBlock, state: State): string {
     .filter((h) => h.level <= levels)
     .map(
       (h) =>
-        `<p class="dk-p dk-ps-Normal" style="display:flex;gap:4pt;margin-left:${pt((h.level - 1) * 11)}">` +
+        `<p class="dk-p dk-ps-Normal"${styleAttr(`display:flex;gap:4pt;margin-left:${pt((h.level - 1) * 11)}`)}>` +
         `<a href="#${escapeHtml(h.id)}" style="color:inherit;text-decoration:none">${escapeHtml(h.text)}</a>` +
         `<span style="flex:1;border-bottom:.75pt dotted currentColor;margin-bottom:.3em"></span>` +
         `<span>${escapeHtml(h.page)}</span></p>`,
