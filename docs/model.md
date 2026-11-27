@@ -82,7 +82,7 @@ Every block may carry `id` (the application's own), `source`, and `pending` (see
 - text (`{ type: 'text', text }`) with `bold`, `italic`, `underline`, `strike`, `superscript`, `subscript`,
   `smallCaps`, `allCaps`, `color`, `size`, `font`, `highlight` (Word's sixteen highlight colours),
   `characterSpacing` (tracking in points, added after every character, negative to condense; Word's `w:spacing` on
-  the run: tracking given in em is `em × size`), `characterStyle` (the id of a character style the document defines,
+  the run: tracking given in em is `em × size`), `kern` (below), `characterStyle` (the id of a character style the document defines,
   its look under the run's own), and `link` (a URI; written as a real hyperlink). In text, a newline is a line break
   and a tab character a tab.
 - `field`: `page`, `pages` (the document's page count) or `sectionPages`.
@@ -140,7 +140,7 @@ text('tracked', { characterStyle: 'Accent' })
 - A paragraph style: `id` (a letter, then letters and digits), `name` (what Word shows; the id when absent),
   `basedOn` (a theme style, `normal`, `title`, `subtitle`, `caption`, `note`, `small`, `heading1`–`heading6`, or
   another defined id; `normal` when absent), `next`, `text` (a `ThemeText`: font, size, colour, bold, italic, caps,
-  small caps, `characterSpacing`, alignment, spacing before and after, line height (a multiple or points),
+  small caps, `characterSpacing`, `kern`, alignment, spacing before and after, line height (a multiple or points),
   `keepWithNext`), `indent`,
   `borders` (each with its `space`), `shading` and `keepLinesTogether`.
 - A character style: `id`, `name`, `basedOn` (another character style) and `text` (a `TextStyle`).
@@ -152,6 +152,22 @@ text('tracked', { characterStyle: 'Accent' })
 
 The theme's text roles take `characterSpacing` too (`theme.headings[0].characterSpacing`), written on their Word
 styles.
+
+## Kerning
+
+`kern` closes up letter pairs by the face's own kerning ("AV", "To"), as Word's *Kerning for fonts* does. Word, the
+layout and the print view kern nothing that does not ask, so text set without it is as wide as its letters' own
+widths; a browser kerns by default, which is why a page laid out unkerned runs a percent or two wider than the same
+text in a web page.
+
+- `kern: true` kerns at every size (written `w:kern w:val="2"`, from 1 pt, Word's own default when it is ticked); a
+  number kerns text of that size in points and larger (`kern: 14`, Word's "14 pt and above", `w:kern w:val="28"`);
+  `false` or `0` kerns nothing (`w:val="0"`), to undo a style's. Anything else stops the writer with the value named.
+- On a run (`text('AV', { kern: true })`), a theme text role (`theme.headings[0].kern`), a named paragraph style's
+  `text` or a character style's. On `theme.body` it is the document's default (written in Word's document defaults),
+  so every style and run kerns unless it says otherwise: `theme: { body: { kern: true } }` kerns the whole document.
+- `document-kit/layout` kerns from the face's GPOS pair kerning (or its legacy `kern` table), only where a run asks and
+  at or above the size it names; `writeHtml` writes `font-kerning: normal` there and `none` elsewhere.
 
 ## Line heights
 

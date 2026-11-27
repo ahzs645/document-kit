@@ -25,6 +25,7 @@ import type {
   TextToken,
 } from '../layout/page-doc';
 import type { ImageCrop } from '../core/document-model';
+import type { ParsedTtf } from '../core/font';
 import type { VectorShape } from '../core/vector';
 import type { OutlineSource } from '../pdf-reader/glyf-outline';
 import { reverseByCodePoint } from '../core/bidi';
@@ -40,10 +41,13 @@ const HIGHLIGHT_HEX = 'fff3a3';
 
 /** The glyph outlines of a page's faces, each defined once and used by id. */
 export class SvgGlyphs {
-  private readonly sources = new Map<FontResource, OutlineSource | null>();
+  // document-kit: keyed by the FACE, not the resource object — a kerned run's
+  // resource is a view of its face's (see `withKerning` in styled-layout), and
+  // its glyphs are the face's own outlines, defined once.
+  private readonly sources = new Map<ParsedTtf, OutlineSource | null>();
   private readonly ids = new Map<string, string | null>();
   private readonly defs: Array<string> = [];
-  private readonly faceIds = new Map<FontResource, number>();
+  private readonly faceIds = new Map<ParsedTtf, number>();
 
   /**
    * The id of the path that draws glyph `gid` of `font`, defining it on first
@@ -57,10 +61,10 @@ export class SvgGlyphs {
   use(font: FontResource, gid: number): string | null | undefined {
     const source = this.sourceOf(font);
     if (!source) return undefined;
-    let face = this.faceIds.get(font);
+    let face = this.faceIds.get(font.parsed);
     if (face === undefined) {
       face = this.faceIds.size;
-      this.faceIds.set(font, face);
+      this.faceIds.set(font.parsed, face);
     }
     const key = `g${String(face)}-${String(gid)}`;
     const known = this.ids.get(key);
@@ -81,12 +85,12 @@ export class SvgGlyphs {
   }
 
   private sourceOf(font: FontResource): OutlineSource | undefined {
-    let source = this.sources.get(font);
+    let source = this.sources.get(font.parsed);
     if (source === undefined) {
       const raw = font.parsed.raw;
       const cff = font.parsed.tables.has('CFF ') ? openTypeCff(raw) : undefined;
       source = (cff ? cffOutlineSource(cff) : outlineSource(raw)) ?? null;
-      this.sources.set(font, source);
+      this.sources.set(font.parsed, source);
     }
     return source ?? undefined;
   }

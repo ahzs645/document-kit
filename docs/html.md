@@ -28,7 +28,10 @@ const html = writeHtml(doc, { fonts })                         // the print view
   (`Normal`, `Title`, `Heading1`…, `Caption`, `KitNote`, `KitSmall`, `Header`, `Footer`, `KitTable` and every
   defined style, each with its look merged through the styles it is based on) and `.dk-cs-<id>` for each character
   style. A run's own look (font, size, colour, weight, slant, underline, strike, raised and lowered, caps, small
-  caps, highlight, tracking as `letter-spacing`) is written on its span.
+  caps, highlight, tracking as `letter-spacing`, kerning as `font-kerning`) is written on its span. Kerning is off on
+  the sheet (`font-kerning: none`), as Word and the layout kern nothing unasked; a run, style or theme role with `kern`
+  sets `font-kerning: normal` (a size threshold is read against the size the same run or style gives; a run that
+  gives none is kerned).
 - Fonts: `options.fonts` (the `NamedFont`s `writeDocx` embeds and `layoutDocx` draws with) become `@font-face` rules
   with the font inline as base64, each face at the weight of the slot it fills (400 or 700), so the browser picks
   the face Word and the layout pick. A face is carried only when `fontEmbeddingReport(fonts, 'html')` allows it:

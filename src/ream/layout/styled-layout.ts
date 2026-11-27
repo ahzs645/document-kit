@@ -340,6 +340,14 @@ export interface StyledRenderOptions {
    * stay as they were; `document-kit/layout` turns it on.
    */
   readonly compact?: boolean;
+  /**
+   * document-kit: kern as Word does (§17.3.2.19): a run is kerned only when it
+   * asks (`w:kern`) and is at least the size it names; every other run is set
+   * at its glyphs' own widths. Off by default, so the engine's own output — and
+   * the byte gate — stay as they were (runs that state no `w:kern` follow the
+   * profile); `document-kit/layout` turns it on.
+   */
+  readonly kernAsAsked?: boolean;
   /** The resolved font set every run draws with (the guaranteed fallback registry). */
   readonly registry: FontRegistry;
   /** Renderer-compatibility profile for the line-height model (default `'ream'`). */
@@ -5682,6 +5690,72 @@ function facesForRun(
   return out;
 }
 
+/**
+ * Whether a run that states no `w:kern` is kerned. Every face's resource
+ * measures this way (see `collectFontResources`): the profile's rule, or, with
+ * document-kit's `kernAsAsked`, Word's — nothing a run does not ask for.
+ */
+function kernsByDefault(options: StyledRenderOptions): boolean {
+  if (options.kernAsAsked === true) return false;
+  return options.layoutProfile !== 'word';
+}
+
+/**
+ * document-kit: §17.3.2.19 `w:kern` — whether a run's glyph pairs are kerned.
+ * With `kernAsAsked`, a run that states a size kerns at that size and above,
+ * and not below it, and a size of 0 turns kerning off. A run that states
+ * nothing, and every run without `kernAsAsked`, follows
+ * {@link kernsByDefault}, as upstream.
+ *
+ * @param options  Render options.
+ * @param resolved The run's resolved properties.
+ * @returns Whether the run is set kerned.
+ */
+function runKerns(options: StyledRenderOptions, resolved: ResolvedRunProperties): boolean {
+  const from = resolved.kerningMinPt;
+  if (from === undefined || options.kernAsAsked !== true) return kernsByDefault(options);
+  return from > 0 && resolved.fontSizePt >= from;
+}
+
+/** Each face's resource as a kerned or unkerned view, made once. */
+const kerningViews = new WeakMap<FontResource, { kerned?: FontResource; plain?: FontResource }>();
+
+/**
+ * document-kit: a face's resource measured and shown with or without its pair
+ * kerning. The view is the same resource — its name, its face and the glyphs
+ * its subset keeps (kerning moves glyphs, it never changes them) — with a
+ * measure of its own, so a kerned run is broken, aligned and drawn (`TJ`
+ * adjustments) at the widths it was measured at.
+ *
+ * @param font    The face's resource, measured as the profile measures.
+ * @param kern    Whether the run is kerned.
+ * @param options Render options (the profile's default).
+ * @returns `font` itself when it already measures that way, else its view.
+ */
+function withKerning(
+  font: FontResource,
+  kern: boolean,
+  options: StyledRenderOptions,
+): FontResource {
+  if (kern === kernsByDefault(options)) return font;
+  let views = kerningViews.get(font);
+  if (!views) kerningViews.set(font, (views = {}));
+  const slot = kern ? 'kerned' : 'plain';
+  return (views[slot] ??= { ...font, measure: createFontMeasure(font.parsed, kern) });
+}
+
+/** {@link facesForRun}'s faces, each kerned as the run is (see {@link withKerning}). */
+function kernedFaces(
+  faces: ReadonlyMap<number, RunFace> | undefined,
+  kern: boolean,
+  options: StyledRenderOptions,
+): ReadonlyMap<number, RunFace> | undefined {
+  if (!faces || kern === kernsByDefault(options)) return faces;
+  const out = new Map<number, RunFace>();
+  for (const [cp, face] of faces) out.set(cp, { ...face, font: withKerning(face.font, kern, options) });
+  return out;
+}
+
 // Tolerant lookup for placeholder fonts (inline-image / math outer run) whose
 // declared family may not have been embedded — falls back to any embedded font.
 function lookupFont(resources: ReadonlyMap<string, FontResource>, fontKey: string): FontResource {
@@ -5999,7 +6073,7 @@ function collectFontResources(
       resourceName,
       parsed: info.parsed,
       // E-PARITY FP4: the 'word' profile measures kern-free (Word's default).
-      measure: createFontMeasure(info.parsed, options.layoutProfile !== 'word'),
+      measure: createFontMeasure(info.parsed, kernsByDefault(options)),
       gids: info.gids,
       ...(info.glyphText ? { glyphText: info.glyphText } : {}),
       ...(info.drawnAs ? { glyphChars: mostDrawn(info.drawnAs) } : {}),
@@ -6719,7 +6793,9 @@ function tokenizeParagraph(
     // it; the PDF layout did neither, so a footnote marker and a cell's
     // "Salary⁽²⁾" came out full size, on the line (45540_classic_Header.xlsx).
     const script = SCRIPT_OFFSET[resolvedRun.verticalAlign] ?? 0;
-    const own = lookupFont(fontResources, fontKey);
+    // document-kit: §17.3.2.19 — kerned as the run asks, whatever face draws it.
+    const kern = runKerns(options, resolvedRun);
+    const own = withKerning(lookupFont(fontResources, fontKey), kern, options);
     const faces = runFaces(options, resolvedRun, primary, run.text);
     // A ligature nobody can draw is set as its letters — before the plans are
     // built, because everything downstream measures and draws what it is given.
@@ -6727,7 +6803,11 @@ function tokenizeParagraph(
       const text = drawableText(faces, run.text);
       return text === run.text ? run : { ...run, text };
     })();
-    const faceFor = facesForRun(fontResources, primary, faces, drawn.text);
+    const faceFor = kernedFaces(
+      facesForRun(fontResources, primary, faces, drawn.text),
+      kern,
+      options,
+    );
     const charColorsHex = charColours(options, paragraph, faces, resolvedRun, run, drawn.text);
     return {
       run: drawn,
@@ -8587,7 +8667,7 @@ function measureSingleLine(
     // …and each character in the face that draws it (see {@link runFaces}).
     for (const span of faceSpans(runFaces(options, resolved, primary, run.text), run.text)) {
       total +=
-        lookupFont(fontResources, span.fontKey).measure.textWidthPt(
+        withKerning(lookupFont(fontResources, span.fontKey), runKerns(options, resolved), options).measure.textWidthPt(
           span.text,
           resolved.fontSizePt,
         ) *

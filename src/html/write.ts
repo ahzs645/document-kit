@@ -496,7 +496,7 @@ interface InlineBase {
 
 const STYLE_KEYS: ReadonlyArray<keyof TextStyle> = [
   'bold', 'italic', 'underline', 'strike', 'superscript', 'subscript', 'smallCaps', 'allCaps',
-  'color', 'size', 'font', 'highlight', 'characterSpacing', 'characterStyle',
+  'color', 'size', 'font', 'highlight', 'characterSpacing', 'kern', 'characterStyle',
 ]
 
 function styleOf(value: object): TextStyle {

@@ -83,7 +83,63 @@ export function parseGposKerning(raw: Uint8Array, table: TableInfo | undefined):
     for (const lookupOffset of lookupOffsets) {
       readLookup(raw, lookupOffset, (lookupType, subtableOffset) => {
         if (lookupType === 2) parsePairPosSubtable(raw, subtableOffset, kerning);
+        // document-kit: GPOS LookupType 9 — an Extension Positioning subtable
+        // (format 1) wraps another lookup's subtable behind a 32-bit offset, so
+        // a large table can reach it. Carlito's kerning is all behind one, and
+        // so is many a brand face's: read past it, a kerned run of those faces
+        // was set at its glyphs' own widths.
+        if (lookupType === 9) {
+          const ext = new BigEndianReader(raw, subtableOffset);
+          if (ext.u16() !== 1) return;
+          const wrapped = ext.u16();
+          const offset = ext.u32();
+          if (wrapped === 2) parsePairPosSubtable(raw, subtableOffset + offset, kerning);
+        }
       });
+    }
+    return kerning;
+  } catch {
+    return new Map();
+  }
+}
+
+/**
+ * document-kit: the legacy `kern` table (OpenType's, version 0): its horizontal
+ * format 0 subtables of glyph pairs, for a face that kerns there and not in
+ * GPOS. Apple's version 1 table, cross-stream and minimum subtables are left
+ * out.
+ *
+ * @param raw   The whole font bytes.
+ * @param table The `kern` table location, or `undefined` when the font has none.
+ * @returns The kerning map keyed on `"gid1,gid2"` (empty when absent or on error).
+ */
+export function parseKernTable(raw: Uint8Array, table: TableInfo | undefined): KerningMap {
+  if (!table) return new Map();
+  try {
+    const kerning = new Map<string, number>();
+    const r = new BigEndianReader(raw, table.offset);
+    if (r.u16() !== 0) return kerning;
+    const count = r.u16();
+    let at = table.offset + 4;
+    for (let t = 0; t < count; t++) {
+      const sub = new BigEndianReader(raw, at);
+      sub.u16(); // version
+      const length = sub.u16();
+      const coverage = sub.u16();
+      // Bit 0 horizontal; bits 1–3 minimum, cross-stream, override; format in the high byte.
+      if ((coverage & 0x0f) === 0x01 && coverage >> 8 === 0) {
+        const pairs = sub.u16();
+        sub.skip(6); // searchRange, entrySelector, rangeShift
+        for (let i = 0; i < pairs; i++) {
+          const left = sub.u16();
+          const right = sub.u16();
+          const value = sub.i16();
+          const key = `${left},${right}`;
+          if (value !== 0 && !kerning.has(key)) kerning.set(key, value);
+        }
+      }
+      if (length < 6) break;
+      at += length;
     }
     return kerning;
   } catch {

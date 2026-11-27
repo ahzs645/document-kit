@@ -22,6 +22,7 @@ import {
   parseGposKerning,
   parseGsubArabicForms,
   parseGsubLigatures,
+  parseKernTable,
 } from './opentype-layout';
 
 /** A table's location within the sfnt: byte offset and length. */
@@ -255,7 +256,11 @@ export function parseTtf(raw: Uint8Array): ParsedTtf {
   const glyphOffsets = readGlyphOffsets(raw, tables, numGlyphs, indexToLocFormat);
 
   const ligatures = parseGsubLigatures(raw, tables.get('GSUB'));
-  const kerning = parseGposKerning(raw, tables.get('GPOS'));
+  // document-kit: a face that kerns in no GPOS lookup may kern in its legacy
+  // `kern` table, as older TrueType faces do.
+  const gposKerning = parseGposKerning(raw, tables.get('GPOS'));
+  const kerning =
+    gposKerning.size > 0 ? gposKerning : parseKernTable(raw, tables.get('kern'));
   const joiningForms = parseGsubArabicForms(raw, tables.get('GSUB'));
 
   return {

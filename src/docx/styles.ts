@@ -11,7 +11,7 @@ import type { LineHeight, TextStyle, Theme, ThemeText } from '../model/types'
 import type { ListRegistry } from './context'
 import { runOptions } from './inline'
 import { alignment, compact, TABLE_STYLE_ID, TOC_TITLE_STYLE_ID } from './paragraphs'
-import { border, halfPoints, hex, lineSpacing, twips } from './units'
+import { border, halfPoints, hex, kernHalfPoints, lineSpacing, twips } from './units'
 
 function runOf(text: ThemeText) {
   return compact({
@@ -24,6 +24,7 @@ function runOf(text: ThemeText) {
     smallCaps: text.smallCaps,
     characterSpacing:
       text.characterSpacing === undefined ? undefined : twips(text.characterSpacing) || Number.EPSILON,
+    kern: text.kern === undefined ? undefined : kernHalfPoints(text.kern),
   })
 }
 

@@ -225,6 +225,8 @@ export async function layoutDocx(
     ...render,
     // Compressed page drawing and palette pictures: the same pages, a fraction of the bytes.
     compact: true,
+    // Kerned where the document asks (w:kern), as Word kerns, and nowhere else.
+    kernAsAsked: true,
     ...(options.pdfA ? { pdfA: options.pdfA } : {}),
     ...(options.tagged ? { tagged: true } : {}),
   };

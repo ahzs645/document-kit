@@ -243,3 +243,31 @@ describe('line heights in points', () => {
     expect(html).toMatch(/<td[^>]*><p class="dk-p dk-ps-KitTable" style="line-height:10pt">Cell/)
   })
 })
+
+describe('kerning', () => {
+  it('sets no kerning on the sheet, as Word kerns nothing unasked', () => {
+    const html = writeHtml(document([section([paragraph('AVATAR')])]))
+    expect(html).toMatch(/\.dk-sheet\{[^}]*font-kerning:none/)
+    expect(html).not.toMatch(/font-kerning:normal/)
+  })
+
+  it('kerns a run, a style and the whole document where they ask (font-kerning: normal)', () => {
+    const run = writeHtml(document([section([paragraph([text('AVATAR', { kern: true }), text('Plain', { kern: false })])])]))
+    expect(run).toMatch(/<span style="font-kerning:normal">AVATAR<\/span>/)
+    expect(run).toMatch(/<span style="font-kerning:none">Plain<\/span>/)
+    const themed = writeHtml(document([section([heading(1, 'Kerned'), paragraph('Kerned')])], { theme: { body: { kern: true } } }))
+    expect(themed).toMatch(/\.dk-ps-Normal\{[^}]*font-kerning:normal/)
+    expect(themed).toMatch(/\.dk-ps-Heading1\{[^}]*font-kerning:normal/)
+  })
+
+  it('reads a size threshold against the style\'s own size', () => {
+    const html = writeHtml(
+      document([section([paragraph('x')])], {
+        theme: { body: { kern: 14 }, headings: [{ size: 20 }] },
+      }),
+    )
+    // Body text is 11 pt, under the threshold; a 20 pt heading is over it.
+    expect(html).toMatch(/\.dk-ps-Normal\{[^}]*font-kerning:none/)
+    expect(html).toMatch(/\.dk-ps-Heading1\{[^}]*font-kerning:normal/)
+  })
+})

@@ -14,7 +14,7 @@ import {
 import { characterStyleId, resolveImage, resolveSentences } from '../model/index'
 import type { InlineImage, PictureCrop, RichText, TextStyle } from '../model/types'
 import type { WriterContext } from './context'
-import { halfPoints, hex, pixels, twips } from './units'
+import { halfPoints, hex, kernHalfPoints, pixels, twips } from './units'
 
 /** A model text style as docx run options. Only what is set is written, so styles underneath show through. */
 export function runOptions(style: TextStyle): IRunOptions {
@@ -34,6 +34,7 @@ export function runOptions(style: TextStyle): IRunOptions {
   // The docx library leaves out a spacing of 0; a value under one twip writes the explicit 0 a style's tracking needs
   // to be undone.
   if (style.characterSpacing !== undefined) out.characterSpacing = twips(style.characterSpacing) || Number.EPSILON
+  if (style.kern !== undefined) out.kern = kernHalfPoints(style.kern)
   if (style.characterStyle) out.style = style.characterStyle
   return out as IRunOptions
 }
@@ -55,6 +56,7 @@ function styleOf(value: TextStyle & Record<string, unknown>): TextStyle {
     'font',
     'highlight',
     'characterSpacing',
+    'kern',
     'characterStyle',
   ]
   for (const key of keys) {

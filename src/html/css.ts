@@ -3,7 +3,7 @@
  * (`src/model/styles.ts`) and the caller's fonts. One CSS class a named style, its look merged through the styles it
  * is based on, so a paragraph in style `AffiliationDepartment` looks in the browser as Word sets it.
  */
-import { fontEmbeddingReport, groupFonts, readLineHeight, type NamedFont, type StyleTable } from '../model/index'
+import { fontEmbeddingReport, groupFonts, kernsAt, readLineHeight, type NamedFont, type StyleTable } from '../model/index'
 import type { Border, Highlight, LineHeight, TextStyle, Theme, ThemeText } from '../model/types'
 
 /** A number of points as CSS, at most three decimals. */
@@ -106,6 +106,9 @@ export function textCss(style: TextStyle | ThemeText): string[] {
   if (style.allCaps !== undefined) out.push(`text-transform:${style.allCaps ? 'uppercase' : 'none'}`)
   if (style.smallCaps !== undefined) out.push(`font-variant-caps:${style.smallCaps ? 'small-caps' : 'normal'}`)
   if (style.characterSpacing !== undefined) out.push(`letter-spacing:${pt(style.characterSpacing)}`)
+  // Kerned as Word kerns it: the sheet sets none, a style or run that asks sets the face's pairs (from its threshold,
+  // read against the size the same style or run gives; a run that gives none is taken to be kerned).
+  if (style.kern !== undefined) out.push(`font-kerning:${kernsAt(style.kern, style.size) ? 'normal' : 'none'}`)
   const run = style as TextStyle
   const lines = [run.underline ? 'underline' : '', run.strike ? 'line-through' : ''].filter(Boolean)
   if (lines.length) out.push(`text-decoration:${lines.join(' ')}`)
@@ -215,7 +218,7 @@ export function fontFaceCss(fonts: readonly NamedFont[]): string {
 export const BASE_CSS = `*,*::before,*::after{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--dk-desk,#e5e7eb)}
-.dk-sheet{position:relative;isolation:isolate;margin:16px auto;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.2);overflow:hidden;display:flex;flex-direction:column;break-after:page}
+.dk-sheet{position:relative;isolation:isolate;font-kerning:none;margin:16px auto;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.2);overflow:hidden;display:flex;flex-direction:column;break-after:page}
 .dk-sheet:last-child{break-after:auto}
 .dk-flow{display:flex;flex-direction:column;min-width:0}
 .dk-body{flex:1 1 auto}

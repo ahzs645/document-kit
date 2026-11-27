@@ -75,6 +75,7 @@ const STYLE: Record<string, Pos> = {
   font: 'scalar',
   highlight: 'scalar',
   characterSpacing: 'scalar',
+  kern: 'scalar',
   characterStyle: 'scalar',
 }
 

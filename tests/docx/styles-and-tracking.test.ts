@@ -22,6 +22,31 @@ describe('character spacing', () => {
   })
 })
 
+describe('kerning', () => {
+  it('writes a run\'s kerning as w:kern in half-points: true from 1 pt, a size from that size, false as 0', async () => {
+    const { document: xml } = await write([
+      paragraph([text('AVATAR', { kern: true }), text('Toto', { kern: 14 }), text('Plain', { kern: false }), text('As is')]),
+    ])
+    expect(all(xml, /<w:kern w:val="(\d+)"\/>/)).toEqual(['2', '28', '0'])
+  })
+
+  it('writes the theme body\'s kerning in the document defaults, and a style\'s on the style', async () => {
+    const pkg = await write([paragraph('Display', { style: 'Display' })], {
+      theme: { body: { kern: true }, headings: [{ kern: 16 }] },
+      styles: { paragraph: [{ id: 'Display', text: { size: 30, kern: 12 } }] },
+    })
+    const xml = pkg.text('word/styles.xml')
+    expect(/<w:docDefaults>[\s\S]*<\/w:docDefaults>/.exec(xml)![0]).toMatch(/<w:kern w:val="2"\/>/)
+    expect(styleXml(xml, 'Heading1')).toMatch(/<w:kern w:val="32"\/>/)
+    expect(styleXml(xml, 'Display')).toMatch(/<w:kern w:val="24"\/>/)
+  })
+
+  it('refuses a kerning that is not true, false or a size', async () => {
+    await expect(write([paragraph([text('x', { kern: -1 })])])).rejects.toThrow(/kerning -1/)
+    await expect(write([paragraph([text('x', { kern: 'yes' as unknown as boolean })])])).rejects.toThrow(/kerning "yes"/)
+  })
+})
+
 describe('named styles', () => {
   const styles: Document['styles'] = {
     paragraph: [

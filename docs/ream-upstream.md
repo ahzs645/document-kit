@@ -229,9 +229,33 @@ Each change is marked in the source with a `document-kit:` comment unless noted.
     sets it at its own x and y with the rest of its paragraphs. A re-read keeps it the same way,
     so the round trip is unchanged. Pinned by `tests/layout/placed-blocks.test.ts` ("sets a
     picture in a frame inside the frame's box").
+22. **Kerning behind an extension lookup, and the legacy `kern` table** (`core/font/opentype-layout.ts`,
+    `parseGposKerning` and the new `parseKernTable`; `core/font/ttf-parser.ts`, `parseTtf`; marked
+    `document-kit:`). Upstream read GPOS pair adjustments (LookupType 2) only where the `kern`
+    feature names them directly; a face that reaches them through an Extension Positioning
+    subtable (LookupType 9, format 1, a 32-bit offset to the wrapped subtable) had no kerning
+    at all. Carlito, the Calibri stand-in, is such a face, and so is many a brand face. Such a
+    lookup is now followed to its pair subtable. A face whose GPOS kerns nothing is read for
+    its legacy OpenType `kern` table (version 0, horizontal format 0 subtables). Under the
+    engine's default profile (kerned measuring) a Carlito run is now kerned where it was not;
+    no fixture of the byte gate is set in such a face. Pinned by `tests/layout/kerning.test.ts`.
+23. **Kerning as the run asks** (`layout/styled-layout.ts`, `StyledRenderOptions.kernAsAsked`,
+    `kernsByDefault`, `runKerns`, `withKerning`, `kernedFaces`, in `tokenizeParagraph` and the
+    table natural-width measure; `svg/svg-text.ts`, `SvgGlyphs` keyed by face; marked
+    `document-kit:`). Upstream read `w:kern` (§17.3.2.19) into `kerningMinPt` and never used
+    it: every run was measured kerned under the default profile and kern-free under `'word'`.
+    With the new `kernAsAsked` option a run is kerned only when it states `w:kern` and its size
+    is at least the size named (0 turns it off), as Word kerns; a run that states none is set
+    at its glyphs' own widths. A kerned run takes a view of its face's resource (the same name,
+    face and glyph subset, a kerned measure), so it is measured, broken and drawn (`TJ`
+    adjustments in the PDF, glyph advances in the page pictures) kerned. The SVG writer's glyph
+    outlines are keyed by the face rather than the resource, so a view shares its face's
+    outlines. Off by default, so the engine's own output and the byte gate are unchanged;
+    `src/layout` (`layoutDocx`, hence `docxToPdf` and `docxToPages`) turns it on. Pinned by
+    `tests/layout/kerning.test.ts`.
 
 Nothing else differs. `diff -r` against the upstream tree, after running the rewrite script
-over a fresh copy, shows only the twenty-one changes above.
+over a fresh copy, shows only the twenty-three changes above.
 
 ## Bringing in a newer upstream
 
@@ -241,11 +265,11 @@ over a fresh copy, shows only the twenty-one changes above.
    included; skip `corpus/`, `stand/`, `docs/`, `scripts/`). Delete files upstream deleted.
 3. Run `node scripts/rewrite-ream-aliases.mjs`, then `node scripts/rewrite-ream-aliases.mjs
    --check` (exits 1 if an alias import or root-relative fixture path is left).
-4. Re-apply changes 1, 2 and 4 to 21 above unless upstream has made them itself (check
+4. Re-apply changes 1, 2 and 4 to 23 above unless upstream has made them itself (check
    `FIXED_MTIME`, a `w:r` split for complex fields, every fallback to the global `fetch` in
    `core/fonts`, `core/converter` and `excel`, `familyNamesInFlow`, `w:vAlign`, PAGEREF and
    body fields, §17.4.66 border conflicts, `w:keepNext` in table rows, and the two foot-frame
-   checks of changes 10 and 11, the no-break hyphen of change 12, percentage widths with their sign of change 13, the stand-in grid of change 14, border widths of change 15, the `compact` option of change 16, synthetic faces for embedded families of change 18, CFF faces in the PDF of change 19, band pictures behind the page of change 20, framed pictures of change 21). Search for
+   checks of changes 10 and 11, the no-break hyphen of change 12, percentage widths with their sign of change 13, the stand-in grid of change 14, border widths of change 15, the `compact` option of change 16, synthetic faces for embedded families of change 18, CFF faces in the PDF of change 19, band pictures behind the page of change 20, framed pictures of change 21, extension and legacy kerning of change 22, `kernAsAsked` of change 23). Search for
    `document-kit:` in the old tree to find each place. Search for new uses of
    `fetch`, `XMLHttpRequest` and `node:` in `src/ream` and treat any as change 4.
 5. Check `src/layout` still compiles against the internals it imports (`core/converter/project`,

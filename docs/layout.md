@@ -224,6 +224,14 @@ supplied or embedded face draws, so they are no longer named as missing symbols;
   a header's under the body's, as Word layers them (`docs/ream-upstream.md`, change 20).
 - **Character spacing** (`w:spacing` in a run or a style, the model's `characterSpacing`): added after every
   character, so tracked text is measured, broken, aligned and drawn wider (or narrower).
+- **Kerning** (`w:kern` in a run, a style or the document defaults, the model's `kern`): a run is kerned only when it
+  asks, at or above the size it names, as Word kerns; every other run is set at its glyphs' own widths. The pairs are
+  the face's GPOS `kern` feature (its pair adjustments, extension lookups included: Carlito's are all behind one), or
+  its legacy `kern` table when its GPOS kerns nothing. A kerned run is measured, broken, aligned and drawn kerned (the
+  PDF shows it with `TJ` adjustments), so a kerned line is narrower by exactly its pairs' kerning
+  (`docs/ream-upstream.md`, changes 22 and 23). Until this, every run in a face whose GPOS kerning the engine read
+  (Arimo, Tinos, Caladea) was kerned whether it asked or not, and Carlito never was: Arial and Times text without
+  `kern` now sets a little wider, as wide as Word sets it.
 - **Line heights** (`w:spacing` `w:line` with `w:lineRule`, the model's `line`): a multiple (`auto`) is set on the
   face's own line, read from its metrics, so it differs between faces as it does in Word. An exact height
   (`exact`) makes every line box that tall whatever its text, and an at-least height (`atLeast`) makes it that tall
@@ -274,5 +282,7 @@ supplied or embedded face draws, so they are no longer named as missing symbols;
   on every face: a line of larger text in an exact paragraph keeps its box, its baseline lower in it by its larger
   descent. Line for line agreement with Word holds for the boxes; a baseline may differ from Word's by a fraction of
   the face's descent.
+- **No kerning across a space.** The layout measures words apart, so a pair with a space in it (Arimo's "␣T", "␣A")
+  is not kerned, where Word kerns it; a kerned line can be a fraction of a point wider than Word's.
 - **Fidelity is the engine's.** Stand-ins match widths, not shapes. Layout differences from
   Word in particular documents are the engine's to fix (and record in `docs/ream-upstream.md`).

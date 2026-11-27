@@ -81,7 +81,7 @@ A block template is the model's JSON (`docs/model.md`: `heading`, `paragraph`, `
 checked against the model at compile time: a misspelt key is an error naming its JSON path.
 
 A `floatingImage`'s `image` comes from the data like a figure's (`"image": "{{ artwork }}"`); with no value it places
-nothing and is listed to complete. A text run's `characterSpacing` and `characterStyle`, and a frame's `x`, `y`,
+nothing and is listed to complete. A text run's `characterSpacing`, `kern` and `characterStyle`, and a frame's `x`, `y`,
 `width`, `height`, `relativeTo` and `wrap`, may be tags like any scalar.
 
 Two shorthands the model does not have:

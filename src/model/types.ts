@@ -49,11 +49,21 @@ export interface TextStyle {
    */
   characterSpacing?: number
   /**
+   * Kern letter pairs with the face's own kerning ("AV", "To" closed up), as Word's "Kerning for fonts" does: `true`
+   * at every size, a number from that size in points up (Word's `w:kern`), `false` (or `0`) not at all, to undo a
+   * style's. Word, the layout and the print view kern nothing that does not ask; `theme.body.kern` asks for the whole
+   * document.
+   */
+  kern?: Kerning
+  /**
    * A character style the document defines (`document.styles.character`, by id): its look applies under this run's
    * own. Unknown ids stop the writer with the id named.
    */
   characterStyle?: string
 }
+
+/** Kerning: `true` at every size, a number from that many points up, `false` or `0` not at all. */
+export type Kerning = boolean | number
 
 /**
  * A stretch of text in one style. In `text`, a newline is a line break and a tab character is a tab. `source` is the
@@ -868,6 +878,11 @@ export interface ThemeText {
   line?: LineHeight
   /** Character spacing (tracking), points; see {@link TextStyle.characterSpacing}. */
   characterSpacing?: number
+  /**
+   * Kerning; see {@link TextStyle.kern}. On `theme.body` it is the document's default (Word's document defaults), so
+   * every style and run kerns unless it says otherwise.
+   */
+  kern?: Kerning
   /**
    * A heading level: keep it on the page of what follows it (and its own lines together). True by default; false lets a
    * heading end a page, as a document whose own heading style does not keep with the next sets it.

@@ -2,6 +2,7 @@ export type * from './types'
 export { DEFAULT_MARGINS, DEFAULT_THEME, PAPER, resolveTheme } from './theme'
 export { pageBox, type PageBox } from './page'
 export { isFixedLineHeight, readLineHeight, type ResolvedLineHeight } from './lineHeight'
+export { kerningFrom, kernsAt } from './kerning'
 export {
   CHECKED_BOX,
   EMPTY_BOX,

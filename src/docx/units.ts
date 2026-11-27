@@ -1,7 +1,8 @@
 /** Points to the units a Word file counts in. */
 import { BorderStyle, LineRuleType, type IBorderOptions } from 'docx'
+import { kerningFrom } from '../model/kerning'
 import { isFixedLineHeight, readLineHeight } from '../model/lineHeight'
-import type { Border, LineHeight } from '../model/types'
+import type { Border, Kerning, LineHeight } from '../model/types'
 
 /** Twentieths of a point: page sizes, margins, indents, spacing, table widths. */
 export const twips = (points: number): number => Math.round(points * 20)
@@ -11,6 +12,11 @@ export const halfPoints = (points: number): number => Math.round(points * 2)
 export const eighths = (points: number): number => Math.min(96, Math.max(2, Math.round(points * 8)))
 /** Pixels at 96 to the inch, which docx takes for a picture's drawn size. */
 export const pixels = (points: number): number => Math.max(1, Math.round((points * 96) / 72))
+/**
+ * Kerning as Word's `w:kern`: the size kerning starts at, in half-points. The docx library leaves out a 0; a value under
+ * one writes the explicit 0 that undoes a style's kerning.
+ */
+export const kernHalfPoints = (value: Kerning): number => halfPoints(kerningFrom(value)) || Number.EPSILON
 /** Line height as a multiple, in Word's 240ths. */
 export const lineMultiple = (multiple: number): number => Math.round(multiple * 240)
 
