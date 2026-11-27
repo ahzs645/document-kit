@@ -11,12 +11,22 @@ import type { LineHeight, TextStyle, Theme, ThemeText } from '../model/types'
 import type { ListRegistry } from './context'
 import { runOptions } from './inline'
 import { alignment, compact, TABLE_STYLE_ID, TOC_TITLE_STYLE_ID } from './paragraphs'
-import { border, halfPoints, hex, kernHalfPoints, lineSpacing, twips } from './units'
+import { border, fontSize, halfPointSize, hex, kernHalfPoints, lineSpacing, twips } from './units'
 
-function runOf(text: ThemeText) {
+/**
+ * Whether any of a document's styles sets a size Word holds only with a character scale: then every size the document
+ * writes says its scale, so none takes a style's ({@link fontSize}).
+ */
+export function scalesSizes(table: StyleTable): boolean {
+  const scaled = (size: number | undefined) => size !== undefined && !halfPointSize(size)
+  return [...table.paragraph.values()].some((style) => scaled(style.text.size)) ||
+    [...table.character.values()].some((style) => scaled(style.text.size))
+}
+
+function runOf(text: ThemeText, reset = false) {
   return compact({
     font: text.font,
-    size: text.size === undefined ? undefined : halfPoints(text.size),
+    ...(text.size === undefined ? {} : fontSize(text.size, reset)),
     color: text.color ? hex(text.color) : undefined,
     bold: text.bold,
     italics: text.italic,
@@ -50,19 +60,19 @@ const style = (
   id: string,
   name: string,
   text: ThemeText,
-  extra: { keepNext?: boolean; next?: string; normalLine?: LineHeight } = {},
+  extra: { keepNext?: boolean; next?: string; normalLine?: LineHeight; reset?: boolean } = {},
 ) => ({
   id,
   name,
   basedOn: 'Normal',
   next: extra.next ?? 'Normal',
   quickFormat: true,
-  run: runOf(text),
+  run: runOf(text, extra.reset),
   paragraph: paragraphOf(text, extra.keepNext, extra.normalLine),
 })
 
 /** The paragraph and character styles a document defines, as the docx library's style options. */
-function definedStyles(table: StyleTable) {
+function definedStyles(table: StyleTable, reset = false) {
   const paragraphStyles = [...table.paragraph.values()]
     .filter((style) => style.defined && style.definition)
     .map((style) => {
@@ -90,7 +100,7 @@ function definedStyles(table: StyleTable) {
         basedOn: style.basedOn,
         next: style.next ?? style.id,
         quickFormat: true,
-        run: runOf(text),
+        run: runOf(text, reset),
         paragraph: {
           ...paragraphOf(text, text.keepWithNext ?? false, style.basedOn ? table.paragraph.get(style.basedOn)?.text.line : undefined),
           // keepWithNext asks for the lines kept together too only when the style says so itself.
@@ -108,20 +118,21 @@ function definedStyles(table: StyleTable) {
       name: style.name,
       basedOn: style.basedOn,
       quickFormat: true,
-      run: runOptions(style.definition.text as TextStyle),
+      run: runOptions(style.definition.text as TextStyle, reset),
     }),
   )
   return { paragraphStyles, characterStyles }
 }
 
 export function stylesFor(theme: Theme, named?: StyleTable): IStylesOptions {
-  const defined = named ? definedStyles(named) : { paragraphStyles: [], characterStyles: [] }
+  const reset = named ? scalesSizes(named) : false
+  const defined = named ? definedStyles(named, reset) : { paragraphStyles: [], characterStyles: [] }
   // Every theme style is based on Normal, whose line height is the body's.
   const normalLine = theme.body.line ?? 1.15
   const heading = (level: number) => {
     const text = theme.headings[level - 1] ?? {}
     return {
-      run: runOf({ ...text, color: text.color ?? theme.body.color }),
+      run: runOf({ ...text, color: text.color ?? theme.body.color }, reset),
       // The outline level is what the navigation pane and a table of contents read.
       paragraph: { ...paragraphOf(text, text.keepWithNext ?? true, normalLine), outlineLevel: level - 1 },
     }
@@ -130,14 +141,14 @@ export function stylesFor(theme: Theme, named?: StyleTable): IStylesOptions {
   return {
     default: {
       document: {
-        run: runOf(theme.body),
+        run: runOf(theme.body, reset),
         paragraph: paragraphOf({ after: theme.body.after ?? 6, line: theme.body.line ?? 1.15, ...compact({ before: theme.body.before }) }),
       },
       title: {
-        run: runOf({ ...theme.title, color: theme.title.color ?? theme.body.color }),
+        run: runOf({ ...theme.title, color: theme.title.color ?? theme.body.color }, reset),
         paragraph: paragraphOf(theme.title, false, normalLine),
       },
-      footnoteText: { run: runOf({ ...theme.note, font: theme.note.font ?? theme.body.font, color: theme.note.color ?? theme.body.color }) },
+      footnoteText: { run: runOf({ ...theme.note, font: theme.note.font ?? theme.body.font, color: theme.note.color ?? theme.body.color }, reset) },
       heading1: heading(1),
       heading2: heading(2),
       heading3: heading(3),
@@ -146,15 +157,15 @@ export function stylesFor(theme: Theme, named?: StyleTable): IStylesOptions {
       heading6: heading(6),
     },
     paragraphStyles: [
-      style('Subtitle', 'Subtitle', theme.subtitle, { normalLine }),
-      style('Caption', 'caption', theme.caption, { normalLine }),
-      style('KitNote', 'Note', theme.note, { normalLine }),
-      style('KitSmall', 'Small', theme.small, { normalLine }),
-      style('Header', 'header', { after: 0, line: 1, ...theme.header }, { normalLine }),
-      style('Footer', 'footer', { after: 0, line: 1, ...theme.footer }, { normalLine }),
-      style(TABLE_STYLE_ID, 'Table text', { size: table.size, before: 0, after: 0, line: table.line ?? 1 }, { normalLine }),
+      style('Subtitle', 'Subtitle', theme.subtitle, { normalLine, reset }),
+      style('Caption', 'caption', theme.caption, { normalLine, reset }),
+      style('KitNote', 'Note', theme.note, { normalLine, reset }),
+      style('KitSmall', 'Small', theme.small, { normalLine, reset }),
+      style('Header', 'header', { after: 0, line: 1, ...theme.header }, { normalLine, reset }),
+      style('Footer', 'footer', { after: 0, line: 1, ...theme.footer }, { normalLine, reset }),
+      style(TABLE_STYLE_ID, 'Table text', { size: table.size, before: 0, after: 0, line: table.line ?? 1 }, { normalLine, reset }),
       // The contents' own title looks like a first-level heading but is not one, so it does not list itself.
-      style(TOC_TITLE_STYLE_ID, 'Contents title', theme.headings[0] ?? {}, { keepNext: true, normalLine }),
+      style(TOC_TITLE_STYLE_ID, 'Contents title', theme.headings[0] ?? {}, { keepNext: true, normalLine, reset }),
       ...defined.paragraphStyles,
     ],
     ...(defined.characterStyles.length ? { characterStyles: defined.characterStyles } : {}),

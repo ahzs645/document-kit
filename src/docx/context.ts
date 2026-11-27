@@ -24,6 +24,11 @@ export interface WriterContext {
   /** Writing the blocks of a table cell. */
   inCell?: boolean
   /**
+   * The document's styles set a size Word holds only with a character scale (units' `fontSize`): a run with a size of
+   * its own then writes its scale, 100% too, so it never takes a style's.
+   */
+  scaledSizes?: boolean
+  /**
    * The next drawing's stacking order (Word's `relativeHeight`), counted through the whole document: a picture placed
    * later stands over one placed earlier in the same layer, as the HTML writer stacks them.
    */

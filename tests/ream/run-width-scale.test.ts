@@ -55,6 +55,18 @@ describe('a run set at a share of its width (§17.3.2.43)', () => {
     expect(spaceWidth(words({ widthScale: 0.5 }))).toBeCloseTo(spaceWidth(words({})) / 2, 6);
   });
 
+  it('is read from a .docx and laid out that narrow', () => {
+    const read = (rPr: string) => {
+      const { doc } = readDocx(
+        buildDocxFromBody(
+          `<w:p><w:r><w:t>Hi</w:t></w:r><w:r>${rPr}<w:t xml:space="preserve"> </w:t></w:r><w:r><w:t>Hi</w:t></w:r></w:p>`,
+        ),
+      );
+      return spaceWidth(doc.body);
+    };
+    expect(read('<w:rPr><w:w w:val="50"/></w:rPr>')).toBeCloseTo(read('') / 2, 6);
+  });
+
   it('is drawn through the horizontal scaling, and the next run at its own width', () => {
     const pdf = renderStyledPdf(words({ widthScale: 0.5 }), {
       registry: FontRegistry.fromBytes(FONTS),

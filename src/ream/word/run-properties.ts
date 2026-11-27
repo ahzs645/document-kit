@@ -183,6 +183,15 @@ export function parseRunProperties(rPr: unknown, themeFonts?: ThemeFonts): RunPr
     if (Number.isFinite(n) && n !== 0) out.letterSpacingPt = twipsToPt(n);
   }
 
+  // document-kit: §17.3.2.43 — each glyph set at this percent of its width (ST_TextScale,
+  // 1 to 600). The writer wrote it and the layout and the PDF set it, but a
+  // .docx's own was dropped: a run Word shows at 98% came out at full width
+  // and broke its lines early. 100 is kept, as it undoes a style's share.
+  if ('w:w' in el) {
+    const n = Number(getVal(el['w:w']));
+    if (Number.isFinite(n) && n > 0) out.widthScale = Math.min(600, Math.max(1, n)) / 100;
+  }
+
   // §17.3.2.19 — the size from which the run's glyph pairs are kerned, in
   // half-points; 0 turns kerning off, which a style may need to say.
   if ('w:kern' in el) {

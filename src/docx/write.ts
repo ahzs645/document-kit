@@ -30,7 +30,7 @@ import { writeBlocks } from './blocks'
 import type { WriterContext } from './context'
 import { Footnotes } from './footnotes'
 import { normalizePackage } from './package'
-import { createListRegistry, stylesFor } from './styles'
+import { createListRegistry, scalesSizes, stylesFor } from './styles'
 import { twips } from './units'
 
 export interface WriteDocxOptions {
@@ -85,6 +85,7 @@ function buildDocx(source: Document, options: WriteDocxOptions): DocxDocument {
   const document = applyTextRules(expandDocument(source, options.registry)).document
   const theme = resolveTheme(document.theme)
   const styles: StyleTable = styleTable(theme, document.styles)
+  const scaledSizes = scalesSizes(styles)
   const captions = numberCaptions(document)
   const lists = createListRegistry()
   const bookmarks = new Set<string>()
@@ -105,6 +106,7 @@ function buildDocx(source: Document, options: WriteDocxOptions): DocxDocument {
       nullCells: options.nullCells ?? 'empty',
       lists,
       styles,
+      scaledSizes,
       nextDrawing,
     }
     return writeSection(section, context)

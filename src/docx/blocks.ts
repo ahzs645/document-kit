@@ -55,7 +55,7 @@ import {
 import { bookmarked } from './bookmarks'
 import { spreadsheetTable } from './spreadsheet'
 import { autoLineTables, tableGaps, writeTable } from './table'
-import { border, pixels, twips } from './units'
+import { border, fontSize, pixels, twips } from './units'
 
 export type FileChild = Paragraph | Table | TableOfContents
 
@@ -258,7 +258,7 @@ function writeFields(block: FieldsBlock, context: WriterContext, breakBefore: bo
   lines.forEach((line, index) => {
     const children: ParagraphChild[] = []
     line.forEach((row, at) => {
-      if (at > 0) children.push(new TextRun(compact({ text: gapSpaces, size: size === undefined ? undefined : size * 2 })))
+      if (at > 0) children.push(new TextRun({ text: gapSpaces, ...(size === undefined ? {} : fontSize(size, context.scaledSizes)) }))
       children.push(...rowChildren(row, at > 0))
     })
     out.push(

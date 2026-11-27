@@ -253,9 +253,15 @@ Each change is marked in the source with a `document-kit:` comment unless noted.
     outlines. Off by default, so the engine's own output and the byte gate are unchanged;
     `src/layout` (`layoutDocx`, hence `docxToPdf` and `docxToPages`) turns it on. Pinned by
     `tests/layout/kerning.test.ts`.
+24. **A run's character scale read from a .docx** (`word/run-properties.ts`, marked
+    `document-kit:`). Upstream laid out, drew and wrote `widthScale` (§17.3.2.43 `w:w`) but
+    never read it, so a run Word sets at 98% of its width came out at full width and broke its
+    lines early. `w:w` is now read into `widthScale` (its percent over 100, kept within 1 to
+    600; 100 kept too, as it undoes a style's share). Pinned by `tests/ream/run-properties.test.ts`,
+    `tests/ream/run-width-scale.test.ts` and `tests/layout/size-scale.test.ts`.
 
 Nothing else differs. `diff -r` against the upstream tree, after running the rewrite script
-over a fresh copy, shows only the twenty-three changes above.
+over a fresh copy, shows only the twenty-four changes above.
 
 ## Bringing in a newer upstream
 
@@ -265,11 +271,11 @@ over a fresh copy, shows only the twenty-three changes above.
    included; skip `corpus/`, `stand/`, `docs/`, `scripts/`). Delete files upstream deleted.
 3. Run `node scripts/rewrite-ream-aliases.mjs`, then `node scripts/rewrite-ream-aliases.mjs
    --check` (exits 1 if an alias import or root-relative fixture path is left).
-4. Re-apply changes 1, 2 and 4 to 23 above unless upstream has made them itself (check
+4. Re-apply changes 1, 2 and 4 to 24 above unless upstream has made them itself (check
    `FIXED_MTIME`, a `w:r` split for complex fields, every fallback to the global `fetch` in
    `core/fonts`, `core/converter` and `excel`, `familyNamesInFlow`, `w:vAlign`, PAGEREF and
    body fields, §17.4.66 border conflicts, `w:keepNext` in table rows, and the two foot-frame
-   checks of changes 10 and 11, the no-break hyphen of change 12, percentage widths with their sign of change 13, the stand-in grid of change 14, border widths of change 15, the `compact` option of change 16, synthetic faces for embedded families of change 18, CFF faces in the PDF of change 19, band pictures behind the page of change 20, framed pictures of change 21, extension and legacy kerning of change 22, `kernAsAsked` of change 23). Search for
+   checks of changes 10 and 11, the no-break hyphen of change 12, percentage widths with their sign of change 13, the stand-in grid of change 14, border widths of change 15, the `compact` option of change 16, synthetic faces for embedded families of change 18, CFF faces in the PDF of change 19, band pictures behind the page of change 20, framed pictures of change 21, extension and legacy kerning of change 22, `kernAsAsked` of change 23, `w:w` read of change 24). Search for
    `document-kit:` in the old tree to find each place. Search for new uses of
    `fetch`, `XMLHttpRequest` and `node:` in `src/ream` and treat any as change 4.
 5. Check `src/layout` still compiles against the internals it imports (`core/converter/project`,

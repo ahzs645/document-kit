@@ -47,6 +47,30 @@ describe('kerning', () => {
   })
 })
 
+describe('a size between half-points', () => {
+  it('is written as the nearest half-point with the character scale that keeps its width', async () => {
+    const { document: xml } = await write([paragraph([text('Body', { size: 9.3 }), text('Label', { size: 5.7 }), text('Whole', { size: 9.5 })])])
+    expect(all(xml, /<w:sz w:val="(\d+)"\/>/)).toEqual(['19', '11', '19'])
+    expect(all(xml, /<w:w w:val="(\d+)"\/>/)).toEqual(['98', '104'])
+  })
+
+  it('in a style makes every size the document writes say its scale, so none takes the style\'s', async () => {
+    const pkg = await write([paragraph([text('Body'), text('Exact', { size: 8 })])], {
+      theme: { body: { size: 9.3 }, headings: [{ size: 27 }] },
+    })
+    const styles = pkg.text('word/styles.xml')
+    expect(/<w:docDefaults>[\s\S]*<\/w:docDefaults>/.exec(styles)![0]).toMatch(/<w:sz w:val="19"\/>[\s\S]*<w:w w:val="98"\/>|<w:w w:val="98"\/>[\s\S]*<w:sz w:val="19"\/>/)
+    expect(styleXml(styles, 'Heading1')).toMatch(/<w:w w:val="100"\/>/)
+    expect(all(pkg.document, /<w:w w:val="(\d+)"\/>/)).toEqual(['100'])
+  })
+
+  it('leaves a document whose sizes are all half-points without a scale', async () => {
+    const pkg = await write([paragraph([text('Body', { size: 8 })])], { theme: { body: { size: 10.5 } } })
+    expect(pkg.text('word/styles.xml')).not.toMatch(/<w:w /)
+    expect(pkg.document).not.toMatch(/<w:w /)
+  })
+})
+
 describe('named styles', () => {
   const styles: Document['styles'] = {
     paragraph: [

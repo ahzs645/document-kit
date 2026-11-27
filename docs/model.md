@@ -12,6 +12,11 @@ A picture's own size is in **pixels**, read at 96 to the inch. Colours are hex: 
 (each digit doubled, as in CSS), in any case, with or without the `#`. Anything else throws an error naming the value.
 Column widths in a table are **shares** (any numbers; `[3, 1, 1]` gives the first column three fifths).
 
+A font size may be any number of points. Word holds sizes in half-points only, so the Word writer sets one between two
+(9.3 pt, a 12.4 px design size) at the nearest half-point with the character scale (`w:w`, whole percent) that keeps
+its width: 9.5 pt at 98%. Its lines break where the HTML writer's, set at 9.3 pt itself, do. Once any style needs a
+scale, every size the document writes states its own (100% included), so none takes a style's.
+
 ## The document
 
 ```ts

@@ -145,6 +145,16 @@ describe('parseRunProperties', () => {
     });
   });
 
+  it('reads the share of its width a run is set at (§17.3.2.43), 100 undoing a style’s', () => {
+    expect(parseRunProperties(parseRpr('<w:rPr><w:w w:val="98"/></w:rPr>'))).toEqual({
+      widthScale: 0.98,
+    });
+    expect(parseRunProperties(parseRpr('<w:rPr><w:w w:val="100"/></w:rPr>'))).toEqual({
+      widthScale: 1,
+    });
+    expect(parseRunProperties(parseRpr('<w:rPr><w:w w:val="0"/></w:rPr>'))).toEqual({});
+  });
+
   it('parses w:rtl toggle', () => {
     expect(parseRunProperties(parseRpr('<w:rPr><w:rtl/></w:rPr>'))).toEqual({ rtl: true });
     expect(parseRunProperties(parseRpr('<w:rPr><w:rtl w:val="false"/></w:rPr>'))).toEqual({

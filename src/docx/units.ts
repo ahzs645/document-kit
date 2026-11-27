@@ -8,6 +8,23 @@ import type { Border, Kerning, LineHeight } from '../model/types'
 export const twips = (points: number): number => Math.round(points * 20)
 /** Half-points: font sizes. */
 export const halfPoints = (points: number): number => Math.round(points * 2)
+
+/** Whether Word can hold a font size as it is: a whole number of half-points. */
+export const halfPointSize = (points: number): boolean => Math.abs(points * 2 - Math.round(points * 2)) < 1e-6
+
+/**
+ * A font size as Word holds it. `w:sz` counts whole half-points, so a size between two (9.3 pt, a 12.4 px design size)
+ * is written as the nearest one with the character scale (`w:w`, whole percent) that sets its text as wide as the size
+ * asked for: 9.5 pt at 98%. Its lines then break where the HTML writer's, set at the size itself, do; rounded alone,
+ * every line is 2% longer and a full page runs over. With `reset`, a size Word holds as it is says 100%, so a run or a
+ * style never takes the scale of a style beneath it.
+ */
+export function fontSize(points: number, reset = false): { size: number; scale?: number } {
+  const size = halfPoints(points)
+  if (size < 1) return { size }
+  const scale = halfPointSize(points) ? 100 : Math.min(600, Math.max(1, Math.round((points * 200) / size)))
+  return scale !== 100 || reset ? { size, scale } : { size }
+}
 /** Eighths of a point: border widths, from 2 (a quarter point) to 96 (twelve points). */
 export const eighths = (points: number): number => Math.min(96, Math.max(2, Math.round(points * 8)))
 /** Pixels at 96 to the inch, which docx takes for a picture's drawn size. */

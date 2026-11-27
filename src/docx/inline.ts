@@ -14,10 +14,13 @@ import {
 import { characterStyleId, resolveImage, resolveSentences } from '../model/index'
 import type { InlineImage, PictureCrop, RichText, TextStyle } from '../model/types'
 import type { WriterContext } from './context'
-import { halfPoints, hex, kernHalfPoints, pixels, twips } from './units'
+import { fontSize, hex, kernHalfPoints, pixels, twips } from './units'
 
-/** A model text style as docx run options. Only what is set is written, so styles underneath show through. */
-export function runOptions(style: TextStyle): IRunOptions {
+/**
+ * A model text style as docx run options. Only what is set is written, so styles underneath show through. `reset`
+ * writes a size's character scale even at 100% ({@link fontSize}), for a document whose styles scale theirs.
+ */
+export function runOptions(style: TextStyle, reset = false): IRunOptions {
   const out: Record<string, unknown> = {}
   if (style.bold !== undefined) out.bold = style.bold
   if (style.italic !== undefined) out.italics = style.italic
@@ -28,7 +31,7 @@ export function runOptions(style: TextStyle): IRunOptions {
   if (style.smallCaps !== undefined) out.smallCaps = style.smallCaps
   if (style.allCaps !== undefined) out.allCaps = style.allCaps
   if (style.color) out.color = hex(style.color)
-  if (style.size !== undefined) out.size = halfPoints(style.size)
+  if (style.size !== undefined) Object.assign(out, fontSize(style.size, reset))
   if (style.font) out.font = style.font
   if (style.highlight) out.highlight = style.highlight
   // The docx library leaves out a spacing of 0; a value under one twip writes the explicit 0 a style's tracking needs
@@ -72,9 +75,9 @@ export interface InlineBase {
 }
 
 /** A blank rule: underlined no-break spaces, about `width` points long at the text size. */
-function blankRun(width: number, size: number, style: TextStyle): TextRun {
+function blankRun(width: number, size: number, style: TextStyle, reset = false): TextRun {
   const count = Math.max(4, Math.round(width / (size * 0.25)))
-  return new TextRun({ ...runOptions(style), underline: {}, text: ' '.repeat(count) })
+  return new TextRun({ ...runOptions(style, reset), underline: {}, text: ' '.repeat(count) })
 }
 
 /** Plain text with its newlines as line breaks, its tab characters as tabs and its no-break hyphens as Word's. */
@@ -170,6 +173,7 @@ export function croppedPixels(info: { width: number; height: number }, crop: Pic
 export function inlineChildren(text: RichText, context: WriterContext, base: InlineBase = {}): ParagraphChild[] {
   const children: ParagraphChild[] = []
   const baseStyle = base.style ?? {}
+  const reset = context.scaledSizes ?? false
   const sourced = (style: TextStyle, source: string | undefined): TextStyle => {
     const from = source ?? base.source
     const mark = from ? context.sourceStyles[from] : undefined
@@ -179,7 +183,7 @@ export function inlineChildren(text: RichText, context: WriterContext, base: Inl
   }
   for (const inline of resolveSentences(text)) {
     if (typeof inline === 'string') {
-      children.push(...textRuns(inline, runOptions(sourced(baseStyle, undefined))))
+      children.push(...textRuns(inline, runOptions(sourced(baseStyle, undefined), reset)))
       continue
     }
     switch (inline.type) {
@@ -191,12 +195,12 @@ export function inlineChildren(text: RichText, context: WriterContext, base: Inl
             ...(context.theme.link.underline ? { underline: true } : {}),
             ...style,
           }
-          const runs = textRuns(inline.text, runOptions(linkStyle))
+          const runs = textRuns(inline.text, runOptions(linkStyle, reset))
           children.push(inline.link.startsWith('#')
             ? new InternalHyperlink({ anchor: inline.link.slice(1), children: runs })
             : new ExternalHyperlink({ link: inline.link, children: runs }))
         } else {
-          children.push(...textRuns(inline.text, runOptions(style)))
+          children.push(...textRuns(inline.text, runOptions(style, reset)))
         }
         break
       }
@@ -212,24 +216,24 @@ export function inlineChildren(text: RichText, context: WriterContext, base: Inl
             : inline.field === 'pages'
               ? PageNumber.TOTAL_PAGES
               : PageNumber.TOTAL_PAGES_IN_SECTION
-        children.push(new TextRun({ ...runOptions(style), children: [field] }))
+        children.push(new TextRun({ ...runOptions(style, reset), children: [field] }))
         break
       }
       case 'break':
-        children.push(new TextRun({ ...runOptions(baseStyle), break: 1 }))
+        children.push(new TextRun({ ...runOptions(baseStyle, reset), break: 1 }))
         break
       case 'tab':
-        children.push(new TextRun({ ...runOptions(baseStyle), children: [new Tab()] }))
+        children.push(new TextRun({ ...runOptions(baseStyle, reset), children: [new Tab()] }))
         break
       case 'blank': {
         const style = sourced({ ...baseStyle, ...styleOf(inline as unknown as TextStyle & Record<string, unknown>) }, inline.source)
         if (inline.show === 'placeholder') {
           // The bracketed name, marked so it cannot pass for prose.
-          children.push(...textRuns(`[${inline.what ?? ''}]`, runOptions({ ...style, ...context.theme.placeholderMark })))
+          children.push(...textRuns(`[${inline.what ?? ''}]`, runOptions({ ...style, ...context.theme.placeholderMark }, reset)))
           break
         }
         const size = style.size ?? context.theme.body.size
-        children.push(blankRun(inline.width ?? context.theme.blankWidth, size, style))
+        children.push(blankRun(inline.width ?? context.theme.blankWidth, size, style, reset))
         break
       }
       case 'checkbox':
