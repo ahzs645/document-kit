@@ -14,12 +14,14 @@ import {
   headerRow,
   heading,
   list,
+  orderedList,
   pageCount,
   pageNumber,
   paragraph,
   pinned,
   row,
   section,
+  tab,
   table,
   text,
   toc,
@@ -151,7 +153,8 @@ describe('writeHtml', () => {
     expect(html).toMatch(/<p id="dk-fn-1" class="dk-p dk-ps-KitNote"[^>]*><sup>1<\/sup> A made-up source.<\/p>/)
     expect(html).toMatch(/<a href="https:\/\/www.example.org">www.example.org<\/a>/)
     expect(html).toMatch(/<a href="#dk-h\d+"[^>]*>Results<\/a>.*?<span>1<\/span>/)
-    expect(html).toMatch(/<ol class="dk-list" style="list-style-type:decimal">.*<ol class="dk-list" style="list-style-type:lower-alpha">/)
+    expect(html).toMatch(/<ol class="dk-list"><li[^>]*><span class="dk-hang dk-marker" aria-hidden="true" style="min-width:14pt">1\.<\/span>First/)
+    expect(html).toMatch(/2\.<\/span>Second<ol class="dk-list"><li[^>]*><span class="dk-hang dk-marker"[^>]*>a\.<\/span>Inner/)
     expect(html).toContain('Expanded note.')
     expect(html).toMatch(/<div class="dk-foot">.*Pinned at the foot\./)
     expect(html).toMatch(/class="dk-blank"/)
@@ -269,5 +272,46 @@ describe('kerning', () => {
     // Body text is 11 pt, under the threshold; a 20 pt heading is over it.
     expect(html).toMatch(/\.dk-ps-Normal\{[^}]*font-kerning:none/)
     expect(html).toMatch(/\.dk-ps-Heading1\{[^}]*font-kerning:normal/)
+  })
+})
+
+describe('numbers in a hanging indent', () => {
+  // A step as a designed page writes one: its number, a tab, its title, the number in the hanging room.
+  const step = (n: string, title: string, tabs = [{ at: 26 }]) =>
+    paragraph([text(n, { bold: true }), tab(), title], { indent: { left: 26, hanging: 26 }, tabs })
+
+  it('sets the number in the hanging room and the text after the tab at the indent, in the flow', () => {
+    const html = writeHtml(document([section([step('01', 'Open the kit')])]))
+    expect(html).toMatch(
+      /<p class="dk-p dk-ps-Normal" style="margin-left:26pt;text-indent:-26pt"><span class="dk-hang" style="min-width:26pt"><span style="font-weight:700">01<\/span><\/span>Open the kit<\/p>/,
+    )
+    // The hanging indent is a stop of its own: with no stops given it is still where the tab goes.
+    expect(writeHtml(document([section([step('02', 'Close it', [])])]))).toMatch(/min-width:26pt"><span[^>]*>02<\/span><\/span>Close it/)
+  })
+
+  it('reads the hanging indent from the paragraph\'s style', () => {
+    const html = writeHtml(
+      document([section([paragraph(['3.', tab(), 'Styled step'], { style: 'Step' })])], {
+        styles: { paragraph: [{ id: 'Step', indent: { left: 20, hanging: 20 } }] },
+      }),
+    )
+    expect(html).toMatch(/<span class="dk-hang" style="min-width:20pt">3\.<\/span>Styled step/)
+  })
+
+  it('places text at a stop before the indent as before, its first line not pulled back by the hanging indent', () => {
+    const html = writeHtml(document([section([step('04', 'At a stop', [{ at: 10 }])])]))
+    expect(html).toMatch(/<span class="dk-at" style="left:-16pt">At a stop<\/span>/)
+    expect(html).toMatch(/\.dk-tabbed>\.dk-at\{[^}]*text-indent:0/)
+  })
+
+  it('numbers ordered lists in Word\'s formats from their start, and bullets lists', () => {
+    const html = writeHtml(
+      document([section([orderedList(['Ninth', 'Tenth'], { start: 9 }), list([{ content: 'Dot', items: [{ content: 'Ring', items: ['Square'] }] }])])]),
+    )
+    expect(html).toMatch(/<ol class="dk-list" start="9"><li[^>]*><span class="dk-hang dk-marker"[^>]*>9\.<\/span>Ninth<\/li><li[^>]*><span[^>]*>10\.<\/span>Tenth/)
+    expect(html).toMatch(/>•<\/span>Dot<ul class="dk-list"><li[^>]*><span[^>]*>◦<\/span>Ring<ul class="dk-list"><li[^>]*><span[^>]*>▪<\/span>Square/)
+    expect(html).toMatch(/\.dk-list\{[^}]*list-style:none/)
+    const roman = writeHtml(document([section([orderedList([{ content: 'a', items: [{ content: 'b', items: ['c', 'd', 'e', 'f'] }] }])])]))
+    expect(roman).toMatch(/>iv\.<\/span>f/)
   })
 })

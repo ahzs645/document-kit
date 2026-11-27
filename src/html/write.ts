@@ -441,7 +441,9 @@ function paragraphHtml(block: ParagraphBlock, ctx: Ctx): string {
   }
   if (block.text) css.push(...textCss(block.text))
   const base: InlineBase = { ...(block.text ? { style: block.text } : {}), ...(block.source ? { source: block.source } : {}) }
-  const content = tabbed(inlineHtml(block.content, ctx, base), block.tabs, ctx, indent?.left ?? 0)
+  // The indent the tabs are read against: the paragraph's own over its style's, as Word reads it.
+  const styled = { ...ctx.state.styles.paragraph.get(style)?.indent, ...indent }
+  const content = tabbed(inlineHtml(block.content, ctx, base), block.tabs, ctx, styled.left ?? 0, styled.hanging ?? 0)
   const id = block.bookmark ? ` id="${escapeHtml(idFor(ctx.state, block.bookmark, 'dk-b'))}"` : ''
   const tabbedClass = content.startsWith(TABBED) ? ' dk-tabbed' : ''
   return `<p class="dk-p dk-ps-${style}${tabbedClass}"${id}${styleAttr(css)}>${content.replace(TABBED, '')}</p>`
@@ -455,23 +457,42 @@ function styled(styleId: string, content: string, css: string[] = []): string {
 const TAB = '\u0001'
 const TABBED = '\u0002'
 
+const DEFAULT_TAB = '<span class="dk-tab" style="tab-size:36pt">\t</span>'
+
 /**
  * A paragraph's content with its tabs set: at the paragraph's tab stops (the text after each tab placed at its stop,
  * left, centred or right; "Page 2 of 9" at the right edge of a footer), else at Word's default stops every half inch.
  * The result starts with a marker when the paragraph needs the `dk-tabbed` class.
+ *
+ * A hanging paragraph whose first tab goes to its left indent ("01", a tab, then the step's title, the number in the
+ * hanging room) is set as Word sets it: the hanging indent is a stop of its own, so the text before the tab fills the
+ * hanging room and the text after it starts at the indent, its later lines wrapping there.
  */
-function tabbed(content: string, stops: readonly TabStop[] | undefined, ctx: Ctx, indent = 0): string {
+function tabbed(content: string, stops: readonly TabStop[] | undefined, ctx: Ctx, indent = 0, hanging = 0): string {
   if (!content.includes(TAB)) return content
   const parts = content.split(TAB)
-  if (!stops?.length) return parts.join('<span class="dk-tab" style="tab-size:36pt">\t</span>')
-  const ordered = stops
+  const ordered = (stops ?? [])
     .map((stop) => ({ ...stop, at: stop.at === 'end' ? ctx.width : stop.at === 'middle' ? ctx.width / 2 : stop.at }))
     .sort((a, b) => a.at - b.at)
+  if (hanging > 0) {
+    // The first stop past the start of the first line; the hanging indent is one, so a custom stop before it is the
+    // only thing that takes the tab elsewhere.
+    const start = indent - hanging
+    const next = ordered.find((stop) => stop.at > start + 0.01)
+    if (!next || next.at >= indent - 0.01) {
+      const rest = ordered.filter((stop) => stop.at > indent + 0.01)
+      const after = parts.slice(1).join(TAB)
+      const tail = tabbed(after, rest, ctx, indent)
+      const box = hangingBox(parts[0]!, hanging)
+      return tail.startsWith(TABBED) ? TABBED + box + tail.slice(TABBED.length) : box + tail
+    }
+  }
+  if (!ordered.length) return parts.join(DEFAULT_TAB)
   let out = parts[0]!
   parts.slice(1).forEach((part, i) => {
     const stop = ordered[i]
     if (!stop) {
-      out += `<span class="dk-tab" style="tab-size:36pt">\t</span>${part}`
+      out += `${DEFAULT_TAB}${part}`
       return
     }
     const at = stop.at - indent
@@ -485,6 +506,15 @@ function tabbed(content: string, stops: readonly TabStop[] | undefined, ctx: Ctx
   })
   if (!parts[0]) out = `&#8203;${out}`
   return TABBED + out
+}
+
+/**
+ * What stands in a paragraph's hanging room — a step's number, a list item's marker — as a box the hanging indent wide
+ * at the start of the first line, so the text after it starts at the indent (wider text pushes it on, as a number
+ * too wide for its room does in Word).
+ */
+function hangingBox(html: string, hanging: number): string {
+  return `<span class="dk-hang"${styleAttr(`min-width:${pt(hanging)}`)}>${html}</span>`
 }
 
 /* ------------------------------------------------------------------ inline text */
@@ -638,22 +668,50 @@ function footnoteHtml(id: string, ctx: Ctx): string {
 
 /* ------------------------------------------------------------------ lists and fields */
 
-const BULLETS = ['disc', 'circle', 'square']
-const ORDERED = ['decimal', 'lower-alpha', 'lower-roman']
+// The markers the Word writer's numbering prints (src/docx/styles.ts, `levels`), level by level.
+const BULLETS = ['•', '◦', '▪']
+const ORDERED = ['decimal', 'lower-alpha', 'lower-roman'] as const
+/** A list level's hanging room, points: the number or bullet stands in it, the text starts after it (as in Word). */
+const LIST_HANGING = 14
 
+/** A counter in a list level's numbering: 3, c, iii. */
+function counter(n: number, format: (typeof ORDERED)[number]): string {
+  if (format === 'decimal' || n < 1) return String(n)
+  if (format === 'lower-alpha') {
+    let out = ''
+    for (let k = n; k > 0; k = Math.floor((k - 1) / 26)) out = String.fromCharCode(97 + ((k - 1) % 26)) + out
+    return out
+  }
+  const numerals: Array<[number, string]> = [
+    [1000, 'm'], [900, 'cm'], [500, 'd'], [400, 'cd'], [100, 'c'], [90, 'xc'],
+    [50, 'l'], [40, 'xl'], [10, 'x'], [9, 'ix'], [5, 'v'], [4, 'iv'], [1, 'i'],
+  ]
+  let out = ''
+  let k = n
+  for (const [value, numeral] of numerals) for (; k >= value; k -= value) out += numeral
+  return out
+}
+
+/**
+ * A list as Word numbers it: each item's number ("1.", "b.", "iii.") or bullet written out in the item's hanging
+ * room, 14 pt, the text 18 pt in a level (the Word writer's numbering), so the numbers show, in print too, and line up
+ * as Word's do: left-aligned at the start of the room, the text after them at the indent, wrapped lines under it.
+ * The list keeps its `ol`/`ul` and items for what reads the page; the written markers are hidden from it.
+ */
 function listHtml(block: ListBlock, ctx: Ctx): string {
   const visit = (items: readonly (ListItem | RichText)[], ordered: boolean, level: number, start: number): string => {
-    const kind = ordered ? ORDERED[level % 3]! : BULLETS[level % 3]!
     const tag = ordered ? 'ol' : 'ul'
     const lis = items
-      .map((raw) => {
+      .map((raw, index) => {
         const item: ListItem = isRichText(raw) ? { content: raw } : raw
+        const marker = ordered ? `${counter(start + index, ORDERED[level % 3]!)}.` : BULLETS[level % 3]!
         const content = tabbed(inlineHtml(item.content, ctx, block.source ? { source: block.source } : {}), undefined, ctx)
         const nested = item.items?.length ? visit(item.items, item.ordered ?? ordered, level + 1, 1) : ''
-        return `<li class="dk-ps-${paragraphStyle({}, ctx)}">${content}${nested}</li>`
+        const box = hangingBox(marker, LIST_HANGING).replace('<span class="dk-hang"', '<span class="dk-hang dk-marker" aria-hidden="true"')
+        return `<li class="dk-ps-${paragraphStyle({}, ctx)}">${box}${content}${nested}</li>`
       })
       .join('')
-    return `<${tag} class="dk-list"${styleAttr(`list-style-type:${kind}`)}${ordered && start !== 1 ? ` start="${start}"` : ''}>${lis}</${tag}>`
+    return `<${tag} class="dk-list"${ordered && start !== 1 ? ` start="${start}"` : ''}>${lis}</${tag}>`
   }
   return visit(block.items, block.ordered === true, 0, Math.floor(block.start ?? 1))
 }

@@ -3,7 +3,7 @@
  * properties, an embedded face) written as Word, laid out with a face named by the caller, and written as HTML, all
  * from the built package in the page. Made-up content only. Throws on failure; returns a JSON-serialisable summary.
  */
-import { document, floatingImage, fontEmbeddingReport, frame, heading, headerRow, lineBreak, paragraph, row, section, table, text } from 'document-kit'
+import { document, floatingImage, fontEmbeddingReport, frame, heading, headerRow, lineBreak, orderedList, paragraph, row, section, tab, table, text } from 'document-kit'
 import { writeDocx } from 'document-kit/docx'
 import { writeHtml } from 'document-kit/html'
 import { createFontProvider, layoutDocx } from 'document-kit/layout'
@@ -30,7 +30,19 @@ export default async function brandCase(ctx) {
         ],
         { page: { paper: 'letter', margins: { top: 0, bottom: 0, left: 0, right: 0, header: 0, footer: 0 } }, header: [floatingImage(art, 'page', { alt: 'Artwork' })] },
       ),
-      section([paragraph([text('Tracked', { characterStyle: 'Wide' })], { style: 'CoverLine' }), table([headerRow(['Quoted face']), row(['Body'])])], { header: [] }),
+      section(
+        [
+          paragraph([text('Tracked', { characterStyle: 'Wide' })], { style: 'CoverLine' }),
+          table([headerRow(['Quoted face']), row(['Body'])]),
+          // A numbered step as a designed page sets one: the number in the hanging room, a tab, the title at the indent.
+          paragraph([text('01', { bold: true, color: 'c2410c' }), tab(), 'A step whose made-up title runs on long enough to wrap onto a second line, under itself at the indent, as Word sets a hanging paragraph.'], {
+            indent: { left: 26, hanging: 26 },
+            tabs: [{ at: 26 }],
+          }),
+          orderedList(['First item']),
+        ],
+        { header: [] },
+      ),
     ],
     {
       metadata: { title: 'Made-up brand document', custom: { 'app.id': 'case-1' } },
@@ -82,6 +94,30 @@ export default async function brandCase(ctx) {
   const headerStyle = view.getComputedStyle(headerText)
   check(headerStyle.color === 'rgb(170, 51, 17)', `the header text is ${headerStyle.color}`)
   check(/Quoted.*Face.*sans-serif/.test(headerStyle.fontFamily), `the header face is ${headerStyle.fontFamily}`)
+  // The step's number shows in the hanging room, the title after it at the indent; a list's number 4pt in, its text at
+  // 18pt (the Word writer's numbering). Sheet two's margins are an inch (96px).
+  const left = sheets[1].getBoundingClientRect().left + 96
+  const px = (points) => (points * 96) / 72
+  const startOf = (node) => {
+    const range = frameEl.contentDocument.createRange()
+    range.selectNodeContents(node)
+    return range.getClientRects()[0]
+  }
+  const hang = sheets[1].querySelector('p .dk-hang')
+  check(hang, 'the step has no hanging number')
+  const number = hang.getBoundingClientRect()
+  const stepTitle = startOf(hang.nextSibling)
+  check(Math.abs(number.left - left) < 1, `the step number starts at ${number.left - left}px, not 0`)
+  check(number.width > 5 && hang.textContent === '01', 'the step number is not shown')
+  check(Math.abs(stepTitle.left - left - px(26)) < 1, `the step title starts at ${stepTitle.left - left}px, not ${px(26)}`)
+  // Its later lines wrap at the indent: the paragraph is two lines tall and its box starts there.
+  const box = hang.parentElement.getBoundingClientRect()
+  check(box.height > number.height * 1.5, 'the step title did not wrap')
+  check(Math.abs(box.left - left - px(26)) < 1, `the step's lines wrap at ${box.left - left}px, not ${px(26)}`)
+  const marker = sheets[1].querySelector('li .dk-marker')
+  check(marker && marker.textContent === '1.', 'the list number is not written')
+  check(Math.abs(marker.getBoundingClientRect().left - left - px(4)) < 1, `the list number is at ${marker.getBoundingClientRect().left - left}px`)
+  check(Math.abs(startOf(marker.nextSibling).left - left - px(18)) < 1, 'the list text is not at 18pt')
   frameEl.remove()
   return { pages: laid.pageCount, htmlBytes: html.length, sheets: sheets.length }
 }

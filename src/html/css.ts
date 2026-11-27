@@ -229,10 +229,11 @@ body{margin:0;background:var(--dk-desk,#e5e7eb)}
 .dk-p{margin:0;overflow-wrap:break-word}
 .dk-p:empty::after{content:"\\200b"}
 .dk-tabbed{position:relative}
-.dk-tabbed>.dk-at{position:absolute;top:0;white-space:nowrap}
+.dk-tabbed>.dk-at{position:absolute;top:0;white-space:nowrap;text-indent:0}
 .dk-tab{white-space:pre}
-.dk-list{margin:0;padding:0 0 0 18pt}
-.dk-list>li{padding-left:0}
+.dk-hang{display:inline-block;text-indent:0}
+.dk-list{margin:0;padding:0 0 0 18pt;list-style:none}
+.dk-list>li{padding-left:0;text-indent:-14pt}
 .dk-list>li>.dk-p{display:block}
 .dk-table{border-collapse:collapse;border-spacing:0}
 .dk-table td,.dk-table th{font-weight:inherit;text-align:inherit;vertical-align:top}

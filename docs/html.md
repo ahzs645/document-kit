@@ -60,6 +60,15 @@ The browser breaks the lines, not the layout engine, so pages are approximated w
   `pages` the number of sheets, `sectionPages` the section's. A contents list prints each heading's sheet number.
 - Tab stops are honoured for one line: the text after each tab is placed at its stop (left, centred or right; the
   "Page 2 of 9" at the right edge of a footer). Without stops a tab advances to the next half inch.
+- A number in a hanging indent is set as Word sets it: in a paragraph with a hanging indent (its own or its style's)
+  whose first tab goes to the left indent — a stop there, or none before it, the hanging indent being a stop of its
+  own — the text before the tab (a step's "01") fills the hanging room and the text after it starts at the indent,
+  its later lines wrapping under it, in the flow (no placed box), so a long title wraps and the paragraph is as tall
+  as its lines.
+- Lists are numbered as the Word writer numbers them: each item's number ("1.", "a.", "i." by level, from the list's
+  `start`) or bullet (• ◦ ▪) is written out in a 14 pt hanging room, the text at 18 pt a level, so the numbers show in
+  print and line up as Word's do (left-aligned, the text after them at the indent). The list keeps its `ol`/`ul`;
+  the written markers are hidden from assistive technology (`aria-hidden`).
 - Paragraph spacing adds as Word adds it (no collapsing margins: every flow is a flex column), a line multiple is
   set on 1.2 em (about a face's own line), and the first block of a sheet, a frame or a header takes no space above.
 - A line height in points is CSS `line-height` in points: `{ exact: 14 }` is `line-height:14pt`, the same pitch as
