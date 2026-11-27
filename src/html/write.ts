@@ -425,12 +425,20 @@ function paragraphHtml(block: ParagraphBlock, ctx: Ctx): string {
   if (block.spacing?.after !== undefined) css.push(`margin-bottom:${pt(block.spacing.after)}`)
   if (block.spacing?.line !== undefined) css.push(`line-height:${lineHeightCss(block.spacing.line)}`)
   const indent = block.indent
-  if (indent) {
-    if (indent.left !== undefined) css.push(`margin-left:${pt(indent.left)}`)
-    if (indent.right !== undefined) css.push(`margin-right:${pt(indent.right)}`)
-    if (indent.hanging) css.push(`text-indent:${pt(-indent.hanging)}`)
-    else if (indent.firstLine !== undefined) css.push(`text-indent:${pt(indent.firstLine)}`)
+  // §17.3.1.24 — Word keeps a paragraph's words at its indent and stands a side rule its space and its width
+  // outside them, so the box (its fill and rules) reaches past the indent: a callout indented by its padding
+  // spans the text column. In CSS the padding and the border sit inside the margin, so the margin is the indent
+  // less both.
+  const outside = (side: 'left' | 'right') => {
+    const value = block.borders?.[side]
+    return value && (value.style ?? 'single') !== 'none' ? (value.space ?? 0) + Math.max(0.25, value.width ?? 0.5) : 0
   }
+  const left = (indent?.left ?? 0) - outside('left')
+  const right = (indent?.right ?? 0) - outside('right')
+  if (indent?.left !== undefined || left) css.push(`margin-left:${pt(left)}`)
+  if (indent?.right !== undefined || right) css.push(`margin-right:${pt(right)}`)
+  if (indent?.hanging) css.push(`text-indent:${pt(-indent.hanging)}`)
+  else if (indent?.firstLine !== undefined) css.push(`text-indent:${pt(indent.firstLine)}`)
   if (block.keepWithNext) css.push('break-after:avoid')
   if (block.keepLinesTogether) css.push('break-inside:avoid')
   if (block.shading) css.push(`background-color:${color(block.shading)}`)

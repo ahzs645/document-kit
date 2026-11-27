@@ -315,3 +315,17 @@ describe('numbers in a hanging indent', () => {
     expect(roman).toMatch(/>iv\.<\/span>f/)
   })
 })
+
+describe('side rules', () => {
+  it('stand outside the indent, as Word sets them: the words at the indent, the box reaching past it', () => {
+    const rule = { style: 'single' as const, width: 1, color: '#123456', space: 12 }
+    const html = writeHtml(document([section([paragraph('Boxed', { indent: { left: 14, right: 14 }, shading: '#eeeeee', borders: { left: rule, right: rule } })])]))
+    // 14 pt of indent less 12 pt of space and the 1 pt rule: the box starts 1 pt in, the words 14 pt in.
+    expect(html).toMatch(/<p class="dk-p dk-ps-Normal" style="margin-left:1pt;margin-right:1pt;[^"]*border-left:1pt solid #123456;padding-left:12pt/)
+  })
+
+  it('leave a paragraph without side rules at its indent', () => {
+    const html = writeHtml(document([section([paragraph('Plain', { indent: { left: 14 }, borders: { top: { width: 1, space: 4 } } })])]))
+    expect(html).toMatch(/style="margin-left:14pt;[^"]*border-top:1pt solid/)
+  })
+})
