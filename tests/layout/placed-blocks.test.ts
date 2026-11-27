@@ -2,7 +2,7 @@
 // and the page pictures set them where Word does. Made-up text throughout.
 import { describe, expect, it } from 'vitest'
 
-import { document, floatingImage, frame, paragraph, section, table, type Block, type Document } from '../../src/model'
+import { document, figure, floatingImage, frame, inlineImage, paragraph, section, table, type Block, type Document } from '../../src/model'
 import { writeDocx } from '../../src/docx'
 import { createFontProvider, layoutDocx } from '../../src/layout'
 import { layOut, linesOf } from './engine'
@@ -40,6 +40,38 @@ describe('frames placed on the page', () => {
     expect(beside.length).toBeGreaterThan(0)
     for (const line of beside) expect(line.x).toBeGreaterThanOrEqual(222)
     expect(lines.find((l) => l.text.startsWith('Line 14'))!.x).toBe(72)
+  })
+
+  it('sets a picture in a frame inside the frame\'s box, in the PDF too', async () => {
+    const logo = { bytes: makePng(12, 6, [200, 30, 30]) }
+    const docx = await docxOf([
+      paragraph('Flowing first line.'),
+      frame(
+        [paragraph('Label above.'), paragraph([inlineImage(logo, 60, 30)]), paragraph('Caption under.')],
+        { x: 300, y: 400, width: 200 },
+        { wrap: 'through' },
+      ),
+      frame([figure(logo, { fit: { width: 80, height: 40, upscale: true }, align: 'left' })], { x: 100, y: 600, width: 200 }, { wrap: 'through' }),
+    ])
+    const laid = await layoutDocx(docx, { fonts })
+    const lines = laid.pageLines[0]!
+    const at = (t: string) => lines.find((l) => l.text === t)!
+    // One frame: its three paragraphs one under the other, the picture between the two lines.
+    expect(at('Label above.').x).toBe(300)
+    expect(at('Caption under.').x).toBe(300)
+    expect(at('Caption under.').y - at('Label above.').y).toBeGreaterThan(30)
+    const painted = paintedImages(pageDrawings(laid.toPdf().bytes)[0]!)
+    expect(painted).toHaveLength(2)
+    const [inFrame, figured] = painted
+    // PDF y is up from the foot of the 792 pt page: the picture's top is under the label and above the caption.
+    const top = 792 - inFrame!.y - inFrame!.height
+    expect(inFrame).toMatchObject({ x: 300, width: 60, height: 30 })
+    expect(top).toBeGreaterThan(at('Label above.').y)
+    expect(top + 30).toBeLessThan(at('Caption under.').y)
+    // A figure in a frame (a picture in a paragraph of its own) is placed at the frame's corner.
+    expect(figured!.x).toBe(100)
+    expect(figured!.width).toBeCloseTo(80, 0)
+    expect(792 - figured!.y - figured!.height).toBeCloseTo(600, 0)
   })
 
   it('measures from the margins when asked', async () => {

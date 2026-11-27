@@ -219,9 +219,19 @@ Each change is marked in the source with a `document-kit:` comment unless noted.
     down before everything else on the page, the band's in z order and ahead of the body's own
     behind-text floats. Pinned by `tests/layout/placed-blocks.test.ts` ("a page ground behind
     shading").
+21. **A picture in a text frame stays in the frame** (`word/document-parser.ts`,
+    `tryExtractDrawingFromParagraph`, marked `document-kit:`). Upstream collapses a paragraph
+    that holds nothing but an inline picture into a standalone picture block, which drops the
+    paragraph's `w:framePr` (§17.3.1.11): the picture fell out of the frame group and was drawn
+    in the flow where the frame was anchored (the top of a cover page), and the frame's later
+    paragraphs became a second frame laid over the first. A framed paragraph whose drawings
+    are all inline is now kept as a paragraph, the picture an inline run in it, so the frame
+    sets it at its own x and y with the rest of its paragraphs. A re-read keeps it the same way,
+    so the round trip is unchanged. Pinned by `tests/layout/placed-blocks.test.ts` ("sets a
+    picture in a frame inside the frame's box").
 
 Nothing else differs. `diff -r` against the upstream tree, after running the rewrite script
-over a fresh copy, shows only the twenty changes above.
+over a fresh copy, shows only the twenty-one changes above.
 
 ## Bringing in a newer upstream
 
@@ -231,11 +241,11 @@ over a fresh copy, shows only the twenty changes above.
    included; skip `corpus/`, `stand/`, `docs/`, `scripts/`). Delete files upstream deleted.
 3. Run `node scripts/rewrite-ream-aliases.mjs`, then `node scripts/rewrite-ream-aliases.mjs
    --check` (exits 1 if an alias import or root-relative fixture path is left).
-4. Re-apply changes 1, 2 and 4 to 20 above unless upstream has made them itself (check
+4. Re-apply changes 1, 2 and 4 to 21 above unless upstream has made them itself (check
    `FIXED_MTIME`, a `w:r` split for complex fields, every fallback to the global `fetch` in
    `core/fonts`, `core/converter` and `excel`, `familyNamesInFlow`, `w:vAlign`, PAGEREF and
    body fields, §17.4.66 border conflicts, `w:keepNext` in table rows, and the two foot-frame
-   checks of changes 10 and 11, the no-break hyphen of change 12, percentage widths with their sign of change 13, the stand-in grid of change 14, border widths of change 15, the `compact` option of change 16, synthetic faces for embedded families of change 18, CFF faces in the PDF of change 19, band pictures behind the page of change 20). Search for
+   checks of changes 10 and 11, the no-break hyphen of change 12, percentage widths with their sign of change 13, the stand-in grid of change 14, border widths of change 15, the `compact` option of change 16, synthetic faces for embedded families of change 18, CFF faces in the PDF of change 19, band pictures behind the page of change 20, framed pictures of change 21). Search for
    `document-kit:` in the old tree to find each place. Search for new uses of
    `fetch`, `XMLHttpRequest` and `node:` in `src/ream` and treat any as change 4.
 5. Check `src/layout` still compiles against the internals it imports (`core/converter/project`,

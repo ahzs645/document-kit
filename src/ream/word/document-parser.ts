@@ -800,6 +800,20 @@ function tryExtractDrawingFromParagraph(p: PoNode, ctx: ParseContext): Array<Bod
   // line lower than the footer margin puts it. An INLINE drawing still
   // collapses: it IS the line, and the writer re-emits it as one.
   if (!vml && drawings.every((d) => poChildren(d).some((c) => poIs(c, 'wp:anchor')))) return null;
+  // document-kit: §17.3.1.11 — a paragraph in a text FRAME is part of the
+  // frame's box, picture and all: an inline picture there is a line of the
+  // frame, set at the frame's x and y. Collapsed to a standalone block it lost
+  // its `w:framePr`, fell out of the frame group, and was drawn in the flow
+  // where the frame was anchored (the top of a cover page), while the frame's
+  // later paragraphs started a second frame over the first.
+  const pPr = poChildren(p).find((c) => poIs(c, 'w:pPr'));
+  if (
+    pPr &&
+    poChildren(pPr).some((c) => poIs(c, 'w:framePr')) &&
+    !drawings.some((d) => poChildren(d).some((c) => poIs(c, 'wp:anchor')))
+  ) {
+    return null;
+  }
 
   // Inject parseBodyElements (bound to this context) so a shape's text box is
   // parsed without a module cycle. A modern <w:drawing> takes precedence over a

@@ -213,7 +213,9 @@ supplied or embedded face draws, so they are no longer named as missing symbols;
 - **Frames placed on the page** (`w:framePr` with `w:x`/`w:y` against the page or the margin, the model's `frame`
   block): set at that point of the page their anchor falls on, `w:w` wide. With `w:wrap="around"` the flow's
   lines that pass it are set beside it; a frame that does not wrap (`w:wrap="through"`/`"none"`) takes nothing
-  from the flow. One in a header is set on every page the header is on.
+  from the flow. One in a header is set on every page the header is on. A picture in a frame's paragraph (an inline
+  picture, or a figure without a caption) is a line of the frame, set inside its box with the frame's other
+  paragraphs (`docs/ream-upstream.md`, change 21).
 - **Pictures behind or in front of the text** (an anchored `wp:anchor` with `behindDoc`, the model's
   `floatingImage`): drawn at its offset against the page or the margin, before the page's text when it is behind
   it, after when it is in front; with no wrapping it moves nothing. A picture behind the text is painted before
