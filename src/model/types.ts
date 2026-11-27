@@ -611,6 +611,62 @@ export interface PinnedBlock extends BlockBase {
   spaceBelow?: number
 }
 
+/**
+ * Blocks set in a text frame placed anywhere on the page: `x`, `y` from the top-left corner of the page (or of the
+ * margins, `relativeTo: 'margin'`), `width` wide. Written as Word's text frame (`w:framePr` with `w:x`/`w:y`), each
+ * paragraph the blocks make carrying the same frame, so Word sets them as one box. A cover's title, a label over
+ * artwork, an address window. It holds what a pinned block holds (paragraphs, headings, lists, `lines` fields, a
+ * signature, tick boxes, spacers and pictures without a caption); a table is refused.
+ *
+ * It is placed on the page its anchor (where the block falls in the flow) is on. In a header or footer it is placed
+ * on every page the header prints on.
+ */
+export interface FrameBlock extends BlockBase {
+  type: 'frame'
+  blocks: readonly Block[]
+  /** Points from the left edge of the page (or of the left margin). */
+  x: number
+  /** Points from the top edge of the page (or of the top margin). */
+  y: number
+  /** Points. */
+  width: number
+  /** Points. Absent: as tall as its content. */
+  height?: number
+  /** `atLeast` (default): the frame grows with its content; `exact`: it is cut to `height`. */
+  heightRule?: 'atLeast' | 'exact'
+  /** What `x` and `y` are measured from: `page` (default) or `margin` (the text area's corner). */
+  relativeTo?: 'page' | 'margin'
+  /**
+   * How the page's text treats the frame: `around` (default, Word's own) flows beside it, `notBeside` only above and
+   * below it, `through` and `none` take no notice of it (text may run under it).
+   */
+  wrap?: 'around' | 'notBeside' | 'through' | 'none'
+  /** Room kept between the frame and text flowing round it, points; 0 by default. */
+  space?: number
+}
+
+/**
+ * A picture placed on the page out of the text's flow (Word's anchored drawing): a full-page cover background behind
+ * the text, a watermark, a mark in a corner. `box: 'page'` covers the whole page; otherwise `x`, `y`, `width`,
+ * `height` in points from the page's top-left corner (or the margins', `relativeTo: 'margin'`). Behind the text by
+ * default (`behind: false` puts it in front). The picture is stretched to the box: give a box of its proportions.
+ *
+ * It is placed on the page its anchor falls on; in a header or footer, on every page the header prints on (a
+ * background for every page of a section, or for its first page through `firstPage.header`).
+ */
+export interface FloatingImageBlock extends BlockBase {
+  type: 'floatingImage'
+  /** Null (a picture a recipe's data did not give): nothing is placed, and it is listed as still to complete. */
+  image: ImageData | null
+  /** `'page'`: the whole page; or the picture's box, points. */
+  box: 'page' | { x: number; y: number; width: number; height: number }
+  /** What the box is measured from: `page` (default) or `margin`. Ignored for `box: 'page'`. */
+  relativeTo?: 'page' | 'margin'
+  /** Behind the text (default) or in front of it. */
+  behind?: boolean
+  alt?: string
+}
+
 export interface PageBreakBlock extends BlockBase {
   type: 'pageBreak'
 }
@@ -705,6 +761,8 @@ export type Block =
   | SignatureBlock
   | ChoicesBlock
   | PinnedBlock
+  | FrameBlock
+  | FloatingImageBlock
   | PageBreakBlock
   | TocBlock
   | SpacerBlock

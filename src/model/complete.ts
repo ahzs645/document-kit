@@ -216,7 +216,11 @@ function scanBlock(block: Block, push: Push) {
       scanText(block.title, push)
       return
     case 'pinned':
+    case 'frame':
       // Its blocks are walked as blocks of their own.
+      return
+    case 'floatingImage':
+      if (block.image === null) push({ kind: 'figure', what: block.alt || 'Floating picture', ...withSource(block.source) })
       return
     case 'pageBreak':
     case 'spacer':

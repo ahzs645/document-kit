@@ -99,7 +99,7 @@ export function expandBlocks(
       out.push(...expanded)
     } else if (block.type === 'table') {
       out.push(expandTable(block, registry, context, depth))
-    } else if (block.type === 'pinned' && block.blocks.some(holdsCustom)) {
+    } else if ((block.type === 'pinned' || block.type === 'frame') && block.blocks.some(holdsCustom)) {
       out.push({ ...block, blocks: expandBlocks(block.blocks, registry, context, depth) })
     } else {
       out.push(block)
@@ -127,7 +127,7 @@ function expandTable(table: TableBlock, registry: CustomRegistry | undefined, co
 
 function holdsCustom(block: Block): boolean {
   if (block.type === 'custom') return true
-  if (block.type === 'pinned') return block.blocks.some(holdsCustom)
+  if (block.type === 'pinned' || block.type === 'frame') return block.blocks.some(holdsCustom)
   if (block.type !== 'table') return false
   return block.rows.some((row) => row.cells.some((input) => toCell(input).blocks?.some(holdsCustom) ?? false))
 }

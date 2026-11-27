@@ -189,6 +189,15 @@ supplied or embedded face draws, so they are no longer named as missing symbols;
   §17.4.66: a cell's own border before the table's, a side with none gives way, then the
   heavier (width × the style's number), then the earlier style, then the darker colour. Heavier
   rules are painted over lighter ones, so a thick border keeps its corners.
+- **Frames placed on the page** (`w:framePr` with `w:x`/`w:y` against the page or the margin, the model's `frame`
+  block): set at that point of the page their anchor falls on, `w:w` wide. With `w:wrap="around"` the flow's
+  lines that pass it are set beside it; a frame that does not wrap (`w:wrap="through"`/`"none"`) takes nothing
+  from the flow. One in a header is set on every page the header is on.
+- **Pictures behind or in front of the text** (an anchored `wp:anchor` with `behindDoc`, the model's
+  `floatingImage`): drawn at its offset against the page or the margin, before the page's text when it is behind
+  it, after when it is in front; with no wrapping it moves nothing.
+- **Character spacing** (`w:spacing` in a run or a style, the model's `characterSpacing`): added after every
+  character, so tracked text is measured, broken, aligned and drawn wider (or narrower).
 - **Frames at the foot of the page** (`w:framePr` with `w:yAlign="bottom"` against the page or margin, the model's
   `pinned` block): set at the foot of the page their anchor falls on, the text flowing above them. A line the frame
   would push below the text area starts the next page, and a frame that would cover text already set on its page

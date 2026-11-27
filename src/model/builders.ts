@@ -18,6 +18,8 @@ import type {
   FigureBlock,
   FigureGridBlock,
   FigureGridItem,
+  FloatingImageBlock,
+  FrameBlock,
   HeadingBlock,
   ImageData,
   InlineImage,
@@ -243,6 +245,26 @@ export const pinned = (blocks: readonly Block[], options: Options<PinnedBlock, '
   type: 'pinned',
   blocks,
 })
+
+/**
+ * Blocks in a text frame placed on the page: `x`, `y` from the page's top-left corner (or the margins', with
+ * `relativeTo: 'margin'`), `width` wide, in points.
+ */
+export const frame = (
+  blocks: readonly Block[],
+  box: { x: number; y: number; width: number; height?: number },
+  options: Options<FrameBlock, 'blocks' | 'x' | 'y' | 'width' | 'height'> = {},
+): FrameBlock => ({ ...options, type: 'frame', blocks, ...box })
+
+/**
+ * A picture placed out of the flow, behind the text unless `behind: false`: `'page'` covers the whole page (a cover's
+ * artwork), or a box in points.
+ */
+export const floatingImage = (
+  image: ImageData | null,
+  box: FloatingImageBlock['box'],
+  options: Options<FloatingImageBlock, 'image' | 'box'> = {},
+): FloatingImageBlock => ({ ...options, type: 'floatingImage', image, box })
 
 export const pageBreak = (): PageBreakBlock => ({ type: 'pageBreak' })
 

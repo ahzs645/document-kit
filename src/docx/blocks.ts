@@ -5,12 +5,16 @@ import {
   HeadingLevel,
   HeightRule,
   HorizontalPositionAlign,
+  HorizontalPositionRelativeFrom,
+  ImageRun,
   LineRuleType,
   Paragraph,
   Table,
   TableOfContents,
   TextRun,
+  TextWrappingType,
   VerticalPositionAlign,
+  VerticalPositionRelativeFrom,
   type IFrameOptions,
   type IParagraphOptions,
   type ParagraphChild,
@@ -23,6 +27,8 @@ import type {
   FieldsBlock,
   FigureBlock,
   FigureGridBlock,
+  FloatingImageBlock,
+  FrameBlock,
   HeadingBlock,
   ListBlock,
   Inline,
@@ -49,7 +55,7 @@ import {
 import { bookmarked } from './bookmarks'
 import { spreadsheetTable } from './spreadsheet'
 import { autoLineTables, tableGaps, writeTable } from './table'
-import { border, twips } from './units'
+import { border, pixels, twips } from './units'
 
 export type FileChild = Paragraph | Table | TableOfContents
 
@@ -121,6 +127,10 @@ function writeBlock(block: Block, context: WriterContext, breakBefore: boolean):
     }
     case 'pinned':
       return writePinned(block, context, breakBefore)
+    case 'frame':
+      return writeFrame(block, context, breakBefore)
+    case 'floatingImage':
+      return writeFloatingImage(block, context, breakBefore)
     case 'toc':
       return writeToc(block, context, breakBefore)
     case 'spacer':
@@ -304,6 +314,58 @@ function figureBox(block: FigureBlock, context: WriterContext) {
     upscale: fit.upscale ?? false,
     explicitHeight: fit.height !== undefined,
   }
+}
+
+/* ------------------------------------------------------------------ floating pictures */
+
+const EMU_PER_POINT = 12700
+
+/**
+ * A picture anchored out of the flow: an empty paragraph, one twip tall, holding a drawing placed against the page or
+ * the margins, behind the text (or in front), with no wrapping, so the text takes no notice of it.
+ */
+function writeFloatingImage(block: FloatingImageBlock, context: WriterContext, breakBefore: boolean): FileChild[] {
+  if (context.frame) throw new Error('document-kit: a floating picture cannot go in a pinned block or a frame')
+  if (!block.image) return breakBefore ? [gapParagraph(1, true)] : []
+  const info = resolveImage(block.image)
+  const page = context.page
+  const box = block.box === 'page' ? { x: 0, y: 0, width: page.width, height: page.height } : block.box
+  for (const [key, value] of Object.entries(box)) {
+    if (!Number.isFinite(value) || ((key === 'width' || key === 'height') && value <= 0)) {
+      throw new Error(`document-kit: a floating picture's ${key} must be a ${key === 'width' || key === 'height' ? 'positive ' : ''}number of points`)
+    }
+  }
+  const margin = block.box !== 'page' && block.relativeTo === 'margin'
+  const run = new ImageRun({
+    type: info.format === 'jpeg' ? 'jpg' : 'png',
+    data: block.image.bytes,
+    transformation: { width: pixels(box.width), height: pixels(box.height) },
+    ...(block.alt ? { altText: { name: block.alt, description: block.alt, title: block.alt } } : {}),
+    floating: {
+      horizontalPosition: {
+        relative: margin ? HorizontalPositionRelativeFrom.MARGIN : HorizontalPositionRelativeFrom.PAGE,
+        offset: Math.round(box.x * EMU_PER_POINT),
+      },
+      verticalPosition: {
+        relative: margin ? VerticalPositionRelativeFrom.MARGIN : VerticalPositionRelativeFrom.PAGE,
+        offset: Math.round(box.y * EMU_PER_POINT),
+      },
+      behindDocument: block.behind !== false,
+      allowOverlap: true,
+      lockAnchor: true,
+      layoutInCell: false,
+      wrap: { type: TextWrappingType.NONE },
+    },
+  })
+  return [
+    new Paragraph(
+      compact({
+        spacing: { before: 0, after: 0, line: 1, lineRule: LineRuleType.EXACT },
+        pageBreakBefore: breakBefore || undefined,
+        children: [run],
+      }),
+    ),
+  ]
 }
 
 /** A box marking where a missing picture goes, with its placeholder text. */
@@ -536,7 +598,33 @@ function writeSignature(block: SignatureBlock, context: WriterContext, breakBefo
 
 /* ------------------------------------------------------------------ pinned blocks */
 
-const FRAMED = new Set<Block['type']>(['heading', 'paragraph', 'list', 'fields', 'signature', 'choices', 'spacer', 'figure', 'pageBreak'])
+const FRAMED = new Set<Block['type']>([
+  'heading',
+  'paragraph',
+  'list',
+  'fields',
+  'signature',
+  'choices',
+  'spacer',
+  'figure',
+  'pageBreak',
+  'pinned',
+  'frame',
+])
+
+/** Refuses, naming it, a block a Word text frame cannot hold. */
+function checkFramed(blocks: readonly Block[], holder: string): void {
+  const refuse = (what: string) => {
+    throw new Error(`document-kit: ${holder} cannot hold ${what}: Word's frames take paragraphs only`)
+  }
+  for (const inner of blocks) {
+    if (!FRAMED.has(inner.type)) refuse(`a ${inner.type} block`)
+    if (inner.type === 'fields' && inner.layout === 'table') refuse('fields in table layout')
+    if (inner.type === 'choices' && inner.boxed) refuse('boxed tick boxes')
+    if (inner.type === 'figure' && (!inner.image || inner.caption)) refuse('a figure without its picture, or with a caption')
+    if (inner.type === 'pinned' || inner.type === 'frame') checkFramed(inner.blocks, holder)
+  }
+}
 
 /**
  * Blocks pinned to the foot of the page: every paragraph they make carries one text frame anchored to the bottom
@@ -548,12 +636,7 @@ function writePinned(block: PinnedBlock, context: WriterContext, breakBefore: bo
   const refuse = (what: string) => {
     throw new Error(`document-kit: a pinned block cannot hold ${what}: Word's frames take paragraphs only`)
   }
-  for (const inner of block.blocks) {
-    if (!FRAMED.has(inner.type)) refuse(`a ${inner.type} block`)
-    if (inner.type === 'fields' && inner.layout === 'table') refuse('fields in table layout')
-    if (inner.type === 'choices' && inner.boxed) refuse('boxed tick boxes')
-    if (inner.type === 'figure' && (!inner.image || inner.caption)) refuse('a figure without its picture, or with a caption')
-  }
+  checkFramed(block.blocks, 'a pinned block')
   const frame: IFrameOptions = {
     type: 'alignment',
     width: twips(context.width),
@@ -569,6 +652,45 @@ function writePinned(block: PinnedBlock, context: WriterContext, breakBefore: bo
   out.push(...writeBlocks(block.blocks, inner))
   if ((block.spaceBelow ?? 0) > 0) out.push(gapParagraph(block.spaceBelow!, false, frame))
   if (out.some((child) => child instanceof Table)) refuse('a table')
+  return out
+}
+
+const FRAME_WRAP = {
+  around: FrameWrap.AROUND,
+  notBeside: FrameWrap.NOT_BESIDE,
+  through: FrameWrap.THROUGH,
+  none: FrameWrap.NONE,
+} as const
+
+/**
+ * Blocks in a text frame placed on the page: every paragraph they make carries one frame (`w:framePr` with `w:x`,
+ * `w:y` and `w:w`, anchored to the page or the margins), so Word and the layout set them as one box there. Inside a
+ * pinned block or another frame, the blocks join that frame.
+ */
+function writeFrame(block: FrameBlock, context: WriterContext, breakBefore: boolean): FileChild[] {
+  if (context.frame) return writeBlocks(block.blocks, context)
+  checkFramed(block.blocks, 'a frame')
+  for (const key of ['x', 'y', 'width'] as const) {
+    if (!Number.isFinite(block[key])) throw new Error(`document-kit: a frame's ${key} must be a number of points`)
+  }
+  if (block.width <= 0) throw new Error("document-kit: a frame's width must be more than 0")
+  const anchor = block.relativeTo === 'margin' ? FrameAnchorType.MARGIN : FrameAnchorType.PAGE
+  const space = block.space === undefined ? undefined : twips(Math.max(0, block.space))
+  const frame: IFrameOptions = {
+    type: 'absolute',
+    position: { x: twips(block.x), y: twips(block.y) },
+    anchor: { horizontal: anchor, vertical: anchor },
+    width: twips(block.width),
+    ...(block.height !== undefined && block.height > 0
+      ? { height: twips(block.height), rule: block.heightRule === 'exact' ? HeightRule.EXACT : HeightRule.ATLEAST }
+      : {}),
+    wrap: FRAME_WRAP[block.wrap ?? 'around'],
+    ...(space !== undefined ? { space: { horizontal: space, vertical: space } } : {}),
+  }
+  const out: FileChild[] = []
+  if (breakBefore) out.push(gapParagraph(1, true))
+  out.push(...writeBlocks(block.blocks, { ...context, frame, width: block.width }))
+  if (out.some((child) => child instanceof Table)) throw new Error("document-kit: a frame cannot hold a table: Word's frames take paragraphs only")
   return out
 }
 

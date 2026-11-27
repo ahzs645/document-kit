@@ -8,7 +8,7 @@ export interface BlockVisit {
   section: number
   /** Where it is: `body`, `header`, `footer`, `firstHeader`, `firstFooter`. */
   part: 'body' | 'header' | 'footer' | 'firstHeader' | 'firstFooter'
-  /** The blocks it sits inside (a table or pinned block holding it), outermost first. */
+  /** The blocks it sits inside (a table, pinned block or frame holding it), outermost first. */
   parents: readonly Block[]
 }
 
@@ -19,7 +19,7 @@ export function* walkBlocks(
 ): Generator<BlockVisit> {
   for (const block of blocks) {
     yield { ...context, block }
-    if (block.type === 'pinned') {
+    if (block.type === 'pinned' || block.type === 'frame') {
       yield* walkBlocks(block.blocks, { ...context, parents: [...context.parents, block] })
     } else if (block.type === 'table') {
       for (const row of block.rows) {

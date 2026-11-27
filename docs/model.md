@@ -60,6 +60,8 @@ A section is a run of pages with one page set-up:
 | `signature` | A label, the signature picture or room to sign by hand, the signing rule with the name (and title) under it, and lines under that (`Title`, `Date`), any of which can be blank. Kept on one page. Options below. |
 | `choices` | A tick-box question: `label`, `options` (strings), `chosen` (one of them, a list for several, or null: unanswered, listed), `answer` (a free-text answer line; null is a blank to complete; absent, no line), `layout` `inline` (default) or `list`, `boxed` (a ruled box, the boxes at the right). |
 | `pinned` | Blocks pinned to the foot of the page they fall on (below). |
+| `frame` | Blocks in a text frame placed anywhere on the page: `x`, `y`, `width` (and `height`) in points, against the page or the margins (below). |
+| `floatingImage` | A picture placed out of the flow, behind the text by default: a full-page cover background (`box: 'page'`), a watermark, a mark in a corner (below). |
 | `pageBreak` | The next block starts a new page. Every block also takes `pageBreakBefore`. |
 | `toc` | A table of contents over heading levels 1 to `levels`, filled from the headings when written. Word fills the page numbers when it updates the field; `document-kit/layout` fills them itself, each in its page's numbering. |
 | `spacer` | Vertical space of an exact height. |
@@ -143,6 +145,45 @@ text('tracked', { characterStyle: 'Accent' })
 
 The theme's text roles take `characterSpacing` too (`theme.headings[0].characterSpacing`), written on their Word
 styles.
+
+## Frames and floating pictures
+
+`frame(blocks, { x, y, width, height? }, options)` sets blocks in a text frame placed on the page: a cover's title
+over its artwork, a label, an address window. Every paragraph the blocks make carries one frame (`w:framePr` with
+`w:x`, `w:y`, `w:w`), so Word and `document-kit/layout` set them as one box there.
+
+- `x`, `y` are points from the top-left corner of the page, or of the margins with `relativeTo: 'margin'`; `width`
+  points. `height` is a least height (`heightRule: 'atLeast'`, the default) or exact (`'exact'`, the content cut to
+  it); absent, the frame is as tall as its content.
+- `wrap`: `around` (default, Word's own; text flows beside it), `notBeside` (above and below only), `through` or
+  `none` (the text takes no notice: for a cover whose flow is empty, or text that must not move). `space`: points
+  kept between the frame and text flowing round it.
+- It holds what a pinned block holds (headings, paragraphs, lists, `lines` fields, a signature, tick boxes, spacers,
+  pictures without a caption); a table or a floating picture is refused with an error naming it. A pinned block or
+  a frame inside a frame joins it.
+- It is placed on the page its anchor falls on (where the block stands in the flow). In a section's `header` it is
+  placed on every page the header prints on; in `firstPage.header`, on the section's first page.
+
+`floatingImage(image, box, options)` places a picture out of the flow (Word's anchored drawing, no wrapping):
+
+- `box: 'page'` covers the whole page (a cover background: give the picture the page's proportions); otherwise
+  `{ x, y, width, height }` in points from the page's corner, or the margins' with `relativeTo: 'margin'`. The
+  picture is stretched to the box.
+- `behind: true` (default) puts it behind the text; `false` in front. `alt` is its description.
+- Its anchor is an empty paragraph one twip tall, so it takes no room in the flow. In a `header` it is on every page
+  of the section (a background for every page), in `firstPage.header` on the first page only.
+- `image: null` (a recipe's picture the data did not give) places nothing and is listed to complete.
+
+A designed cover is a section with no margins, its artwork in `firstPage.header` (or `header`) and its words in
+frames:
+
+```ts
+section(
+  [frame([heading(1, 'Annual review')], { x: 54, y: 120, width: 420 }, { wrap: 'through' })],
+  { page: { paper: 'letter', margins: { top: 0, right: 0, bottom: 0, left: 0, header: 0, footer: 0 } },
+    header: [floatingImage(artwork, 'page', { alt: 'Cover artwork' })], footer: [] },
+)
+```
 
 ## Signature options
 
@@ -417,6 +458,10 @@ always, and the same bytes whenever `created` is given.
 
 ## What the model cannot say yet
 
+- A frame that holds a table (Word's frames take paragraphs), or a frame given a fixed point on a page other than
+  the one its anchor falls on.
+- A floating picture cropped or framed (`crop` and `border` are on `figure` only), or text wrapped round it
+  (`square`, `tight`): it floats with no wrapping, behind or in front.
 - Shapes and vector drawing: a scale bar with an arrow, a mark between matrix cells, an X on a grid, a north arrow.
   The app draws them as a PNG or builds them from table cells. SVG pictures are not written.
 - Tick boxes typed as characters (☐ in a text run) are drawn by the layout's face of boxes too, but only the

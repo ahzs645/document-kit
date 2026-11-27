@@ -803,6 +803,7 @@ function blockWith(block: Block, ctx: Ctx, setting: Block['textRules']): Block {
     case 'choices':
       return set(block, { label: opt(block.label, 'choice'), answer: nul(block.answer, 'value') })
     case 'pinned':
+    case 'frame':
       return { ...block, blocks: blocksWith(block.blocks, ctx, setting) }
     case 'toc':
       return set(block, { title: opt(block.title, 'heading') })
