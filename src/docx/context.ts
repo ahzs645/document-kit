@@ -1,6 +1,6 @@
 /** What every part of the writer needs to know while it writes one section. */
 import type { IFrameOptions } from 'docx'
-import type { CaptionedBlock, PageBox } from '../model/index'
+import type { CaptionedBlock, PageBox, StyleTable } from '../model/index'
 import type { TextStyle, Theme } from '../model/types'
 
 import type { Footnotes } from './footnotes'
@@ -17,7 +17,9 @@ export interface WriterContext {
   sourceStyles: Readonly<Record<string, TextStyle>>
   nullCells: 'empty' | 'rule'
   lists: ListRegistry
-  /** Inside a pinned block: the text frame every paragraph written there carries (one frame together). */
+  /** The document's named styles, the theme's and its own. */
+  styles: StyleTable
+  /** Inside a pinned block or a frame: the text frame every paragraph written there carries (one frame together). */
   frame?: IFrameOptions
   /** Writing the blocks of a table cell. */
   inCell?: boolean

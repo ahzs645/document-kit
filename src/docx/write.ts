@@ -17,7 +17,9 @@ import {
   numberCaptions,
   pageBox,
   resolveTheme,
+  styleTable,
   type CustomRegistry,
+  type StyleTable,
 } from '../model/index'
 import type { Block, Document, Section, TextStyle } from '../model/types'
 import { writeBlocks } from './blocks'
@@ -68,6 +70,7 @@ function buildDocx(source: Document, options: WriteDocxOptions): DocxDocument {
   // Custom blocks first, so the text they become takes the rules too.
   const document = applyTextRules(expandDocument(source, options.registry)).document
   const theme = resolveTheme(document.theme)
+  const styles: StyleTable = styleTable(theme, document.styles)
   const captions = numberCaptions(document)
   const lists = createListRegistry()
   const bookmarks = new Set<string>()
@@ -85,13 +88,14 @@ function buildDocx(source: Document, options: WriteDocxOptions): DocxDocument {
       sourceStyles: options.sourceStyles ?? {},
       nullCells: options.nullCells ?? 'empty',
       lists,
+      styles,
     }
     return writeSection(section, context)
   })
   const metadata = document.metadata ?? {}
   return new DocxDocument({
     sections,
-    styles: stylesFor(theme),
+    styles: stylesFor(theme, styles),
     numbering: lists.numbering(),
     ...(footnotes.size && { footnotes: footnotes.definitions, features: { updateFields: true } }),
     ...(metadata.title ? { title: metadata.title } : {}),

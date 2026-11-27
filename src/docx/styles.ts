@@ -6,10 +6,12 @@ import {
   type INumberingOptions,
   type IStylesOptions,
 } from 'docx'
-import type { Theme, ThemeText } from '../model/types'
+import type { StyleTable } from '../model/index'
+import type { TextStyle, Theme, ThemeText } from '../model/types'
 import type { ListRegistry } from './context'
+import { runOptions } from './inline'
 import { alignment, compact, TABLE_STYLE_ID, TOC_TITLE_STYLE_ID } from './paragraphs'
-import { halfPoints, hex, lineMultiple, twips } from './units'
+import { border, halfPoints, hex, lineMultiple, twips } from './units'
 
 function runOf(text: ThemeText) {
   return compact({
@@ -20,6 +22,8 @@ function runOf(text: ThemeText) {
     italics: text.italic,
     allCaps: text.allCaps,
     smallCaps: text.smallCaps,
+    characterSpacing:
+      text.characterSpacing === undefined ? undefined : twips(text.characterSpacing) || Number.EPSILON,
   })
 }
 
@@ -47,7 +51,61 @@ const style = (id: string, name: string, text: ThemeText, extra: { keepNext?: bo
   paragraph: paragraphOf(text, extra.keepNext),
 })
 
-export function stylesFor(theme: Theme): IStylesOptions {
+/** The paragraph and character styles a document defines, as the docx library's style options. */
+function definedStyles(table: StyleTable) {
+  const paragraphStyles = [...table.paragraph.values()]
+    .filter((style) => style.defined && style.definition)
+    .map((style) => {
+      const own = style.definition!
+      const text = own.text ?? {}
+      const borders = own.borders
+        ? compact({
+            top: border(own.borders.top),
+            bottom: border(own.borders.bottom),
+            left: border(own.borders.left),
+            right: border(own.borders.right),
+          })
+        : undefined
+      const indent = own.indent
+        ? compact({
+            left: own.indent.left === undefined ? undefined : twips(own.indent.left),
+            right: own.indent.right === undefined ? undefined : twips(own.indent.right),
+            firstLine: own.indent.firstLine === undefined ? undefined : twips(own.indent.firstLine),
+            hanging: own.indent.hanging === undefined ? undefined : twips(own.indent.hanging),
+          })
+        : undefined
+      return compact({
+        id: style.id,
+        name: style.name,
+        basedOn: style.basedOn,
+        next: style.next ?? style.id,
+        quickFormat: true,
+        run: runOf(text),
+        paragraph: {
+          ...paragraphOf(text, text.keepWithNext ?? false),
+          // keepWithNext asks for the lines kept together too only when the style says so itself.
+          ...(own.keepLinesTogether !== undefined ? { keepLines: own.keepLinesTogether } : {}),
+          ...(text.keepWithNext === false ? { keepNext: false } : {}),
+          ...(indent ? { indent } : {}),
+          ...(borders && Object.keys(borders).length ? { border: borders } : {}),
+          ...(own.shading ? { shading: { fill: hex(own.shading), color: 'auto', type: 'clear' as const } } : {}),
+        },
+      })
+    })
+  const characterStyles = [...table.character.values()].map((style) =>
+    compact({
+      id: style.id,
+      name: style.name,
+      basedOn: style.basedOn,
+      quickFormat: true,
+      run: runOptions(style.definition.text as TextStyle),
+    }),
+  )
+  return { paragraphStyles, characterStyles }
+}
+
+export function stylesFor(theme: Theme, named?: StyleTable): IStylesOptions {
+  const defined = named ? definedStyles(named) : { paragraphStyles: [], characterStyles: [] }
   const heading = (level: number) => {
     const text = theme.headings[level - 1] ?? {}
     return {
@@ -82,7 +140,9 @@ export function stylesFor(theme: Theme): IStylesOptions {
       style(TABLE_STYLE_ID, 'Table text', { size: table.size, before: 0, after: 0, line: table.line ?? 1 }),
       // The contents' own title looks like a first-level heading but is not one, so it does not list itself.
       style(TOC_TITLE_STYLE_ID, 'Contents title', theme.headings[0] ?? {}, { keepNext: true }),
+      ...defined.paragraphStyles,
     ],
+    ...(defined.characterStyles.length ? { characterStyles: defined.characterStyles } : {}),
   }
 }
 

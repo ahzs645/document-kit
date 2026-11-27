@@ -43,6 +43,16 @@ export interface TextStyle {
   size?: number
   font?: string
   highlight?: Highlight
+  /**
+   * Character spacing (tracking), points: added after every character, negative to condense (Word's `w:spacing` on a
+   * run). Tracking given in em is `em × size`: 0.05 em at 12 pt is 0.6.
+   */
+  characterSpacing?: number
+  /**
+   * A character style the document defines (`document.styles.character`, by id): its look applies under this run's
+   * own. Unknown ids stop the writer with the id named.
+   */
+  characterStyle?: string
 }
 
 /**
@@ -256,12 +266,19 @@ export interface HeadingBlock extends BlockBase {
 /** Paragraph styles every theme defines. */
 export type ParagraphStyleName = 'normal' | 'title' | 'subtitle' | 'caption' | 'note' | 'small'
 
+/**
+ * A paragraph's style: one the theme defines ({@link ParagraphStyleName}), or the id of a paragraph style the document
+ * defines in `document.styles.paragraph`.
+ */
+export type ParagraphStyleRef = ParagraphStyleName | (string & {})
+
 export interface ParagraphBlock extends BlockBase {
   /** Named destination for an internal link written as #name. */
   bookmark?: string
   type: 'paragraph'
   content: RichText
-  style?: ParagraphStyleName
+  /** A theme style, or the id of a paragraph style the document defines (`document.styles.paragraph`). */
+  style?: ParagraphStyleRef
   align?: Align
   spacing?: Spacing
   indent?: Indent
@@ -771,6 +788,8 @@ export interface ThemeText {
   after?: number
   /** Line height multiple. */
   line?: number
+  /** Character spacing (tracking), points; see {@link TextStyle.characterSpacing}. */
+  characterSpacing?: number
   /**
    * A heading level: keep it on the page of what follows it (and its own lines together). True by default; false lets a
    * heading end a page, as a document whose own heading style does not keep with the next sets it.
@@ -847,11 +866,54 @@ export type ThemeInput = {
       : Theme[K]
 }
 
+/**
+ * A paragraph style the document defines, written as a named Word style (it shows in Word's style gallery and keeps
+ * its name when the document is edited) and referenced by a paragraph's `style`. `text` is the look: font, size,
+ * colour, bold, italic, caps, tracking, alignment, spacing before and after, line height and keep-with-next.
+ */
+export interface ParagraphStyleDefinition {
+  /** The Word style id: a letter, then letters and digits (`AffiliationDepartment`). Not one of the theme's ids. */
+  id: string
+  /** The name Word shows; the id when absent. */
+  name?: string
+  /**
+   * The style it builds on: a theme style (`normal`, `title`, `subtitle`, `caption`, `note`, `small`, `heading1` to
+   * `heading6`) or another style the document defines, by id. `normal` when absent.
+   */
+  basedOn?: string
+  /** The style of the paragraph after it, when one is typed in Word: a theme style or a defined id. */
+  next?: string
+  text?: ThemeText
+  indent?: Indent
+  borders?: { top?: Border; bottom?: Border; left?: Border; right?: Border }
+  /** Fill behind the paragraph, a hex colour. */
+  shading?: string
+  keepLinesTogether?: boolean
+}
+
+/** A character style the document defines, referenced by a run's `characterStyle`. */
+export interface CharacterStyleDefinition {
+  /** The Word style id: a letter, then letters and digits. */
+  id: string
+  name?: string
+  /** Another character style the document defines, by id. */
+  basedOn?: string
+  text: Omit<TextStyle, 'characterStyle'>
+}
+
+/** The named styles a document defines beyond the theme's. */
+export interface DocumentStyles {
+  paragraph?: readonly ParagraphStyleDefinition[]
+  character?: readonly CharacterStyleDefinition[]
+}
+
 export interface Document {
   /** Paragraphs of each note, keyed by a permanent ID. Numbers follow first use in the body. */
   footnotes?: Readonly<Record<string, readonly string[]>>
   metadata?: Metadata
   theme?: ThemeInput
+  /** Named paragraph and character styles beyond the theme's, for blocks and runs to reference by id. */
+  styles?: DocumentStyles
   /**
    * Automatic text touches, stated as data and applied in order by the writer to the text's ordinary runs: links,
    * terms in italics, raised footnote markers, formula digits set low. See {@link TextRule} and `docs/model.md`.

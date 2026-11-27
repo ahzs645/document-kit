@@ -18,6 +18,7 @@ Column widths in a table are **shares** (any numbers; `[3, 1, 1]` gives the firs
 interface Document {
   metadata?: { title?, author?, subject?, description?, keywords?, created?, modified? }
   theme?: ThemeInput      // any part of the theme; the rest is the kit's neutral default
+  styles?: DocumentStyles // named paragraph and character styles beyond the theme's (below)
   textRules?: TextRule[]  // automatic text touches: links, italic terms, raised markers (below)
   sections: Section[]     // at least one
 }
@@ -49,7 +50,7 @@ A section is a run of pages with one page set-up:
 | Block | What it says |
 |---|---|
 | `heading` | Levels 1 to 6. Written as Word's Heading styles with outline levels, so the navigation pane and a table of contents read them. |
-| `paragraph` | Rich text with a style (`normal`, `title`, `subtitle`, `caption`, `note`, `small`), alignment (including justify), spacing before/after/line, indent (left, right, first line, hanging), keep with next, keep lines together, page break before, tab stops (`at: 'end'` is the right edge), borders (each with its distance from the text, `space`, as a rule set a little under a letterhead) and shading. |
+| `paragraph` | Rich text with a style (`normal`, `title`, `subtitle`, `caption`, `note`, `small`, or the id of a style the document defines), alignment (including justify), spacing before/after/line, indent (left, right, first line, hanging), keep with next, keep lines together, page break before, tab stops (`at: 'end'` is the right edge), borders (each with its distance from the text, `space`, as a rule set a little under a letterhead) and shading. |
 | `list` | Bulleted or ordered, nested to any depth; an item may change kind for its children. Real Word numbering; each ordered list counts from its own `start`. |
 | `fields` | Label and value rows, as lines (`Label: value`, optional tab stop) or as a two-column table. A `null` value prints a blank rule. In lines, `rowSpacing` is the space after each row, and a row with `sameLine: true` goes on the line of the row before it after `sameLineGap` points (24) — "E-mail: …   Phone: …" — when it fits; when it does not, it moves whole to the next line, since its spaces and hyphens are written unbreakable (the hyphen as Word's no-break hyphen, which Word and `document-kit/layout` draw as the font's own hyphen and read back as `-`). It then shares the paragraph of the row before it, so it lacks that row's `rowSpacing` above it. |
 | `table` | Rows with roles: `header` (theme header look, repeated at the top of each page while among the first rows), `group` (shaded band), `note` (one small cell across the table), `spacer` (a short empty row), `body`. Cells span columns and rows (`colSpan`, `rowSpan`, listed as in HTML: a covered cell is not written). Per-cell alignment, vertical alignment, shading, borders, padding (`padding`, over the table's `cellPadding`), text style, a corner-to-corner rule (`diagonal`, a struck cell), text turned a quarter (`textDirection: 'up'` or `'down'`), and blocks inside a cell (paragraphs, lists, pictures, nested tables). Column shares, width as a share of the text, table borders, cell padding, text size, a caption above or below, a note under it, rows kept whole (`cantSplit`), a row kept with the next (`keepWithNext`, on by default for a `header` row with a row after it), the whole table on one page (`keepTogether`), its own line height (`line`), and `autoFit` (Word's AutoFit to contents, the shares only a start; fixed by default). A `header` row further down the table (a stacked block's own header) is drawn in the header look and not repeated. |
@@ -71,8 +72,11 @@ Every block may carry `id` (the application's own), `source`, and `pending` (see
 `RichText` is a string, one run, or a list of runs. Runs:
 
 - text (`{ type: 'text', text }`) with `bold`, `italic`, `underline`, `strike`, `superscript`, `subscript`,
-  `smallCaps`, `allCaps`, `color`, `size`, `font`, `highlight` (Word's sixteen highlight colours), and `link`
-  (a URI; written as a real hyperlink). In text, a newline is a line break and a tab character a tab.
+  `smallCaps`, `allCaps`, `color`, `size`, `font`, `highlight` (Word's sixteen highlight colours),
+  `characterSpacing` (tracking in points, added after every character, negative to condense; Word's `w:spacing` on
+  the run: tracking given in em is `em × size`), `characterStyle` (the id of a character style the document defines,
+  its look under the run's own), and `link` (a URI; written as a real hyperlink). In text, a newline is a line break
+  and a tab character a tab.
 - `field`: `page`, `pages` (the document's page count) or `sectionPages`.
 - `break`, `tab`.
 - `blank`: a rule to fill by hand, with `what` it is for. `show: 'placeholder'` prints `[what]` instead, in the
@@ -106,6 +110,39 @@ last line clears the margin.
   to the foot of the next page instead (with nothing else on that page if nothing follows). `document-kit/layout`
   does both (`docs/ream-upstream.md`, changes 10 and 11); Word does the same.
 - Its blocks are walked like any others: to-complete, caption numbers, custom blocks and hand edits reach into it.
+
+## Named styles
+
+`document.styles` defines paragraph and character styles beyond the theme's, written as named Word styles (they show
+in Word's style gallery and keep their names when the file is edited) and as CSS classes by `writeHtml`. A paragraph
+names one with `style`, a run with `characterStyle`.
+
+```ts
+styles: {
+  paragraph: [
+    { id: 'AffiliationDepartment', name: 'Affiliation Department', text: { size: 12, bold: true, characterSpacing: 0.6, after: 2 } },
+    { id: 'AffiliationSubdepartment', basedOn: 'AffiliationDepartment', next: 'normal', text: { size: 10.5, bold: false } },
+  ],
+  character: [{ id: 'Accent', text: { color: 'b45309', characterSpacing: 1 } }],
+}
+paragraph('Faculty of Examples', { style: 'AffiliationDepartment' })
+text('tracked', { characterStyle: 'Accent' })
+```
+
+- A paragraph style: `id` (a letter, then letters and digits), `name` (what Word shows; the id when absent),
+  `basedOn` (a theme style, `normal`, `title`, `subtitle`, `caption`, `note`, `small`, `heading1`–`heading6`, or
+  another defined id; `normal` when absent), `next`, `text` (a `ThemeText`: font, size, colour, bold, italic, caps,
+  small caps, `characterSpacing`, alignment, spacing before and after, line height, `keepWithNext`), `indent`,
+  `borders` (each with its `space`), `shading` and `keepLinesTogether`.
+- A character style: `id`, `name`, `basedOn` (another character style) and `text` (a `TextStyle`).
+- The Word file holds each style's own settings over its base, as Word keeps them; `styleTable(theme, styles)`
+  (from `document-kit`) gives each style resolved through its bases, which is what `writeHtml` writes.
+- Refused with a `StyleError` naming it: an id that is malformed, defined twice, or one of the theme's own (`Title`,
+  `Heading1`, `note`…, in any case); a `basedOn` or `next` naming no style; styles based on each other in a circle;
+  a paragraph or run naming a style the document does not define.
+
+The theme's text roles take `characterSpacing` too (`theme.headings[0].characterSpacing`), written on their Word
+styles.
 
 ## Signature options
 

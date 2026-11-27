@@ -52,3 +52,13 @@ export {
   type TextRuleProblem,
 } from './textRules'
 export * from './builders'
+export {
+  characterStyleId,
+  paragraphStyleId,
+  styleTable,
+  StyleError,
+  THEME_STYLE_IDS,
+  type ResolvedCharacterStyle,
+  type ResolvedParagraphStyle,
+  type StyleTable,
+} from './styles'

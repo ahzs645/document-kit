@@ -11,10 +11,10 @@ import {
   type IRunOptions,
   type ParagraphChild,
 } from 'docx'
-import { resolveImage, resolveSentences } from '../model/index'
+import { characterStyleId, resolveImage, resolveSentences } from '../model/index'
 import type { InlineImage, PictureCrop, RichText, TextStyle } from '../model/types'
 import type { WriterContext } from './context'
-import { halfPoints, hex, pixels } from './units'
+import { halfPoints, hex, pixels, twips } from './units'
 
 /** A model text style as docx run options. Only what is set is written, so styles underneath show through. */
 export function runOptions(style: TextStyle): IRunOptions {
@@ -31,6 +31,10 @@ export function runOptions(style: TextStyle): IRunOptions {
   if (style.size !== undefined) out.size = halfPoints(style.size)
   if (style.font) out.font = style.font
   if (style.highlight) out.highlight = style.highlight
+  // The docx library leaves out a spacing of 0; a value under one twip writes the explicit 0 a style's tracking needs
+  // to be undone.
+  if (style.characterSpacing !== undefined) out.characterSpacing = twips(style.characterSpacing) || Number.EPSILON
+  if (style.characterStyle) out.style = style.characterStyle
   return out as IRunOptions
 }
 
@@ -50,6 +54,8 @@ function styleOf(value: TextStyle & Record<string, unknown>): TextStyle {
     'size',
     'font',
     'highlight',
+    'characterSpacing',
+    'characterStyle',
   ]
   for (const key of keys) {
     if (value[key] !== undefined) (out as Record<string, unknown>)[key] = value[key]
@@ -165,7 +171,9 @@ export function inlineChildren(text: RichText, context: WriterContext, base: Inl
   const sourced = (style: TextStyle, source: string | undefined): TextStyle => {
     const from = source ?? base.source
     const mark = from ? context.sourceStyles[from] : undefined
-    return mark ? { ...style, ...mark } : style
+    const out = mark ? { ...style, ...mark } : style
+    characterStyleId(context.styles, out.characterStyle)
+    return out
   }
   for (const inline of resolveSentences(text)) {
     if (typeof inline === 'string') {

@@ -10,7 +10,7 @@ import {
   type IParagraphOptions,
   type ParagraphChild,
 } from 'docx'
-import { captionKind, captionPrefix, inlines, resolveSentences, type CaptionedBlock } from '../model/index'
+import { captionKind, captionPrefix, inlines, paragraphStyleId, resolveSentences, type CaptionedBlock } from '../model/index'
 import type { Align, Caption, ParagraphBlock, TabStop, TextStyle } from '../model/types'
 import { bookmarked } from './bookmarks'
 import type { WriterContext } from './context'
@@ -71,7 +71,7 @@ export function writeParagraph(block: ParagraphBlock, context: WriterContext, br
   }
   const children = inlineChildren(block.content, context, compact({ style: block.text, source: block.source }))
   const style =
-    (block.style ? STYLE_IDS[block.style] : undefined) ??
+    paragraphStyleId(context.styles, block.style) ??
     (context.part === 'header' ? 'Header' : context.part === 'footer' ? 'Footer' : undefined)
   const spacing = block.spacing
     ? compact({
