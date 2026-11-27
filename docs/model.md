@@ -56,10 +56,10 @@ A section is a run of pages with one page set-up:
 | Block | What it says |
 |---|---|
 | `heading` | Levels 1 to 6. Written as Word's Heading styles with outline levels, so the navigation pane and a table of contents read them. |
-| `paragraph` | Rich text with a style (`normal`, `title`, `subtitle`, `caption`, `note`, `small`, or the id of a style the document defines), alignment (including justify), spacing before/after/line, indent (left, right, first line, hanging), keep with next, keep lines together, page break before, tab stops (`at: 'end'` is the right edge), borders (each with its distance from the text, `space`, as a rule set a little under a letterhead) and shading. |
+| `paragraph` | Rich text with a style (`normal`, `title`, `subtitle`, `caption`, `note`, `small`, or the id of a style the document defines), alignment (including justify), spacing before/after/line (a multiple, or exact or at-least points: see Line heights), indent (left, right, first line, hanging), keep with next, keep lines together, page break before, tab stops (`at: 'end'` is the right edge), borders (each with its distance from the text, `space`, as a rule set a little under a letterhead) and shading. |
 | `list` | Bulleted or ordered, nested to any depth; an item may change kind for its children. Real Word numbering; each ordered list counts from its own `start`. |
 | `fields` | Label and value rows, as lines (`Label: value`, optional tab stop) or as a two-column table. A `null` value prints a blank rule. In lines, `rowSpacing` is the space after each row, and a row with `sameLine: true` goes on the line of the row before it after `sameLineGap` points (24) — "E-mail: …   Phone: …" — when it fits; when it does not, it moves whole to the next line, since its spaces and hyphens are written unbreakable (the hyphen as Word's no-break hyphen, which Word and `document-kit/layout` draw as the font's own hyphen and read back as `-`). It then shares the paragraph of the row before it, so it lacks that row's `rowSpacing` above it. |
-| `table` | Rows with roles: `header` (theme header look, repeated at the top of each page while among the first rows), `group` (shaded band), `note` (one small cell across the table), `spacer` (a short empty row), `body`. Cells span columns and rows (`colSpan`, `rowSpan`, listed as in HTML: a covered cell is not written). Per-cell alignment, vertical alignment, shading, borders, padding (`padding`, over the table's `cellPadding`), text style, a corner-to-corner rule (`diagonal`, a struck cell), text turned a quarter (`textDirection: 'up'` or `'down'`), and blocks inside a cell (paragraphs, lists, pictures, nested tables). Column shares, width as a share of the text, table borders, cell padding, text size, a caption above or below, a note under it, rows kept whole (`cantSplit`), a row kept with the next (`keepWithNext`, on by default for a `header` row with a row after it), the whole table on one page (`keepTogether`), its own line height (`line`), and `autoFit` (Word's AutoFit to contents, the shares only a start; fixed by default). A `header` row further down the table (a stacked block's own header) is drawn in the header look and not repeated. |
+| `table` | Rows with roles: `header` (theme header look, repeated at the top of each page while among the first rows), `group` (shaded band), `note` (one small cell across the table), `spacer` (a short empty row), `body`. Cells span columns and rows (`colSpan`, `rowSpan`, listed as in HTML: a covered cell is not written). Per-cell alignment, vertical alignment, shading, borders, padding (`padding`, over the table's `cellPadding`), text style, a corner-to-corner rule (`diagonal`, a struck cell), text turned a quarter (`textDirection: 'up'` or `'down'`), and blocks inside a cell (paragraphs, lists, pictures, nested tables). Column shares, width as a share of the text, table borders, cell padding, text size, a caption above or below, a note under it, rows kept whole (`cantSplit`), a row kept with the next (`keepWithNext`, on by default for a `header` row with a row after it), the whole table on one page (`keepTogether`), its own line height (`line`, a multiple or points), and `autoFit` (Word's AutoFit to contents, the shares only a start; fixed by default). A `header` row further down the table (a stacked block's own header) is drawn in the header look and not repeated. |
 | `spreadsheet` | One sheet of an Excel workbook (`.xlsx` bytes in `workbook`), written as a native table: details below. |
 | `figure` | A PNG or JPEG with its pixel size (read from its header when not given), fitted into a box (`fit: { width, height, upscale }`, or `'page'` to fill what the section's page leaves under the caption), a caption, a note, alignment. `crop: { top, right, bottom, left }` shows a band of it (the share, 0 to 1, cut away at each edge; the part shown is what is fitted), and `border: { width, color }` draws a solid frame round it. `image: null` prints a placeholder box with `placeholder` text. |
 | `figureGrid` | Pictures in `columns` columns (one column stacks them), each with a label above or below and a placeholder when missing, under one caption. |
@@ -140,7 +140,8 @@ text('tracked', { characterStyle: 'Accent' })
 - A paragraph style: `id` (a letter, then letters and digits), `name` (what Word shows; the id when absent),
   `basedOn` (a theme style, `normal`, `title`, `subtitle`, `caption`, `note`, `small`, `heading1`–`heading6`, or
   another defined id; `normal` when absent), `next`, `text` (a `ThemeText`: font, size, colour, bold, italic, caps,
-  small caps, `characterSpacing`, alignment, spacing before and after, line height, `keepWithNext`), `indent`,
+  small caps, `characterSpacing`, alignment, spacing before and after, line height (a multiple or points),
+  `keepWithNext`), `indent`,
   `borders` (each with its `space`), `shading` and `keepLinesTogether`.
 - A character style: `id`, `name`, `basedOn` (another character style) and `text` (a `TextStyle`).
 - The Word file holds each style's own settings over its base, as Word keeps them; `styleTable(theme, styles)`
@@ -151,6 +152,33 @@ text('tracked', { characterStyle: 'Accent' })
 
 The theme's text roles take `characterSpacing` too (`theme.headings[0].characterSpacing`), written on their Word
 styles.
+
+## Line heights
+
+A line height (`LineHeight`) is a multiple of single spacing or a height in points, wherever the model takes one: a
+paragraph's `spacing.line`, a theme text role's `line` (`theme.body.line`, `theme.headings[0].line`…), a named
+paragraph style's `text.line`, a table's `line` and the theme's `table.line`.
+
+```ts
+paragraph('Lines 14pt apart in any face', { spacing: { line: { exact: 14 } } })
+paragraph('At least 14pt; a larger line grows', { spacing: { line: { atLeast: 14 } } })
+paragraph('1.15 of the face\'s own line', { spacing: { line: 1.15 } })
+{ theme: { body: { line: { exact: 13 } } }, styles: { paragraph: [{ id: 'CoverLabel', text: { line: { exact: 12 } } }] } }
+```
+
+- A **multiple** (`1.15`) is Word's "Multiple": it is measured on the face's own line, which Word and the layout read
+  from the face's metrics, so the same multiple stands taller in one face than in another (11pt Carlito's single
+  line is 13.4pt, Arimo's 12.6pt) and lines land differently between faces. Written `w:line` in 240ths.
+- `{ exact: n }` is Word's "Exactly": every line is `n` points tall whatever its text, so lines land in the same
+  places in Word, the PDF and the HTML whatever the face. Written `w:line` in twips with `w:lineRule="exact"`. Text
+  taller than the line is not given more room (in Word its tops are cut off).
+- `{ atLeast: n }` is Word's "At least": a line is `n` points tall unless its text needs more. `w:lineRule="atLeast"`.
+- Points from more than 0 to 1584; a multiple from more than 0 to 132. Anything else (both keys, another key, 0, a
+  negative) throws an error naming the value. `readLineHeight` (from `document-kit`) reads one as the writers do.
+- A multiple written over a style whose line height is in points (a paragraph's `line: 1` in a body set exactly, a
+  style based on an exact one, the header and table text that the kit sets single over the body) is written with
+  `w:lineRule="auto"`: Word reads a rule left out as a multiple, but the layout and LibreOffice take the style's.
+  Elsewhere a multiple is written with no rule, as before, so existing documents keep their bytes.
 
 ## Frames and floating pictures
 
@@ -348,7 +376,7 @@ row that says `cantSplit`. The writer says both that way:
 
 The theme is how a document looks, so one application can be Times with a green band and the other Arial and grey,
 and the kit knows neither: body font, size and colour; title, subtitle, six heading levels, caption, note, small,
-header and footer text (font, size, colour, bold, italic, caps, alignment, spacing before and after, line height; a heading level's `keepWithNext`, true by default, false to let a heading end a page);
+header and footer text (font, size, colour, bold, italic, caps, alignment, spacing before and after, line height as a multiple or in points; a heading level's `keepWithNext`, true by default, false to let a heading end a page);
 link colour; the placeholder mark (`placeholderMark`, a text style); the table look (text size, line height `line`,
 header fill and text, group fill, note text, label fill, outer and inner borders, cell padding, least heights of
 header and other rows `headerRowHeight` and `rowHeight`, spacer height, placeholder box); the caption words and separator (`Table 3: Results`, or `Figure 2. View`); the blank rule's

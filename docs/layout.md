@@ -219,6 +219,13 @@ supplied or embedded face draws, so they are no longer named as missing symbols;
   it, after when it is in front; with no wrapping it moves nothing.
 - **Character spacing** (`w:spacing` in a run or a style, the model's `characterSpacing`): added after every
   character, so tracked text is measured, broken, aligned and drawn wider (or narrower).
+- **Line heights** (`w:spacing` `w:line` with `w:lineRule`, the model's `line`): a multiple (`auto`) is set on the
+  face's own line, read from its metrics, so it differs between faces as it does in Word. An exact height
+  (`exact`) makes every line box that tall whatever its text, and an at-least height (`atLeast`) makes it that tall
+  or the text's own height, the larger; the baseline sits the line's descent above the foot of its box, the extra
+  room above the text. Lines of one size in an exact paragraph are therefore exactly that many points apart in any
+  face, in the flow and in a frame, as in Word; two faces' baselines differ only by their descents (under a point
+  at body sizes), the same on every line.
 - **Frames at the foot of the page** (`w:framePr` with `w:yAlign="bottom"` against the page or margin, the model's
   `pinned` block): set at the foot of the page their anchor falls on, the text flowing above them. A line the frame
   would push below the text area starts the next page, and a frame that would cover text already set on its page
@@ -257,5 +264,10 @@ supplied or embedded face draws, so they are no longer named as missing symbols;
 - **`docxToHtml` has no headers, footers or page numbers**: it flows a Word file. To print the
   block model as HTML with its pages, headers, footers, frames and fonts, use `writeHtml` from
   `document-kit/html` (`docs/html.md`), which reads the document the Word writer reads.
+- **Where the baseline sits in an exact line.** The pitch is exact, but where the text sits inside its line box is
+  the engine's rule (the descent above the box's foot), checked against Word on the engine's test documents and not
+  on every face: a line of larger text in an exact paragraph keeps its box, its baseline lower in it by its larger
+  descent. Line for line agreement with Word holds for the boxes; a baseline may differ from Word's by a fraction of
+  the face's descent.
 - **Fidelity is the engine's.** Stand-ins match widths, not shapes. Layout differences from
   Word in particular documents are the engine's to fix (and record in `docs/ream-upstream.md`).

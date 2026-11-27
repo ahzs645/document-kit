@@ -3,7 +3,7 @@
  * properties, an embedded face) written as Word, laid out with a face named by the caller, and written as HTML, all
  * from the built package in the page. Made-up content only. Throws on failure; returns a JSON-serialisable summary.
  */
-import { document, floatingImage, fontEmbeddingReport, frame, heading, headerRow, paragraph, row, section, table, text } from 'document-kit'
+import { document, floatingImage, fontEmbeddingReport, frame, heading, headerRow, lineBreak, paragraph, row, section, table, text } from 'document-kit'
 import { writeDocx } from 'document-kit/docx'
 import { writeHtml } from 'document-kit/html'
 import { createFontProvider, layoutDocx } from 'document-kit/layout'
@@ -26,7 +26,7 @@ export default async function brandCase(ctx) {
       section(
         [
           frame([heading(1, 'Made-up cover')], { x: 72, y: 144, width: 400 }, { wrap: 'through' }),
-          frame([paragraph('Prepared for nobody in particular', { style: 'CoverLine' })], { x: 72, y: 600, width: 400 }, { wrap: 'through' }),
+          frame([paragraph(['Prepared for nobody', lineBreak(), 'in particular'], { style: 'CoverLine' })], { x: 72, y: 600, width: 400 }, { wrap: 'through' }),
         ],
         { page: { paper: 'letter', margins: { top: 0, bottom: 0, left: 0, right: 0, header: 0, footer: 0 } }, header: [floatingImage(art, 'page', { alt: 'Artwork' })] },
       ),
@@ -36,7 +36,7 @@ export default async function brandCase(ctx) {
       metadata: { title: 'Made-up brand document', custom: { 'app.id': 'case-1' } },
       theme: { body: { font: 'Brand Serif' }, table: { headerText: { font: 'Brand "Quoted" Face', color: 'aa3311', bold: true } } },
       styles: {
-        paragraph: [{ id: 'CoverLine', text: { size: 14, characterSpacing: 1 } }],
+        paragraph: [{ id: 'CoverLine', text: { size: 14, characterSpacing: 1, line: { exact: 20 } } }],
         character: [{ id: 'Wide', text: { characterSpacing: 3 } }],
       },
     },
@@ -50,6 +50,10 @@ export default async function brandCase(ctx) {
   const title = laid.pageLines[0].find((line) => line.text === 'Made-up cover')
   check(title && title.x === 72 && title.y > 144, `the framed title is at ${JSON.stringify(title)}`)
   check(!laid.losses.some((loss) => /brand serif/i.test(loss.detail)), 'the embedded face was substituted')
+  // The cover line's exact 20pt sets its two lines in the frame 20pt apart.
+  const prepared = laid.pageLines[0].find((line) => line.text === 'Prepared for nobody')
+  const particular = laid.pageLines[0].find((line) => line.text === 'in particular')
+  check(prepared && particular && Math.abs(particular.y - prepared.y - 20) < 0.01, `the cover lines are at ${JSON.stringify([prepared, particular])}`)
   const named = await layoutDocx(docx, { fonts, namedFonts: [{ family: 'Brand Serif', bytes: ctx.loadFont('Tinos-Regular.ttf') }] })
   const pdf = named.toPdf().bytes
   check(new TextDecoder('latin1').decode(pdf).includes('Tinos'), 'the named face is not in the PDF')
@@ -71,6 +75,8 @@ export default async function brandCase(ctx) {
   const sheetBox = sheets[0].getBoundingClientRect()
   check(Math.abs(placed.left - sheetBox.left - 96) < 1 && Math.abs(placed.top - sheetBox.top - 192) < 1, 'the frame is not where it was put')
   const view = frameEl.contentWindow
+  const coverLine = view.getComputedStyle(frameEl.contentDocument.querySelector('p.dk-ps-CoverLine')).lineHeight
+  check(Math.abs(parseFloat(coverLine) - (20 * 96) / 72) < 0.01, `the cover line is ${coverLine} high, not 20pt`)
   // A quoted face name in the header cell's style attribute does not cut off what follows it.
   const headerText = frameEl.contentDocument.querySelector('th p')
   const headerStyle = view.getComputedStyle(headerText)

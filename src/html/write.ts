@@ -75,7 +75,7 @@ import {
   escapeHtml,
   fontFaceCss,
   fontStack,
-  LINE,
+  lineHeightCss,
   paragraphCss,
   pt,
   styleAttr,
@@ -297,7 +297,7 @@ export function writeHtml(source: Document, options: WriteHtmlOptions = {}): str
     fontFaceCss(options.fonts ?? []),
     BASE_CSS,
     `body{--dk-desk:${options.desk ? color(options.desk) : '#e5e7eb'}}`,
-    `.dk-sheet{font-family:${fontStack(body.font)};font-size:${pt(body.size)};color:${color(body.color)};line-height:${Math.round((body.line ?? 1.15) * LINE * 1000) / 1000}}`,
+    `.dk-sheet{font-family:${fontStack(body.font)};font-size:${pt(body.size)};color:${color(body.color)};line-height:${lineHeightCss(body.line ?? 1.15)}}`,
     `.dk-sheet a{color:${color(theme.link.color)};text-decoration:${theme.link.underline ? 'underline' : 'none'}}`,
     styleCss(styles),
     `.dk-ps-KitTocTitle{${paragraphCss({ ...styles.paragraph.get('Heading1')!.text }).join(';')}}`,
@@ -423,7 +423,7 @@ function paragraphHtml(block: ParagraphBlock, ctx: Ctx): string {
   if (block.align) css.push(`text-align:${block.align}`)
   if (block.spacing?.before !== undefined) css.push(`margin-top:${pt(block.spacing.before)}`)
   if (block.spacing?.after !== undefined) css.push(`margin-bottom:${pt(block.spacing.after)}`)
-  if (block.spacing?.line !== undefined) css.push(`line-height:${Math.round(block.spacing.line * LINE * 1000) / 1000}`)
+  if (block.spacing?.line !== undefined) css.push(`line-height:${lineHeightCss(block.spacing.line)}`)
   const indent = block.indent
   if (indent) {
     if (indent.left !== undefined) css.push(`margin-left:${pt(indent.left)}`)
@@ -810,7 +810,7 @@ function tableHtml(table: TableBlock, ctx: Ctx, number?: number): string {
         } else {
           const pcss = [...textCss(base)]
           if (align) pcss.push(`text-align:${align}`)
-          if (table.line !== undefined) pcss.push(`line-height:${Math.round(table.line * LINE * 1000) / 1000}`)
+          if (table.line !== undefined) pcss.push(`line-height:${lineHeightCss(table.line)}`)
           const text =
             cell.content === null && ctx.state.nullCells === 'rule'
               ? `<span class="dk-blank"${styleAttr(`width:${pt(Math.min(inner * 0.8, theme.blankWidth))}`)}>&nbsp;</span>`

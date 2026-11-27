@@ -15,7 +15,7 @@ import type { Align, Caption, ParagraphBlock, TabStop, TextStyle } from '../mode
 import { bookmarked } from './bookmarks'
 import type { WriterContext } from './context'
 import { inlineChildren } from './inline'
-import { border, hex, lineMultiple, twips } from './units'
+import { border, hex, lineSpacing, twips } from './units'
 
 export function alignment(align: Align | undefined) {
   switch (align) {
@@ -77,7 +77,8 @@ export function writeParagraph(block: ParagraphBlock, context: WriterContext, br
     ? compact({
         before: block.spacing.before === undefined ? undefined : twips(block.spacing.before),
         after: block.spacing.after === undefined ? undefined : twips(block.spacing.after),
-        line: block.spacing.line === undefined ? undefined : lineMultiple(block.spacing.line),
+        // The style's own line height, which a multiple written over a height in points must name its rule against.
+        ...lineSpacing(block.spacing.line, context.styles.paragraph.get(style ?? 'Normal')?.text.line),
       })
     : undefined
   const indent = block.indent

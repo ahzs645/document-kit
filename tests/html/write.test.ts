@@ -214,3 +214,32 @@ describe('attribute values', () => {
     expect(html).not.toContain('<b>')
   })
 })
+
+describe('line heights in points', () => {
+  it('writes an exact height in points and a least height as the larger of it and a single line', () => {
+    const html = writeHtml(
+      document(
+        [
+          section([
+            paragraph('Exact.', { spacing: { line: { exact: 14 } } }),
+            paragraph('At least.', { spacing: { line: { atLeast: 15 } } }),
+            paragraph('Multiple.', { spacing: { line: 1.5 } }),
+            paragraph('Styled.', { style: 'CoverLine' }),
+            table([row(['Cell'])], { line: { exact: 10 } }),
+          ]),
+        ],
+        {
+          theme: { body: { line: { exact: 13 } }, headings: [{ line: { atLeast: 20 } }] },
+          styles: { paragraph: [{ id: 'CoverLine', text: { line: { exact: 12 } } }] },
+        },
+      ),
+    )
+    expect(html).toMatch(/<p class="dk-p dk-ps-Normal" style="line-height:14pt">Exact\./)
+    expect(html).toMatch(/<p class="dk-p dk-ps-Normal" style="line-height:max\(15pt,1\.2em\)">At least\./)
+    expect(html).toMatch(/<p class="dk-p dk-ps-Normal" style="line-height:1\.8">Multiple\./)
+    expect(html).toMatch(/\.dk-sheet\{[^}]*line-height:13pt\}/)
+    expect(html).toMatch(/\.dk-ps-Heading1\{[^}]*line-height:max\(20pt,1\.2em\)/)
+    expect(html).toMatch(/\.dk-ps-CoverLine\{[^}]*line-height:12pt/)
+    expect(html).toMatch(/<td[^>]*><p class="dk-p dk-ps-KitTable" style="line-height:10pt">Cell/)
+  })
+})

@@ -18,7 +18,7 @@ import type { Align, RowRole, TableBlock, TableCell, TextStyle, ThemeText, Verti
 import type { WriterContext } from './context'
 import { blankChildren, inlineChildren } from './inline'
 import { alignment, captionParagraph, compact, gapParagraph, styledParagraph, TABLE_STYLE_ID } from './paragraphs'
-import { border, hex, lineMultiple, twips } from './units'
+import { border, hex, lineMultiple, lineSpacing, twips } from './units'
 
 /** Writes nested blocks inside a cell. Set by the block writer, which tables call back into. */
 export type BlockWriter = (blocks: TableCell['blocks'] & object, context: WriterContext) => Array<Paragraph | Table>
@@ -209,9 +209,9 @@ export function writeTable(
               spacing:
                 table.line === undefined
                   ? undefined
-                  : autoLineTables.has(table)
+                  : typeof table.line === 'number' && autoLineTables.has(table)
                     ? { line: lineMultiple(table.line), lineRule: LineRuleType.AUTO }
-                    : { line: lineMultiple(table.line) },
+                    : lineSpacing(table.line, context.theme.table.line ?? 1),
               children: runs,
             }),
           ),

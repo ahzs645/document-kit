@@ -3,8 +3,8 @@
  * (`src/model/styles.ts`) and the caller's fonts. One CSS class a named style, its look merged through the styles it
  * is based on, so a paragraph in style `AffiliationDepartment` looks in the browser as Word sets it.
  */
-import { fontEmbeddingReport, groupFonts, type NamedFont, type StyleTable } from '../model/index'
-import type { Border, Highlight, TextStyle, Theme, ThemeText } from '../model/types'
+import { fontEmbeddingReport, groupFonts, readLineHeight, type NamedFont, type StyleTable } from '../model/index'
+import type { Border, Highlight, LineHeight, TextStyle, Theme, ThemeText } from '../model/types'
 
 /** A number of points as CSS, at most three decimals. */
 export const pt = (value: number): string => `${Math.round(value * 1000) / 1000}pt`
@@ -84,6 +84,17 @@ export function fontStack(name: string): string {
  */
 export const LINE = 1.2
 
+/**
+ * A line height as CSS: a multiple on {@link LINE} as a number (inherited as a multiple, as Word's is), an exact height
+ * in points, or a least height as the larger of its points and a single line of the paragraph's text.
+ */
+export function lineHeightCss(value: LineHeight): string {
+  const read = readLineHeight(value)
+  if (read.rule === 'exact') return pt(read.value)
+  if (read.rule === 'atLeast') return `max(${pt(read.value)},${LINE}em)`
+  return String(Math.round(read.value * LINE * 1000) / 1000)
+}
+
 /** The declarations for a text style: face, size, colour, weight, slant, decoration, caps, highlight, tracking. */
 export function textCss(style: TextStyle | ThemeText): string[] {
   const out: string[] = []
@@ -108,7 +119,7 @@ export function paragraphCss(text: ThemeText): string[] {
   if (text.align) out.push(`text-align:${text.align}`)
   if (text.before !== undefined) out.push(`margin-top:${pt(text.before)}`)
   if (text.after !== undefined) out.push(`margin-bottom:${pt(text.after)}`)
-  if (text.line !== undefined) out.push(`line-height:${Math.round(text.line * LINE * 1000) / 1000}`)
+  if (text.line !== undefined) out.push(`line-height:${lineHeightCss(text.line)}`)
   if (text.keepWithNext) out.push('break-after:avoid')
   return out
 }

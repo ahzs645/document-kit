@@ -13,7 +13,7 @@
     "align": { "default": null, "description": "Body alignment by column, as [\"left\", \"right\"]." },
     "size": { "default": null },
     "padding": { "default": null, "description": "Cell padding, points: { top, bottom, left, right }." },
-    "line": { "default": null, "description": "Line height of the table's text, as a multiple." },
+    "line": { "default": null, "description": "Line height of the table's text: a multiple, or { \"exact\": 12 } or { \"atLeast\": 12 } in points." },
     "repeatHeader": { "default": null, "description": "false: the header row is not repeated at the top of each page." },
     "autoFit": { "default": null, "description": "true: the columns fit their content, the widths only a start." },
     "empty": { "default": "No results." }

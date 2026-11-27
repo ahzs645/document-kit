@@ -59,6 +59,9 @@ The browser breaks the lines, not the layout engine, so pages are approximated w
   "Page 2 of 9" at the right edge of a footer). Without stops a tab advances to the next half inch.
 - Paragraph spacing adds as Word adds it (no collapsing margins: every flow is a flex column), a line multiple is
   set on 1.2 em (about a face's own line), and the first block of a sheet, a frame or a header takes no space above.
+- A line height in points is CSS `line-height` in points: `{ exact: 14 }` is `line-height:14pt`, the same pitch as
+  Word and the PDF whatever the face; `{ atLeast: 14 }` is `line-height:max(14pt,1.2em)`, the larger of the height
+  and a single line of the paragraph's own text.
 - Every `style` attribute is escaped as an attribute value (`styleAttr` in `src/html/css.ts`): a font stack's quoted
   names, or a font named with quotes, no longer end the attribute and lose what follows. Font names in the style
   sheet are CSS strings with quotes, backslashes and angle brackets escaped, and the style sheet holds no `<`, so no
@@ -73,7 +76,11 @@ The browser breaks the lines, not the layout engine, so pages are approximated w
 - **Text does not flow round a frame.** A frame's `wrap: 'around'` or `notBeside` is laid over the text, not round
   it; use frames in room the flow leaves empty (a cover, a margin) or `wrap: 'through'`.
 - **Line breaks and line heights are the browser's.** With the same faces the lines are close to the PDF's but not
-  identical; with no faces given, the browser's own stand-in is used.
+  identical; with no faces given, the browser's own stand-in is used. A multiple is set on 1.2 em, not the face's
+  own line; an exact height in points gives the PDF's pitch, but the browser centres the text in the line (Word and
+  the layout put the extra room above it), so a baseline can sit up to half the difference between the height and
+  the face's line away from the PDF's. An at-least height is measured on the paragraph's own size: larger text in
+  one of its runs does not make its line taller, as it does in Word.
 - **Tabs** beyond the paragraph's stops, and stops in a paragraph that wraps, are approximated.
 - **Table borders** collapse as CSS collapses them (the wider wins), not by Word's precedence rules.
 - **Repeating header rows** repeat in print (`thead`) only when the browser breaks the table itself.

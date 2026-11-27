@@ -215,13 +215,22 @@ export interface BlockBase {
   textRules?: false | readonly string[]
 }
 
+/**
+ * A line height: a multiple of single spacing (`1.15`, Word's "Multiple"), measured on the font's own line, so the
+ * same multiple stands taller in one face than another; or a height in points every line takes whatever its text
+ * (`{ exact: 14 }`, Word's "Exactly"); or a least height in points that a line with larger text grows past
+ * (`{ atLeast: 14 }`, Word's "At least"). A height in points puts the lines in the same places in Word, the PDF and
+ * the HTML whatever the face.
+ */
+export type LineHeight = number | { readonly exact: number } | { readonly atLeast: number }
+
 export interface Spacing {
   /** Points before the paragraph. */
   before?: number
   /** Points after the paragraph. */
   after?: number
-  /** Line height as a multiple of single spacing (1.15). */
-  line?: number
+  /** Line height: a multiple of single spacing (1.15), or `{ exact: 14 }` / `{ atLeast: 14 }` in points. */
+  line?: LineHeight
 }
 
 export interface Indent {
@@ -432,8 +441,11 @@ export interface TableBlock extends BlockBase {
   borders?: TableBorders
   /** Inner padding of every cell, points. */
   cellPadding?: { top?: number; bottom?: number; left?: number; right?: number }
-  /** Line height of the table's text as a multiple of single spacing; the theme's table line height when absent. */
-  line?: number
+  /**
+   * Line height of the table's text: a multiple of single spacing, or `{ exact }` / `{ atLeast }` in points
+   * ({@link LineHeight}); the theme's table line height when absent.
+   */
+  line?: LineHeight
   /** Keep every row whole (no row breaks across a page). */
   cantSplit?: boolean
   /** Space after this table, points, over the theme's `table.spaceAfter`; 0 for none. */
@@ -852,8 +864,8 @@ export interface ThemeText {
   before?: number
   /** Points after. */
   after?: number
-  /** Line height multiple. */
-  line?: number
+  /** Line height: a multiple of single spacing, or `{ exact }` / `{ atLeast }` in points ({@link LineHeight}). */
+  line?: LineHeight
   /** Character spacing (tracking), points; see {@link TextStyle.characterSpacing}. */
   characterSpacing?: number
   /**
@@ -883,8 +895,8 @@ export interface TableLook {
   rowHeight?: number
   /** Least height of a header row, points (a row's own `height` wins); none when absent. */
   headerRowHeight?: number
-  /** Line height of table text as a multiple of single spacing; 1 by default. */
-  line?: number
+  /** Line height of table text: a multiple of single spacing, or `{ exact }` / `{ atLeast }` in points; 1 by default. */
+  line?: LineHeight
   /** Spacer row height, points. */
   spacerHeight: number
   /**

@@ -212,4 +212,16 @@ describe('the shared components', () => {
       items: ['H: 3, Y', 'H: Picture to come', 'Sheet: Picture to come', 'Sheet: Signed', 'Sheet: Title', 'Sheet: Date'],
     })
   })
+
+  it('passes a data table a line height in points as well as a multiple', () => {
+    const lineOf = (line: number | { exact: number } | undefined) => {
+      const parts = [{ use: 'data-table', with: { columns: ['X'], rows: [[1]], ...(line === undefined ? {} : { line }) } }]
+      const { document } = renderRecipe(compileRecipe(recipe('lines', parts), sharedLibrary()), {})
+      const table = (document.sections[0]?.body ?? []).find((block) => block.type === 'table')
+      return table?.type === 'table' ? table.line : 'no table'
+    }
+    expect(lineOf({ exact: 12 })).toEqual({ exact: 12 })
+    expect(lineOf(1.1)).toBe(1.1)
+    expect(lineOf(undefined)).toBeUndefined()
+  })
 })
