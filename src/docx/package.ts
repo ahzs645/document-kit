@@ -5,17 +5,21 @@
  * - drawing ids (`wp:docPr id`), bookmark ids and the contents' `_Toc` bookmark names, which come from counters that
  *   run on across every document made in the same page, are numbered from 1 in each file;
  * - the created and modified times in `docProps/core.xml` are the document's own when it gives them;
- * - the zip entries carry one fixed time instead of the moment of writing.
+ * - the zip entries carry one fixed time instead of the moment of writing;
+ * - the custom properties (`docProps/custom.xml`), when given, are written with their types.
  *
  * Runs on the package's bytes with fflate and string replacement only, so it works in a browser.
  */
 import { strFromU8, strToU8, unzipSync, zipSync, type Zippable } from 'fflate'
+import type { CustomPropertyValue } from '../model/types'
 
 export interface NormalizeOptions {
   /** ISO 8601 creation time for `docProps/core.xml`; left as the library wrote it when absent. */
   created?: string
   /** ISO 8601 modified time; `created` when absent. */
   modified?: string
+  /** Custom document properties, written as `docProps/custom.xml` in place of what the package has. */
+  customProperties?: Readonly<Record<string, CustomPropertyValue>>
 }
 
 const XML = /\.(xml|rels)$/
@@ -95,12 +99,38 @@ export function normalizePackage(bytes: Uint8Array, options: NormalizeOptions = 
     )
   }
 
+  // Custom properties, with their types.
+  if (options.customProperties) {
+    text.set('docProps/custom.xml', customXml(options.customProperties))
+    if (!names.includes('docProps/custom.xml')) names.push('docProps/custom.xml')
+    const rels = text.get('_rels/.rels')
+    if (rels !== undefined && !rels.includes('docProps/custom.xml')) {
+      text.set(
+        '_rels/.rels',
+        rels.replace(
+          '</Relationships>',
+          '<Relationship Id="rIdCustom" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/custom-properties" Target="docProps/custom.xml"/></Relationships>',
+        ),
+      )
+    }
+    const types = text.get('[Content_Types].xml')
+    if (types !== undefined && !types.includes('/docProps/custom.xml')) {
+      text.set(
+        '[Content_Types].xml',
+        types.replace(
+          '</Types>',
+          '<Override PartName="/docProps/custom.xml" ContentType="application/vnd.openxmlformats-officedocument.custom-properties+xml"/></Types>',
+        ),
+      )
+    }
+  }
+
   // [Content_Types].xml first, as Word writes it; the rest in the library's order.
   const order = ['[Content_Types].xml', ...names.filter((name) => name !== '[Content_Types].xml')]
   const zippable: Zippable = {}
   const mtime = ZIP_TIME()
   for (const name of order) {
-    if (!(name in files)) continue
+    if (!(name in files) && !text.has(name)) continue
     const data = text.has(name) ? strToU8(text.get(name)!) : files[name]!
     zippable[name] = [data, { mtime }]
   }
@@ -112,4 +142,34 @@ function isoTime(value: string): string {
   const time = Date.parse(value)
   if (Number.isNaN(time)) throw new Error(`document-kit: "${value}" is not an ISO 8601 time`)
   return new Date(time).toISOString().replace(/\.\d{3}Z$/, 'Z')
+}
+
+const escapeXml = (value: string): string =>
+  value.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!)
+
+/** `docProps/custom.xml` for the properties, each value in its own type. Throws on a name or value it cannot write. */
+export function customXml(properties: Readonly<Record<string, CustomPropertyValue>>): string {
+  const items = Object.entries(properties).map(([name, value], index) => {
+    if (!name.trim() || name.length > 255) throw new Error(`document-kit: a custom property's name must be 1 to 255 characters (${JSON.stringify(name)})`)
+    let typed: string
+    if (typeof value === 'string') typed = `<vt:lpwstr>${escapeXml(value)}</vt:lpwstr>`
+    else if (typeof value === 'boolean') typed = `<vt:bool>${value ? 'true' : 'false'}</vt:bool>`
+    else if (typeof value === 'number') {
+      if (!Number.isFinite(value)) throw new Error(`document-kit: the custom property "${name}" is not a finite number`)
+      typed = Number.isInteger(value) && Math.abs(value) <= 0x7fffffff ? `<vt:i4>${value}</vt:i4>` : `<vt:r8>${value}</vt:r8>`
+    } else if (value instanceof Date) {
+      if (Number.isNaN(value.getTime())) throw new Error(`document-kit: the custom property "${name}" is not a valid time`)
+      typed = `<vt:filetime>${value.toISOString().replace(/\.\d{3}Z$/, 'Z')}</vt:filetime>`
+    } else {
+      throw new Error(`document-kit: the custom property "${name}" must be text, a number, a yes/no or a Date`)
+    }
+    return `<property fmtid="{D5CDD505-2E9C-101B-9397-08002B2CF9AE}" pid="${index + 2}" name="${escapeXml(name)}">${typed}</property>`
+  })
+  return (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n' +
+    '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/custom-properties" ' +
+    'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">' +
+    items.join('') +
+    '</Properties>'
+  )
 }

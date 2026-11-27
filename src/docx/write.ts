@@ -58,9 +58,11 @@ export async function writeDocx(document: Document, options: WriteDocxOptions = 
   const bytes = await Packer.pack(docx, 'uint8array')
   const created = document.metadata?.created
   const modified = document.metadata?.modified
+  const custom = document.metadata?.custom
   return normalizePackage(bytes, {
     ...(created ? { created } : {}),
     ...(modified ? { modified } : {}),
+    ...(custom && Object.keys(custom).length ? { customProperties: custom } : {}),
   })
 }
 

@@ -827,7 +827,15 @@ export interface Metadata {
   created?: string
   /** ISO 8601. The modified time; `created` when absent. */
   modified?: string
+  /**
+   * Custom document properties (Word's File › Properties › Custom, `docProps/custom.xml`), by name: text, a number,
+   * a yes/no, or a time (a `Date`). The application's own ids and provenance travel with the file this way.
+   */
+  custom?: Readonly<Record<string, CustomPropertyValue>>
 }
+
+/** A custom document property's value: written as text, a whole or real number, a yes/no, or a time. */
+export type CustomPropertyValue = string | number | boolean | Date
 
 /** Text in one role in the theme. */
 export interface ThemeText {

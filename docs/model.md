@@ -16,7 +16,7 @@ Column widths in a table are **shares** (any numbers; `[3, 1, 1]` gives the firs
 
 ```ts
 interface Document {
-  metadata?: { title?, author?, subject?, description?, keywords?, created?, modified? }
+  metadata?: { title?, author?, subject?, description?, keywords?, created?, modified?, custom? }
   theme?: ThemeInput      // any part of the theme; the rest is the kit's neutral default
   styles?: DocumentStyles // named paragraph and character styles beyond the theme's (below)
   textRules?: TextRule[]  // automatic text touches: links, italic terms, raised markers (below)
@@ -26,6 +26,12 @@ interface Document {
 
 `metadata.created` (ISO 8601) pins the file's creation and modified times; with it, the same document always
 writes the same bytes.
+
+`metadata.custom` holds custom document properties by name (Word's File › Properties › Custom,
+`docProps/custom.xml`): text, a number (a whole number within 32 bits is written as `vt:i4`, any other as `vt:r8`),
+a yes/no (`vt:bool`) or a `Date` (`vt:filetime`, UTC). An application's own ids, provenance and font requirements
+travel in the file this way. A name is 1 to 255 characters; a number that is not finite, or an invalid `Date`, stops
+the writer with the property named. `writeHtml` writes each as a `<meta name content>`.
 
 ## Sections
 
