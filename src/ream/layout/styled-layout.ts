@@ -5194,7 +5194,9 @@ function runFontKeyAndParsed(
     const emb = options.embeddedFonts.get(name);
     if (emb) {
       const { variant, parsed } = emb.resolveByStyle(bold, italic);
-      return { fontKey: `embed:${name}:${variant}`, parsed };
+      // document-kit: a family that brought no bold (or italic) face is thickened (or slanted), as Word draws it,
+      // rather than set in its regular face.
+      return { fontKey: `embed:${name}:${variant}`, parsed, ...syntheticFace(variant, bold, italic) };
     }
   }
   const byFamily = options.registriesByFamily;

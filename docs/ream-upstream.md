@@ -193,8 +193,25 @@ Each change is marked in the source with a `document-kit:` comment unless noted.
     file did not cache. Nothing upstream reads the new fields; rendering is unchanged. Pinned by
     `tests/docx/spreadsheet.test.ts`.
 
+18. **Bold and italic made for an embedded family that lacks them** (`layout/styled-layout.ts`,
+    `runFontKeyAndParsed`, marked `document-kit:`). Upstream drew a bold run in a family the
+    document embeds (or, through `document-kit/layout`'s `namedFonts`, the caller names) with
+    whichever face the family has, so a family embedded with its regular face alone printed bold
+    text regular. It now takes the same synthetic face the stand-ins take (`syntheticFace`):
+    thickened for bold, slanted for italic, as Word draws a family it has no such face for. A
+    family with its own bold face is drawn as before. Pinned by
+    `tests/layout/named-fonts.test.ts`.
+19. **OpenType faces with CFF outlines in the PDF** (`pdf/cid-font.ts`, `embedTtfFont` and the
+    new `embedCffFont`, marked `document-kit:`). Upstream embedded every face as TrueType
+    (`/FontFile2`, subset by `glyf`); a CFF face (an `.otf` brand face) has no `glyf`, and
+    subsetting it threw. Such a face is now embedded whole as `/FontFile3` of subtype `/OpenType`
+    under a `/CIDFontType0` descendant: its CFF is not CID-keyed (the layout refuses one that is,
+    with a loss), so a CID is the glyph id and the page's codes are unchanged. Not subset: the
+    PDF carries the whole face. Measuring, the page pictures (`svg/svg-text.ts` already drew CFF
+    outlines) and `/ToUnicode` are unchanged. Pinned by `tests/layout/named-fonts.test.ts`.
+
 Nothing else differs. `diff -r` against the upstream tree, after running the rewrite script
-over a fresh copy, shows only the seventeen changes above.
+over a fresh copy, shows only the nineteen changes above.
 
 ## Bringing in a newer upstream
 
@@ -204,11 +221,11 @@ over a fresh copy, shows only the seventeen changes above.
    included; skip `corpus/`, `stand/`, `docs/`, `scripts/`). Delete files upstream deleted.
 3. Run `node scripts/rewrite-ream-aliases.mjs`, then `node scripts/rewrite-ream-aliases.mjs
    --check` (exits 1 if an alias import or root-relative fixture path is left).
-4. Re-apply changes 1, 2 and 4 to 17 above unless upstream has made them itself (check
+4. Re-apply changes 1, 2 and 4 to 19 above unless upstream has made them itself (check
    `FIXED_MTIME`, a `w:r` split for complex fields, every fallback to the global `fetch` in
    `core/fonts`, `core/converter` and `excel`, `familyNamesInFlow`, `w:vAlign`, PAGEREF and
    body fields, §17.4.66 border conflicts, `w:keepNext` in table rows, and the two foot-frame
-   checks of changes 10 and 11, the no-break hyphen of change 12, percentage widths with their sign of change 13, the stand-in grid of change 14, border widths of change 15, the `compact` option of change 16). Search for
+   checks of changes 10 and 11, the no-break hyphen of change 12, percentage widths with their sign of change 13, the stand-in grid of change 14, border widths of change 15, the `compact` option of change 16, synthetic faces for embedded families of change 18, CFF faces in the PDF of change 19). Search for
    `document-kit:` in the old tree to find each place. Search for new uses of
    `fetch`, `XMLHttpRequest` and `node:` in `src/ream` and treat any as change 4.
 5. Check `src/layout` still compiles against the internals it imports (`core/converter/project`,

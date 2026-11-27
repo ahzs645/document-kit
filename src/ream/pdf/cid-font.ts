@@ -68,6 +68,8 @@ export function embedTtfFont(
 ): EmbeddedFont {
   const scale = 1000 / parsed.unitsPerEm;
   const toPdfUnits = (v: number): number => Math.round(v * scale);
+  // document-kit: an OpenType face with CFF outlines has no `glyf` to subset; it goes in whole, as /FontFile3.
+  if (!parsed.tables.has('glyf') && parsed.tables.has('CFF ')) return embedCffFont(doc, parsed, options);
 
   const usedGidsArr = options.usedGids ? [...options.usedGids] : undefined;
   // What the subset actually contains: the used glyphs plus whatever their
@@ -382,4 +384,74 @@ function buildToUnicodeCMap(
   lines.push('end');
 
   return encoder.encode(lines.join('\n'));
+}
+
+/**
+ * ISO 32000-1 §9.7.4.2 — an OpenType face with CFF outlines, embedded whole as `/FontFile3` of subtype `/OpenType`
+ * (PDF 1.6) under a `/CIDFontType0` descendant. The CFF is not CID-keyed (the layout refuses one that is), so a CID
+ * is the glyph id, as the TrueType path's `/CIDToGIDMap /Identity` makes it: the page's codes need no change.
+ */
+function embedCffFont(doc: PdfDocument, parsed: ParsedTtf, options: EmbedTtfOptions): EmbeddedFont {
+  const scale = 1000 / parsed.unitsPerEm;
+  const toPdfUnits = (v: number): number => Math.round(v * scale);
+  const used = options.usedGids ? [...new Set([0, ...options.usedGids])].sort((a, b) => a - b) : undefined;
+  const fontFileRef = doc.add(deflatedStream({ Subtype: name('OpenType') }, parsed.raw));
+  const allGids = Array.from({ length: parsed.numGlyphs }, (_, i) => i);
+  const cidSetRef = options.cidSet ? doc.add(deflatedStream({}, buildCidSet(new Set(allGids)))) : undefined;
+  const descriptorRef = doc.add(
+    dict({
+      Type: name('FontDescriptor'),
+      FontName: name(parsed.postScriptName),
+      Flags: parsed.flags,
+      FontBBox: [
+        toPdfUnits(parsed.fontBBox[0]),
+        toPdfUnits(parsed.fontBBox[1]),
+        toPdfUnits(parsed.fontBBox[2]),
+        toPdfUnits(parsed.fontBBox[3]),
+      ],
+      ItalicAngle: parsed.italicAngle,
+      Ascent: toPdfUnits(parsed.ascender),
+      Descent: toPdfUnits(parsed.descender),
+      CapHeight: toPdfUnits(parsed.capHeight),
+      XHeight: toPdfUnits(parsed.xHeight),
+      StemV: parsed.stemV,
+      FontFile3: ref(fontFileRef.id),
+      ...(cidSetRef ? { CIDSet: ref(cidSetRef.id) } : {}),
+    }),
+  );
+  const widthRuns = consecutiveRuns(used ?? allGids).map(
+    (run) => [run[0]!, run.map((g) => toPdfUnits(parsed.advanceWidths[g] ?? 0))] as const,
+  );
+  const cidFontRef = doc.add(
+    dict({
+      Type: name('Font'),
+      Subtype: name('CIDFontType0'),
+      BaseFont: name(parsed.postScriptName),
+      CIDSystemInfo: dict({ Registry: 'Adobe', Ordering: 'Identity', Supplement: 0 }),
+      FontDescriptor: ref(descriptorRef.id),
+      DW: 1000,
+      W: widthRuns.flatMap(([first, ws]) => [first, ws]),
+    }),
+  );
+  const toUnicodeRef = doc.add(
+    deflatedStream({}, buildToUnicodeCMap(parsed, used, options.glyphText, options.glyphChars)),
+  );
+  const type0Ref = doc.add(
+    dict({
+      Type: name('Font'),
+      Subtype: name('Type0'),
+      BaseFont: name(parsed.postScriptName),
+      Encoding: name('Identity-H'),
+      DescendantFonts: [ref(cidFontRef.id)],
+      ToUnicode: ref(toUnicodeRef.id),
+    }),
+  );
+  const measure = createFontMeasure(parsed);
+  return {
+    fontRef: type0Ref,
+    parsed,
+    pdfWidthForGid: measure.pdfWidthForGid,
+    textWidthPt: measure.textWidthPt,
+    encodeTextAsCidHex: measure.encodeTextAsCidHex,
+  };
 }

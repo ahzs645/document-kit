@@ -15,6 +15,7 @@ import type { FlowDoc } from '../ream/core/ir/flow';
 import type { LaidOutDocument, LaidOutPage } from '../ream/layout/page-doc';
 import type { PdfALevel, StyledRenderOptions } from '../ream/layout/styled-layout';
 import type { FaceStyle, FontProvider, ProvidedFamily, StandInFamily } from './fonts';
+import type { NamedFont } from '../model/fonts';
 
 import { flowRenderOptions } from '../ream/core/converter/project';
 import { decryptPackage, isEncryptedPackage } from '../ream/core/crypto/offcrypto';
@@ -36,6 +37,7 @@ import { PdfDocument } from '../ream/pdf/writer';
 import { writeSvg } from '../ream/svg/svg-writer';
 import { docxReader } from '../ream/word/docx-reader';
 import { STAND_IN_NAMES } from './fonts';
+import { familyKey, fontFileInfo, groupFonts } from '../model/fonts';
 import { circledNumberRegistry, isCircledNumber } from './circledNumbers';
 import { TICK_BOX_CHARACTERS, tickBoxRegistry } from './tickBoxes';
 
@@ -60,6 +62,13 @@ export interface PagedOptions extends LayoutOptions {
    * cannot be laid out.
    */
   readonly fonts?: FontProvider;
+  /**
+   * Fonts by family name, drawn before anything else: a face given here is used for every run naming its family,
+   * over a font the document embeds and over the bundled stand-ins (a licensed brand face, say, the same bytes
+   * `writeDocx` was asked to embed). TrueType or OpenType (CFF) faces; a weight of 600 or more is the family's bold
+   * face. A face that cannot be read is a loss, and the family falls back to the document's own or a stand-in.
+   */
+  readonly namedFonts?: ReadonlyArray<NamedFont>;
 }
 
 /** Options for {@link docxToPdf}. */
@@ -211,7 +220,7 @@ export async function layoutDocx(
   options: LayoutDocxOptions = {},
 ): Promise<LaidOutDocx> {
   const { flow, losses } = readWord(docx, options.password);
-  const render = await renderOptions(flow, options.fonts, losses);
+  const render = await renderOptions(flow, options.fonts, losses, options.namedFonts ?? []);
   const styled: StyledRenderOptions = {
     ...render,
     // Compressed page drawing and palette pictures: the same pages, a fraction of the bytes.
@@ -357,8 +366,12 @@ async function renderOptions(
   flow: FlowDoc,
   provider: FontProvider | undefined,
   losses: Array<LayoutLoss>,
+  namedFonts: ReadonlyArray<NamedFont>,
 ): Promise<StyledRenderOptions> {
-  const embedded = flow.embeddedFonts ?? new Map<string, EngineFontRegistry>();
+  // The caller's named fonts first, then the faces the document embeds: the engine draws a family it finds here
+  // with these faces, ahead of any stand-in.
+  const embedded = new Map<string, EngineFontRegistry>(flow.embeddedFonts ?? []);
+  for (const [key, registry] of namedRegistries(namedFonts, losses)) embedded.set(key, registry);
 
   // Which stand-in each named family needs. A family the document carries
   // itself is drawn with its own embedded face and needs none. Arimo is always
@@ -485,10 +498,71 @@ async function renderOptions(
 
   return {
     ...flowRenderOptions(flow),
+    ...(embedded.size > 0 ? { embeddedFonts: embedded } : {}),
     registry,
     ...(registriesByFamily.size > 0 ? { registriesByFamily } : {}),
     losses,
   };
+}
+
+/**
+ * The caller's named fonts as the engine's registries, one a family keyed as the engine keys an embedded font
+ * (trimmed, lower case). A family with no regular face takes its bold one as regular. A face the engine cannot
+ * draw with (a collection, a CID-keyed CFF font, a file that does not parse) is left out and named in a loss.
+ */
+function namedRegistries(
+  fonts: ReadonlyArray<NamedFont>,
+  losses: Array<LayoutLoss>,
+): Map<string, EngineFontRegistry> {
+  const out = new Map<string, EngineFontRegistry>();
+  if (fonts.length === 0) return out;
+  const usable: Array<NamedFont> = [];
+  for (const font of fonts) {
+    const info = fontFileInfo(font.bytes);
+    if (info.format === 'truetype' || info.format === 'cff') {
+      usable.push(font);
+      continue;
+    }
+    const why =
+      info.format === 'cff-cid'
+        ? 'a CID-keyed CFF font, which the PDF writer cannot place by glyph'
+        : info.format === 'collection'
+          ? 'a font collection; pass its faces one by one'
+          : 'not a TrueType or OpenType font';
+    losses.push({
+      severity: 'substituted',
+      feature: FEATURES.fontsSubstitution,
+      detail: `the face given for "${font.family}" (weight ${font.weight ?? 400}${font.style === 'italic' ? ', italic' : ''}) is ${why}; it is not used`,
+    });
+  }
+  const { families } = groupFonts(usable);
+  for (const [key, { family, faces }] of families) {
+    const bytes = (font: NamedFont | undefined) =>
+      font ? (font.bytes instanceof Uint8Array ? font.bytes : new Uint8Array(font.bytes)) : undefined;
+    const regular = bytes(faces.regular ?? faces.bold ?? faces.italic ?? faces.boldItalic)!;
+    try {
+      const bold = bytes(faces.bold);
+      const italic = bytes(faces.italic);
+      const boldItalic = bytes(faces.boldItalic);
+      out.set(
+        familyKey(key),
+        FontRegistry.fromBytes({
+          regular,
+          ...(bold && faces.regular ? { bold } : {}),
+          ...(italic && (faces.regular || faces.bold) ? { italic } : {}),
+          ...(boldItalic ? { boldItalic } : {}),
+        }),
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      losses.push({
+        severity: 'substituted',
+        feature: FEATURES.fontsSubstitution,
+        detail: `the faces given for "${family}" could not be read (${message}); the family is drawn as if none were given`,
+      });
+    }
+  }
+  return out;
 }
 
 /** Every face of a registry (the regular one and those of the styles it has). */

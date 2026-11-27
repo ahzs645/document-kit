@@ -36,6 +36,7 @@ export type {
   StandInFamily,
   StandInFile,
 } from './fonts';
+export type { NamedFont } from '../model/fonts';
 export { WrongPasswordError } from '../ream/core/crypto/password-error';
 export type { DocumentInfo } from '../ream/core/document-model';
 export type { PdfALevel } from '../ream/layout/styled-layout';

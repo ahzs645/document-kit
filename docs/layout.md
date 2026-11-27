@@ -19,11 +19,20 @@ const { html } = await docxToHtml(docx);
 
 // Preview and export from one layout:
 const laid = await layoutDocx(docx, { fonts });
+
+// A brand's own faces, by family name, drawn before anything else (TrueType or OpenType/CFF):
+const branded = await layoutDocx(docx, {
+  fonts,
+  namedFonts: [
+    { family: 'Brand Sans', bytes: regular },
+    { family: 'Brand Sans', weight: 700, bytes: bold },
+  ],
+});
 const preview = laid.toPages();      // same as docxToPages
 const pdf = laid.toPdf({ info });    // same as docxToPdf, without laying out again
 ```
 
-- `layoutDocx(docx, { fonts?, password?, pdfA?, tagged? })` → `Promise<LaidOutDocx>`: the file
+- `layoutDocx(docx, { fonts?, namedFonts?, password?, pdfA?, tagged? })` → `Promise<LaidOutDocx>`: the file
   laid out once. `LaidOutDocx` has `pageCount`, `pageSizes`, `pageText`, `pageLines`, `losses` (what reading
   and laying out recorded), and two writers that reuse the layout, each callable any number of
   times: `toPdf({ info? })` → `PdfResult` and `toPages({ sharedGlyphs? })` → `PagesResult`.
@@ -31,6 +40,16 @@ const pdf = laid.toPdf({ info });    // same as docxToPdf, without laying out ag
   need the structure tree the layout builds; they change nothing on the pages. `docxToPdf` and
   `docxToPages` are `layoutDocx` followed by one writer, and write the same bytes as before.
 
+- `namedFonts` (every paged call takes it: `layoutDocx`, `docxToPdf`, `docxToPages`) is a list of `NamedFont`
+  (`{ family, bytes, weight?, style? }`, the type `document-kit` exports and `writeDocx`'s `embedFonts` takes): the
+  caller's own faces by family name, used for every run naming the family (the name matched without regard to
+  case), **before** a face the document embeds and before the bundled stand-ins. A weight of 600 or more is the
+  family's bold face, `style: 'italic'` its italic; a family given no bold or italic face has bold and italic text
+  thickened or slanted by the layout, as Word does. TrueType and OpenType (CFF) faces both work, in Node and in the
+  browser: a CFF face is drawn in the page pictures from its own outlines and embedded in the PDF whole, as
+  `/FontFile3` (`/OpenType`). A face the layout cannot draw with (a CID-keyed CFF font, a collection, a file that
+  is not a font) is left out with a `substituted` loss naming it, and its family falls back to the document's own
+  face or a stand-in.
 - `docxToPdf(docx, { fonts?, password?, info?, pdfA?, tagged? })` →
   `Promise<{ bytes, pageCount, pageSizes, losses }>`. `info` (title, author, …) is laid over the Word
   file's own properties; `pdfA` is a level such as `'PDF/A-2b'`; `tagged` writes a tagged PDF.
@@ -77,7 +96,7 @@ const pdf = laid.toPdf({ info });    // same as docxToPdf, without laying out ag
 - `WrongPasswordError` is thrown for an encrypted Word file opened without its password or with
   the wrong one. A file that is not a `.docx` throws an `Error`.
 
-Types exported: `FontProvider`, `FontLoader`, `FontFileBytes`, `StandInFamily`, `StandInFile`,
+Types exported: `NamedFont`, `FontProvider`, `FontLoader`, `FontFileBytes`, `StandInFamily`, `StandInFile`,
 `FaceStyle`, `ProvidedFamily`, `LayoutOptions`, `PagedOptions`, `PdfOptions`, `PdfResult`,
 `PageLine`, `PagesResult`, `PagesWriteOptions`, `PageSize`, `HtmlResult`, `LayoutLoss`, `LayoutDocxOptions`,
 `LaidOutDocx`, `PdfWriteOptions`, `DocumentInfo`, `PdfALevel`.
@@ -110,17 +129,19 @@ before the viewer renders them. SVG previews are also available through `toPages
 
 The kit never reaches the network. For each family the document draws text in:
 
-1. A font **embedded in the document** (Word's *Embed fonts*) is used as it is.
-2. Otherwise the **caller's stand-in** for that name, chosen by the engine's own substitution
+1. A face the caller **names** for the family (`namedFonts`) is used first.
+2. Otherwise a font **embedded in the document** (Word's *Embed fonts*, `writeDocx`'s `embedFonts`) is used as it
+   is.
+3. Otherwise the **caller's stand-in** for that name, chosen by the engine's own substitution
    table (`standInFor`): Calibri → Carlito, Cambria → Caladea, Arial/Helvetica → Arimo, Times New
    Roman → Tinos, Courier New → Cousine; other serif names → Tinos, other monospaced names →
    Cousine, anything else → Arimo. Arimo is always asked for: it draws text with no named font,
    math and chart labels.
-3. A stand-in nobody supplied is **not fetched**. Its text is drawn with the first family that
+4. A stand-in nobody supplied is **not fetched**. Its text is drawn with the first family that
    was supplied (Arimo when it was), and the loss says so.
 
-Without a provider, only embedded fonts are used; a document that embeds none cannot be laid
-out and `docxToPdf`/`docxToPages` reject with "No fonts…". `docxToHtml` needs no fonts.
+Without a provider, only named and embedded fonts are used; a document with neither cannot be
+laid out and `docxToPdf`/`docxToPages` reject with "No fonts…". `docxToHtml` needs no fonts.
 
 Built-in glyphs cover ballot boxes ☐, ☑ and ☒ and circled numbers ⓪ and ①–⑳. The engine uses
 these glyphs when the requested character is missing from the supplied fonts. The original Unicode
@@ -218,9 +239,10 @@ supplied or embedded face draws, so they are no longer named as missing symbols;
 
 - **Word files only.** The engine also reads `.doc`, `.xlsx`, `.xls`, `.pptx`, `.ppt` and PDF;
   this API takes `.docx`. Use `document-kit/ream` for the rest (and pass fonts yourself).
-- **No caller-named fonts.** A caller cannot yet supply their own bytes for a named family
-  (say, a licensed Calibri); only the five stand-ins. The engine supports it (`embeddedFonts`);
-  the API does not expose it yet.
+- **CFF faces go into the PDF whole.** A TrueType face is subset to the glyphs a document uses;
+  an OpenType face with CFF outlines (`namedFonts`) is embedded whole, so a PDF set in one is
+  larger by the face's size. A CID-keyed CFF face (most CJK `.otf` faces) is not drawn with at
+  all: it is reported and its family falls back.
 - **No scripts beyond Latin, Greek and Cyrillic** in the bundled set (see above).
 - **Each call lays out.** `docxToPdf` and `docxToPages` each run the layout; use
   `layoutDocx` to write both from one. A document with page-number fields in its body is laid
