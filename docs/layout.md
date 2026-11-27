@@ -216,7 +216,10 @@ supplied or embedded face draws, so they are no longer named as missing symbols;
   from the flow. One in a header is set on every page the header is on.
 - **Pictures behind or in front of the text** (an anchored `wp:anchor` with `behindDoc`, the model's
   `floatingImage`): drawn at its offset against the page or the margin, before the page's text when it is behind
-  it, after when it is in front; with no wrapping it moves nothing.
+  it, after when it is in front; with no wrapping it moves nothing. A picture behind the text is painted before
+  everything else on the page, the body's cell and paragraph shading included, whether it is anchored in the body or
+  in a header or footer (a page ground for every page); pictures behind the text stack by their `relativeHeight`,
+  a header's under the body's, as Word layers them (`docs/ream-upstream.md`, change 20).
 - **Character spacing** (`w:spacing` in a run or a style, the model's `characterSpacing`): added after every
   character, so tracked text is measured, broken, aligned and drawn wider (or narrower).
 - **Line heights** (`w:spacing` `w:line` with `w:lineRule`, the model's `line`): a multiple (`auto`) is set on the

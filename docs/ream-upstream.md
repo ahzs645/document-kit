@@ -209,9 +209,19 @@ Each change is marked in the source with a `document-kit:` comment unless noted.
     with a loss), so a CID is the glyph id and the page's codes are unchanged. Not subset: the
     PDF carries the whole face. Measuring, the page pictures (`svg/svg-text.ts` already drew CFF
     outlines) and `/ToUnicode` are unchanged. Pinned by `tests/layout/named-fonts.test.ts`.
+20. **A band's pictures behind the text painted behind the page** (`layout/styled-layout.ts`,
+    `drawBlocksSequentially`, marked `document-kit:`). Upstream drew a header's or footer's
+    `behindDoc` picture first within the band but pushed it with the band's other items, so it
+    rode the page's image pass, which paints after every fill: a full-page ground anchored in
+    the header covered the body's cell and paragraph shading (§17.4.32, §17.3.1.31) in the PDF
+    and the page pictures, while Word paints it under them (§20.4.2.3). Such a picture (or
+    shape) is now marked `behind` with its `relativeHeight` as `z`, so the paint plan sets it
+    down before everything else on the page, the band's in z order and ahead of the body's own
+    behind-text floats. Pinned by `tests/layout/placed-blocks.test.ts` ("a page ground behind
+    shading").
 
 Nothing else differs. `diff -r` against the upstream tree, after running the rewrite script
-over a fresh copy, shows only the nineteen changes above.
+over a fresh copy, shows only the twenty changes above.
 
 ## Bringing in a newer upstream
 
@@ -221,11 +231,11 @@ over a fresh copy, shows only the nineteen changes above.
    included; skip `corpus/`, `stand/`, `docs/`, `scripts/`). Delete files upstream deleted.
 3. Run `node scripts/rewrite-ream-aliases.mjs`, then `node scripts/rewrite-ream-aliases.mjs
    --check` (exits 1 if an alias import or root-relative fixture path is left).
-4. Re-apply changes 1, 2 and 4 to 19 above unless upstream has made them itself (check
+4. Re-apply changes 1, 2 and 4 to 20 above unless upstream has made them itself (check
    `FIXED_MTIME`, a `w:r` split for complex fields, every fallback to the global `fetch` in
    `core/fonts`, `core/converter` and `excel`, `familyNamesInFlow`, `w:vAlign`, PAGEREF and
    body fields, §17.4.66 border conflicts, `w:keepNext` in table rows, and the two foot-frame
-   checks of changes 10 and 11, the no-break hyphen of change 12, percentage widths with their sign of change 13, the stand-in grid of change 14, border widths of change 15, the `compact` option of change 16, synthetic faces for embedded families of change 18, CFF faces in the PDF of change 19). Search for
+   checks of changes 10 and 11, the no-break hyphen of change 12, percentage widths with their sign of change 13, the stand-in grid of change 14, border widths of change 15, the `compact` option of change 16, synthetic faces for embedded families of change 18, CFF faces in the PDF of change 19, band pictures behind the page of change 20). Search for
    `document-kit:` in the old tree to find each place. Search for new uses of
    `fetch`, `XMLHttpRequest` and `node:` in `src/ream` and treat any as change 4.
 5. Check `src/layout` still compiles against the internals it imports (`core/converter/project`,

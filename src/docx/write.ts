@@ -89,6 +89,8 @@ function buildDocx(source: Document, options: WriteDocxOptions): DocxDocument {
   const lists = createListRegistry()
   const bookmarks = new Set<string>()
   const footnotes = new Footnotes(document.footnotes)
+  let drawings = 0
+  const nextDrawing = () => (drawings += 1)
   const sections = document.sections.map((section) => {
     const page = pageBox(section.page, theme)
     const context: WriterContext = {
@@ -103,6 +105,7 @@ function buildDocx(source: Document, options: WriteDocxOptions): DocxDocument {
       nullCells: options.nullCells ?? 'empty',
       lists,
       styles,
+      nextDrawing,
     }
     return writeSection(section, context)
   })

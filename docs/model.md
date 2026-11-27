@@ -203,7 +203,12 @@ over its artwork, a label, an address window. Every paragraph the blocks make ca
 - `box: 'page'` covers the whole page (a cover background: give the picture the page's proportions); otherwise
   `{ x, y, width, height }` in points from the page's corner, or the margins' with `relativeTo: 'margin'`. The
   picture is stretched to the box.
-- `behind: true` (default) puts it behind the text; `false` in front. `alt` is its description.
+- `behind: true` (default) puts it behind the text; `false` in front. `alt` is its description. Behind the text means
+  under everything the body paints, its fills too: a shaded cell or paragraph over a page ground keeps its fill in
+  Word, the PDF and the HTML alike.
+- Pictures in the same layer stack in document order: one placed later stands over one placed earlier (Word's
+  `relativeHeight`, written 1, 2, 3… through the document; the `docx` library's own default was the picture's height,
+  which put a large ground over a small mark placed after it).
 - Its anchor is an empty paragraph one twip tall, so it takes no room in the flow. In a `header` it is on every page
   of the section (a background for every page), in `firstPage.header` on the first page only.
 - `image: null` (a recipe's picture the data did not give) places nothing and is listed to complete.

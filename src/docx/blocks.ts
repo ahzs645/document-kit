@@ -351,6 +351,9 @@ function writeFloatingImage(block: FloatingImageBlock, context: WriterContext, b
         offset: Math.round(box.y * EMU_PER_POINT),
       },
       behindDocument: block.behind !== false,
+      // Word stacks pictures in one layer by relativeHeight; the docx library's default is the picture's height in
+      // EMU, which put a full-page ground over a small mark placed after it. Document order instead: later is higher.
+      zIndex: context.nextDrawing(),
       allowOverlap: true,
       lockAnchor: true,
       layoutInCell: false,

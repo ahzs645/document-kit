@@ -4972,6 +4972,21 @@ function drawBlocksSequentially(
   const ordered = blocks.some(isBehind)
     ? [...blocks.filter(isBehind), ...blocks.filter((b) => !isBehind(b))]
     : blocks;
+  // document-kit: §20.4.2.3 — …and behind the PAGE's content as well. Pushed
+  // with the band's other items, a header's full-page ground rode the image
+  // pass, which paints after every fill: the shading of the body's cells and
+  // paragraphs went under the picture and was lost. Such items are marked
+  // `behind` (painted before anything else on the page, the band's in their
+  // `relativeHeight` order) and stamped with their z-order.
+  const under: Array<PageItem> = [];
+  const sinkFor = (block: LaidOutBlock): Array<PageItem> => {
+    if (!isBehind(block)) return out;
+    const z = (block as { readonly float?: FloatAnchor }).float?.zOrder;
+    return {
+      push: (...items: Array<PageItem>): number =>
+        under.push(...items.map((i) => ({ ...i, ...(z !== undefined ? { z } : {}), behind: true }))),
+    } as unknown as Array<PageItem>;
+  };
   for (const block of ordered) {
     // A header is not only paragraphs. A letterhead is very often ONE TABLE —
     // logo in the left cell, institute in the right — and the band drew
@@ -5027,7 +5042,8 @@ function drawBlocksSequentially(
         anchored === undefined || !block.float
           ? cursorY
           : bandAnchorTop(block.float, cursorY, pageHeight, block.heightPt, bandMargins);
-      out.push({
+      const sink = sinkFor(block);
+      sink.push({
         type: 'image',
         x: pt(startX + offset),
         y: pt(pageHeight - top),
@@ -5042,7 +5058,7 @@ function drawBlocksSequentially(
         ...(block.flipV ? { flipV: true } : {}),
       });
       if (block.outline) {
-        out.push(
+        sink.push(
           ...pictureOutlineItems(
             block.outline,
             startX + offset,
@@ -5075,7 +5091,7 @@ function drawBlocksSequentially(
         anchored === undefined || !block.float
           ? cursorY
           : bandAnchorTop(block.float, cursorY, pageHeight, block.heightPt, bandMargins);
-      emitShapeItems(block, startX + offset, top - block.heightPt, out, pageHeight, structId);
+      emitShapeItems(block, startX + offset, top - block.heightPt, sinkFor(block), pageHeight, structId);
       if (anchored === undefined) cursorY -= block.heightPt;
       cursorY -= block.spacingAfterPt;
       if (anchored === undefined) spacing.close(block.spacingAfterPt);
@@ -5117,7 +5133,7 @@ function drawBlocksSequentially(
     cursorY -= block.spacingAfterPt;
     spacing.close(block.spacingAfterPt);
   }
-  return out;
+  return under.length > 0 ? [...PageAssembler.byZ(under), ...out] : out;
 }
 
 /**

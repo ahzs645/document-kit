@@ -2,12 +2,13 @@
 // and the page pictures set them where Word does. Made-up text throughout.
 import { describe, expect, it } from 'vitest'
 
-import { document, floatingImage, frame, paragraph, section, type Block, type Document } from '../../src/model'
+import { document, floatingImage, frame, paragraph, section, table, type Block, type Document } from '../../src/model'
 import { writeDocx } from '../../src/docx'
 import { createFontProvider, layoutDocx } from '../../src/layout'
 import { layOut, linesOf } from './engine'
 import { diskLoader } from './sample'
-import { makePng } from '../docx/helpers'
+import { makePng, readPackage } from '../docx/helpers'
+import { pageDrawings, paintedImages } from './pdf'
 
 const fonts = createFontProvider(diskLoader)
 const page = { paper: 'letter' as const, margins: { top: 72, bottom: 72, left: 72, right: 72, header: 36, footer: 36 } }
@@ -88,5 +89,58 @@ describe('a picture behind the text', () => {
     const laid = layOut(docx)
     expect(laid.pages).toHaveLength(2)
     for (const p of laid.pages) expect(p.commands.some((c) => c.type === 'image')).toBe(true)
+  })
+})
+
+describe('a page ground behind shading', () => {
+  // A header's full-page picture behind the text, and a body of filled boxes over it: a shaded cell (a table header
+  // row, a callout) and a shaded paragraph. Word paints behind-text pictures under the body's text and fills.
+  const ground = { bytes: makePng(10, 10, [255, 238, 170]) }
+  const shaded = () =>
+    writeDocx(
+      document([
+        section(
+          [
+            table([{ cells: [{ content: 'Shaded cell', shading: '0B2B4A', text: { color: 'FFFFFF' } }] }]),
+            paragraph('Shaded paragraph', { shading: '0B2B4A', text: { color: 'FFFFFF' } }),
+          ],
+          { page, header: [floatingImage(ground, 'page', { alt: 'Ground' })] },
+        ),
+      ]),
+    )
+  const FILL = /0\.043 0\.169 0\.29 rg/
+
+  it('paints the picture before the cell and paragraph fills in the PDF', async () => {
+    const drawing = pageDrawings((await layoutDocx(await shaded(), { fonts })).toPdf().bytes)[0]!
+    const [picture] = paintedImages(drawing)
+    expect(picture).toMatchObject({ x: 0, y: 0, width: 612, height: 792 })
+    const fill = FILL.exec(drawing)
+    expect(fill).not.toBeNull()
+    expect(picture!.at).toBeLessThan(fill!.index)
+    // Both fills come after the picture: nothing it covers.
+    expect(drawing.slice(picture!.at).match(/ re\s+f/g)!.length).toBeGreaterThanOrEqual(2)
+  })
+
+  it('marks the header\'s picture as behind the page in the layout, and in the page pictures', async () => {
+    const commands = layOut(await shaded()).pages[0]!.commands
+    const image = commands.find((c) => c.type === 'image')!
+    expect(image.behind).toBe(true)
+    const svg = (await layoutDocx(await shaded(), { fonts })).toPages().pages[0]!
+    const fillAt = svg.search(/fill="#0B2B4A"/i)
+    expect(fillAt).toBeGreaterThan(0)
+    expect(svg.indexOf('<image')).toBeLessThan(fillAt)
+  })
+
+  it('stacks pictures in one layer in document order (relativeHeight), whatever their size', async () => {
+    const big = floatingImage({ bytes: makePng(10, 10, [10, 10, 10]) }, 'page')
+    const mark = floatingImage({ bytes: makePng(4, 4, [200, 30, 30]) }, { x: 400, y: 40, width: 120, height: 40 })
+    const docx = await writeDocx(document([section([paragraph('Body.')], { page, header: [big, mark] })]))
+    const pkg = readPackage(docx)
+    const header = pkg.text(pkg.names.find((name) => /word\/header\d*\.xml$/.test(name))!)
+    const heights = [...header.matchAll(/relativeHeight="(\d+)"/g)].map((m) => Number(m[1]))
+    expect(heights).toEqual([1, 2])
+    const drawing = pageDrawings((await layoutDocx(docx, { fonts })).toPdf().bytes)[0]!
+    const painted = paintedImages(drawing)
+    expect(painted.map((p) => p.width)).toEqual([612, 120])
   })
 })

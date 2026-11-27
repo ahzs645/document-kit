@@ -23,6 +23,11 @@ export interface WriterContext {
   frame?: IFrameOptions
   /** Writing the blocks of a table cell. */
   inCell?: boolean
+  /**
+   * The next drawing's stacking order (Word's `relativeHeight`), counted through the whole document: a picture placed
+   * later stands over one placed earlier in the same layer, as the HTML writer stacks them.
+   */
+  nextDrawing: () => number
 }
 
 /** The numbering definitions the lists of a document need, gathered while the body is written. */
