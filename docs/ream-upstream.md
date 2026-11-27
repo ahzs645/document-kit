@@ -259,9 +259,18 @@ Each change is marked in the source with a `document-kit:` comment unless noted.
     lines early. `w:w` is now read into `widthScale` (its percent over 100, kept within 1 to
     600; 100 kept too, as it undoes a style's share). Pinned by `tests/ream/run-properties.test.ts`,
     `tests/ream/run-width-scale.test.ts` and `tests/layout/size-scale.test.ts`.
+25. **Text state after a picture or a drawn box** (`pdf/styled-page-emitter.ts`, marked
+    `document-kit:`). The emitter set its record of the text state back to the defaults (`Tc` 0,
+    `Tz` 100) after a picture, a math box or a rule, on the reasoning that ET resets them. It does
+    not: ET ends the text object, and `Tc` and `Tz` stand until set again (ISO 32000-1 §9.3.1).
+    A plain run after a picture therefore skipped its own `0 Tc` and `100 Tz` and was drawn with
+    the tracking and scale of the run before it, wider than it was laid out. The record is now
+    unknown there (NaN), so the next run states both. The byte gate's `xlsx: tracks` case changed
+    with it (a sheet's tracked text after a rule now states its spacing). Pinned by
+    `tests/layout/text-state-after-pictures.test.ts`.
 
 Nothing else differs. `diff -r` against the upstream tree, after running the rewrite script
-over a fresh copy, shows only the twenty-four changes above.
+over a fresh copy, shows only the twenty-five changes above.
 
 ## Bringing in a newer upstream
 
@@ -271,11 +280,11 @@ over a fresh copy, shows only the twenty-four changes above.
    included; skip `corpus/`, `stand/`, `docs/`, `scripts/`). Delete files upstream deleted.
 3. Run `node scripts/rewrite-ream-aliases.mjs`, then `node scripts/rewrite-ream-aliases.mjs
    --check` (exits 1 if an alias import or root-relative fixture path is left).
-4. Re-apply changes 1, 2 and 4 to 24 above unless upstream has made them itself (check
+4. Re-apply changes 1, 2 and 4 to 25 above unless upstream has made them itself (check
    `FIXED_MTIME`, a `w:r` split for complex fields, every fallback to the global `fetch` in
    `core/fonts`, `core/converter` and `excel`, `familyNamesInFlow`, `w:vAlign`, PAGEREF and
    body fields, §17.4.66 border conflicts, `w:keepNext` in table rows, and the two foot-frame
-   checks of changes 10 and 11, the no-break hyphen of change 12, percentage widths with their sign of change 13, the stand-in grid of change 14, border widths of change 15, the `compact` option of change 16, synthetic faces for embedded families of change 18, CFF faces in the PDF of change 19, band pictures behind the page of change 20, framed pictures of change 21, extension and legacy kerning of change 22, `kernAsAsked` of change 23, `w:w` read of change 24). Search for
+   checks of changes 10 and 11, the no-break hyphen of change 12, percentage widths with their sign of change 13, the stand-in grid of change 14, border widths of change 15, the `compact` option of change 16, synthetic faces for embedded families of change 18, CFF faces in the PDF of change 19, band pictures behind the page of change 20, framed pictures of change 21, extension and legacy kerning of change 22, `kernAsAsked` of change 23, `w:w` read of change 24, the text state after a picture of change 25). Search for
    `document-kit:` in the old tree to find each place. Search for new uses of
    `fetch`, `XMLHttpRequest` and `node:` in `src/ream` and treat any as change 4.
 5. Check `src/layout` still compiles against the internals it imports (`core/converter/project`,

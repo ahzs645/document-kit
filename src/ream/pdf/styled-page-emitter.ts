@@ -1071,7 +1071,7 @@ function emitPageContent(
       lastFauxWidth = 0;
       lastStroke = undefined;
       lastStroke = undefined;
-      lastTz = 100;
+      lastTz = Number.NaN;
       lastSize = -1;
       lastColor = '';
       return;
@@ -1165,14 +1165,17 @@ function emitPageContent(
       out.push('S');
       out.push('Q');
     }
-    // Text state is reset by ET; force re-emit on the next text token.
+    // document-kit: force the text state out again on the next text token. ET ends the text object, not
+    // the text state: Tc and Tz stand until set again (ISO 32000-1 §9.3.1), so the scale and spacing are
+    // unknown here, not the defaults. Taken as 0 and 100, a plain run after a picture kept the tracking
+    // and scale of the label before it.
     lastFont = '';
     lastFauxWidth = 0;
     lastStroke = undefined;
-    lastTz = 100;
+    lastTz = Number.NaN;
     lastSize = -1;
     lastColor = '';
-    lastTc = 0;
+    lastTc = Number.NaN;
   };
   // Emit an inline math box: glyph items in text mode, rule/path items in
   // graphics mode. All positions are box-local, offset by the box origin.
@@ -1210,7 +1213,7 @@ function emitPageContent(
         lastFauxWidth = 0;
         lastStroke = undefined;
         lastStroke = undefined;
-        lastTz = 100;
+        lastTz = Number.NaN;
         lastSize = -1;
         lastColor = '';
       } else {
@@ -1231,7 +1234,7 @@ function emitPageContent(
         lastFauxWidth = 0;
         lastStroke = undefined;
         lastStroke = undefined;
-        lastTz = 100;
+        lastTz = Number.NaN;
         lastSize = -1;
         lastColor = '';
       }
@@ -1258,10 +1261,10 @@ function emitPageContent(
     lastFont = '';
     lastFauxWidth = 0;
     lastStroke = undefined;
-    lastTz = 100;
+    lastTz = Number.NaN;
     lastSize = -1;
     lastColor = '';
-    lastTc = 0;
+    lastTc = Number.NaN;
     out.push('BT');
     inBT = true;
     body(cmd);
@@ -1274,10 +1277,10 @@ function emitPageContent(
     lastFont = '';
     lastFauxWidth = 0;
     lastStroke = undefined;
-    lastTz = 100;
+    lastTz = Number.NaN;
     lastSize = -1;
     lastColor = '';
-    lastTc = 0;
+    lastTc = Number.NaN;
   };
   // A TURNED line whose glyphs one text matrix cannot set is set flat, token
   // by token, inside a CTM that turns it about its own origin — so its tabs,
@@ -1303,10 +1306,10 @@ function emitPageContent(
     lastFont = '';
     lastFauxWidth = 0;
     lastStroke = undefined;
-    lastTz = 100;
+    lastTz = Number.NaN;
     lastSize = -1;
     lastColor = '';
-    lastTc = 0;
+    lastTc = Number.NaN;
     const from = links.length;
     const { rotationDeg: _turned, ...flat } = cmd;
     out.push('BT');
@@ -1321,10 +1324,10 @@ function emitPageContent(
     lastFont = '';
     lastFauxWidth = 0;
     lastStroke = undefined;
-    lastTz = 100;
+    lastTz = Number.NaN;
     lastSize = -1;
     lastColor = '';
-    lastTc = 0;
+    lastTc = Number.NaN;
     for (let k = from; k < links.length; k++) {
       const link = links[k]!;
       const [x0, y0, x1, y1] = link.rect;
