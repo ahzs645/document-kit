@@ -77,8 +77,12 @@ default. A `with` naming a parameter the component does not declare is an error,
 ### Block templates
 
 A block template is the model's JSON (`docs/model.md`: `heading`, `paragraph`, `list`, `fields`, `table`, `spreadsheet`, `figure`,
-`figureGrid`, `signature`, `choices`, `pinned`, `pageBreak`, `toc`, `spacer`, `custom`) in which any string may hold tags. Every key is
+`figureGrid`, `signature`, `choices`, `pinned`, `frame`, `floatingImage`, `pageBreak`, `toc`, `spacer`, `custom`) in which any string may hold tags. Every key is
 checked against the model at compile time: a misspelt key is an error naming its JSON path.
+
+A `floatingImage`'s `image` comes from the data like a figure's (`"image": "{{ artwork }}"`); with no value it places
+nothing and is listed to complete. A text run's `characterSpacing` and `characterStyle`, and a frame's `x`, `y`,
+`width`, `height`, `relativeTo` and `wrap`, may be tags like any scalar.
 
 Two shorthands the model does not have:
 
@@ -181,7 +185,7 @@ object a control node.
 |---|---|
 | `kind`, `version`, `id`, `name`, `description` | As for components |
 | `extends` | Another recipe's id: this recipe is that one with `changes` |
-| `document` | `metadata` and `theme` as the model takes them; strings may hold tags. `textRules` as the model takes them (`docs/model.md`, "Text rules"), carried as written: no tags are read in them. They are checked at compile, each problem named by its place (`recipe/lab:document.textRules[2].pattern`) |
+| `document` | `metadata` (custom properties in `metadata.custom`), `theme` and `styles` (named paragraph and character styles, `docs/model.md`, "Named styles") as the model takes them; strings may hold tags. `textRules` as the model takes them (`docs/model.md`, "Text rules"), carried as written: no tags are read in them. They are checked at compile, each problem named by its place (`recipe/lab:document.textRules[2].pattern`) |
 | `missing` | The missing-value rule of every part that does not give its own: `blank` (default) or `placeholder` (below) |
 | `meta` | Extra details of the application's own (below) |
 | `options` | Constants the components read as `options.*` |

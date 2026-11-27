@@ -74,6 +74,8 @@ const STYLE: Record<string, Pos> = {
   size: 'scalar',
   font: 'scalar',
   highlight: 'scalar',
+  characterSpacing: 'scalar',
+  characterStyle: 'scalar',
 }
 
 /** Each block type's keys (besides `type`). */
@@ -199,6 +201,19 @@ export const BLOCK_KEYS: Record<string, Record<string, Pos>> = {
     boxed: 'scalar',
   },
   pinned: { ...BASE, at: 'scalar', blocks: 'blocks', spaceBelow: 'scalar' },
+  frame: {
+    ...BASE,
+    blocks: 'blocks',
+    x: 'scalar',
+    y: 'scalar',
+    width: 'scalar',
+    height: 'scalar',
+    heightRule: 'scalar',
+    relativeTo: 'scalar',
+    wrap: 'scalar',
+    space: 'scalar',
+  },
+  floatingImage: { ...BASE, image: 'image', box: 'any', relativeTo: 'scalar', behind: 'scalar', alt: 'text' },
   pageBreak: { ...BASE },
   toc: { ...BASE, title: 'richOpt', levels: 'scalar' },
   spacer: { ...BASE, height: 'scalar' },

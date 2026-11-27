@@ -723,6 +723,7 @@ export function compileRecipe(recipe: string | Recipe, libraryIn: Library, optio
   const top: Sym = { params: new Map(), vars: new Map(), inLoop: false, part: null, stack: [] }
   if (resolved.document.metadata) document.metadata = walkValue(resolved.document.metadata, 'any', ctx, top, at(root, 'document', 'metadata'), ['document', 'metadata']) as JsonObject
   if (resolved.document.theme) document.theme = walkValue(resolved.document.theme, 'any', ctx, top, at(root, 'document', 'theme'), ['document', 'theme']) as JsonObject
+  if (resolved.document.styles) document.styles = walkValue(resolved.document.styles, 'any', ctx, top, at(root, 'document', 'styles'), ['document', 'styles']) as JsonObject
   if (resolved.document.footnotes) document.footnotes = cloneJson(resolved.document.footnotes) as Record<string, string[]>
   if (textRules !== undefined) document.textRules = cloneJson(textRules as Json) as Json[]
 

@@ -136,7 +136,8 @@ export function applyEdits(
             source,
           }
         }
-        case 'pinned': {
+        case 'pinned':
+        case 'frame': {
           const inner = walk(block.blocks, scope)
           return inner.every((b, i) => b === block.blocks[i]) ? block : { ...block, blocks: inner }
         }

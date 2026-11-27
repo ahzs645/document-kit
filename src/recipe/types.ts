@@ -129,6 +129,8 @@ export interface RecipeDocument {
   footnotes?: Record<string, string[]>
   metadata?: JsonObject
   theme?: JsonObject
+  /** Named paragraph and character styles (the model's `DocumentStyles`), tags read in them as in the theme. */
+  styles?: JsonObject
   /** The document's text rules (the model's `TextRule`s), carried as written: no tags are read in them. */
   textRules?: Json[]
 }

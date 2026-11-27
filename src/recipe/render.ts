@@ -1044,6 +1044,7 @@ export function renderRecipe(compiledIn: CompiledRecipe, data: unknown, options:
 
   const metadata = compiled.document.metadata ? (evalValue(state, compiled.document.metadata, 'any', EMPTY_SCOPE, ['document', 'metadata']) as Record<string, unknown>) : undefined
   const theme = compiled.document.theme ? (evalValue(state, compiled.document.theme, 'any', EMPTY_SCOPE, ['document', 'theme']) as Record<string, unknown>) : undefined
+  const styles = compiled.document.styles ? (evalValue(state, compiled.document.styles, 'any', EMPTY_SCOPE, ['document', 'styles']) as Record<string, unknown>) : undefined
 
   const parts: RenderedPart[] = []
   const items: RecipeToCompleteItem[] = []
@@ -1125,6 +1126,7 @@ export function renderRecipe(compiledIn: CompiledRecipe, data: unknown, options:
   const document: Document = { sections, ...(compiled.document.footnotes && { footnotes: compiled.document.footnotes }) }
   if (metadata && Object.keys(metadata).length) (document as { metadata?: unknown }).metadata = metadata
   if (theme && Object.keys(theme).length) (document as { theme?: unknown }).theme = theme
+  if (styles && Object.keys(styles).length) (document as { styles?: unknown }).styles = styles
   if (compiled.document.textRules?.length) (document as { textRules?: unknown }).textRules = compiled.document.textRules
 
   // An edit counts as applied only where its target took it (a tick must be one of the question's options).

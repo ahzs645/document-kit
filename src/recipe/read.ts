@@ -254,7 +254,7 @@ function checkRecipe(c: Checker, value: unknown, path: Path) {
     c.problem([...path, 'description'], 'The description is not a string')
   c.id(value.extends, [...path, 'extends'], 'The recipe it extends', true)
   if (c.object(value.document, [...path, 'document'], 'The document', true)) {
-    c.keys(value.document, ['metadata', 'theme', 'textRules', 'footnotes'], [...path, 'document'], 'The document')
+    c.keys(value.document, ['metadata', 'theme', 'styles', 'textRules', 'footnotes'], [...path, 'document'], 'The document')
     if (c.object(value.document.footnotes, [...path, 'document', 'footnotes'], 'The footnotes', true)) {
       for (const [id, paragraphs] of Object.entries(value.document.footnotes)) {
         if (!Array.isArray(paragraphs) || !paragraphs.length || !paragraphs.every(p => typeof p === 'string' && p.trim()))
@@ -269,6 +269,8 @@ function checkRecipe(c: Checker, value: unknown, path: Path) {
       c.json(value.document.metadata, [...path, 'document', 'metadata'], 'The metadata')
     if (c.object(value.document.theme, [...path, 'document', 'theme'], 'The theme', true))
       c.json(value.document.theme, [...path, 'document', 'theme'], 'The theme')
+    if (c.object(value.document.styles, [...path, 'document', 'styles'], 'The styles', true))
+      c.json(value.document.styles, [...path, 'document', 'styles'], 'The styles')
   }
   if (c.object(value.options, [...path, 'options'], 'The options', true)) c.json(value.options, [...path, 'options'], 'The options')
   c.missing(value.missing, [...path, 'missing'])
